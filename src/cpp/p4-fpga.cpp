@@ -12,8 +12,8 @@
 #include "midend.h"
 #include "options.h"
 #include "backend.h"
+#include "frontend.h"  
 #include "frontends/common/parseInput.h"
-#include "frontends/p4/frontend.h"
 #include "frontends/p4/evaluator/evaluator.h"
 #include "lib/cstring.h"
 
@@ -24,7 +24,6 @@ int main(int argc, char *const argv[]) {
     P4::AutoCompileContext autoContext(new SV::SVContext());
     auto& options = SV::SVContext::get().options();
     
-    // Set version info BEFORE processing options (important!)
     options.langVersion = P4::CompilerOptions::FrontendVersion::P4_16;
     options.compilerVersion = P4::cstring("1.0.0");
     
@@ -36,8 +35,6 @@ int main(int argc, char *const argv[]) {
         return 1;
     }
     
-    //auto hook = options.getDebugHook();
-    
     // Parse P4 file
     std::cerr << "Parsing P4 file..." << std::endl;
     auto program = P4::parseP4File(options);
@@ -46,22 +43,15 @@ int main(int argc, char *const argv[]) {
         return 1;
     }
     std::cerr << "Parse successful" << std::endl;
-    
+
     // Run frontend
+    SV::FrontEnd frontend;
     try {
         std::cerr << "Running frontend..." << std::endl;
-        P4::FrontEnd frontend;
-        //frontend.addDebugHook(hook);
-        program = frontend.run(options, program, nullptr);
+        program = frontend.run(options, program);
         std::cerr << "Frontend complete" << std::endl;
     } catch (const P4::Util::P4CExceptionBase &bug) {
         std::cerr << "Frontend error: " << bug.what() << std::endl;
-        return 1;
-    } catch (const std::exception &e) {
-        std::cerr << "Frontend std exception: " << e.what() << std::endl;
-        return 1;
-    } catch (...) {
-        std::cerr << "Frontend unknown exception" << std::endl;
         return 1;
     }
     
@@ -70,10 +60,15 @@ int main(int argc, char *const argv[]) {
         return 1;
     }
     
-    // Run midend
+    // Run midend 
     std::cerr << "Running midend..." << std::endl;
     const P4::IR::ToplevelBlock* toplevel = nullptr;
     SV::MidEnd midend;
+    
+    // Copy the maps from frontend to midend
+    midend.refMap = frontend.getRefMap();
+    midend.typeMap = frontend.getTypeMap();
+    
     try {
         toplevel = midend.run(options, program);
         if (P4::errorCount() > 0) {
