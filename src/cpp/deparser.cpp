@@ -1,263 +1,298 @@
-/*
-  Copyright 2015-2016 P4FPGA Project
-
-  Licensed under the Apache License, Version 2.0 (the "License");
-  you may not use this file except in compliance with the License.
-  You may obtain a copy of the License at
-
-  http://www.apache.org/licenses/LICENSE-2.0
-
-  Unless required by applicable law or agreed to in writing, software
-  distributed under the License is distributed on an "AS IS" BASIS,
-  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-  See the License for the specific language governing permissions and
-  limitations under the License.
-*/
-
-#include <math.h>
+#include "common.h"
 #include "deparser.h"
-#include "ir/ir.h"
-#include "vector_utils.h"
-#include "string_utils.h"
+#include "program.h"
+#include "lib/log.h"
+#include <sstream>
 
-namespace FPGA {
+namespace SV {
 
-class DeparserBuilder : public Inspector {
-  public:
-    DeparserBuilder(FPGADeparser* deparser, const FPGAProgram* program) :
-      program(program), deparser(deparser) {}
-    bool preorder(const IR::MethodCallStatement* stat) override
-    { visit(stat->methodCall); return false; }
-    bool preorder(const IR::MethodCallExpression* expression) override;
-  private:
-    const FPGAProgram* program;
-    FPGADeparser* deparser;
-};
+bool SVDeparser::build() {
+    LOG1("Building deparser");
+    
+    extractEmitStatements();
+    calculateHeaderOrder();
+    
+    return true;
+}
 
-bool DeparserBuilder::preorder(const IR::MethodCallExpression* expression) {
-  // packet.emit
-  auto it = expression->arguments->begin();
-  for (auto typeName : *expression->typeArguments) {
-    auto instName = *it;
-    auto type = program->typeMap->getType(typeName, true);
-
-    // get header width
-    auto hdr_width = type->width_bits();
-    // create deparse state for each header
-    if (type->is<IR::Type_StructLike>()) {
-      auto t = type->to<IR::Type_StructLike>();
-      if (instName->is<IR::Member>()) {
-        const IR::Member* member = instName->to<IR::Member>();
-        cstring name = member->member;
-        cstring indexed_name = name;
-        deparser->states.push_back(new IR::BSV::DeparseState(name, t->fields, hdr_width, indexed_name));
-      }
-    }
-    // unroll header stack to individual headers and create deparse state for each one
-    else if (type->is<IR::Type_Stack>()){
-      auto stk = type->to<IR::Type_Stack>();
-      for (unsigned i = 0; i < stk->getSize(); i++) {
-        if (stk->elementType->is<IR::Type_StructLike>()) {
-          auto t = stk->elementType->to<IR::Type_StructLike>();
-          int hdr_width = stk->elementType->width_bits();
-          if (instName->is<IR::Member>()) {
-            const IR::Member* member = instName->to<IR::Member>();
-            cstring name = member->member + std::to_string(i);
-            cstring indexed_name = member->member + "[" + std::to_string(i) + "]";
-            deparser->states.push_back(new IR::BSV::DeparseState(name.c_str(), t->fields, hdr_width, indexed_name));
-          }
+void SVDeparser::extractEmitStatements() {
+    // Extract packet.emit() calls from deparser body
+    for (auto stmt : controlBlock->container->body->components) {
+        if (auto methodCall = stmt->to<IR::MethodCallStatement>()) {
+            auto expr = methodCall->methodCall;
+            if (expr->method->toString() == "emit") {
+                // Process emit arguments
+                for (auto arg : *expr->arguments) {
+                    if (auto member = arg->expression->to<IR::Member>()) {
+                        auto headerName = member->member;
+                        auto type = program->typeMap->getType(arg->expression, true);
+                        
+                        if (type && type->is<IR::Type_Header>()) {
+                            auto headerType = type->to<IR::Type_Header>();
+                            auto state = new SVDeparseState(headerName, headerType);
+                            state->width = type->width_bits();
+                            deparseStates.push_back(state);
+                            LOG2("Deparser emits header: " << headerName 
+                                 << " width: " << state->width);
+                        }
+                    }
+                }
+            }
         }
-      }
     }
-    it++;
-  }
-  return false;
 }
 
-class DeparserRuleVisitor : public Inspector {
-  public:
-    DeparserRuleVisitor(CodeBuilder* builder, int& num_rules) :
-      builder(builder), num_rules(num_rules) {}
-    bool preorder(const IR::BSV::DeparseState* state) override;
-  private:
-    CodeBuilder* builder;
-    int& num_rules;
-};
-
-bool DeparserRuleVisitor::preorder(const IR::BSV::DeparseState* state) {
-  auto width = state->width_bits;
-  auto hdr = state->to<IR::Type_Header>();
-  auto name = hdr->name.name;
-
-  builder->append_line("`COLLECT_RULE(deparse_fsm, joinRules(vec(genDeparseNextRule(w_%s, StateDeparse%s, %d))));", name, CamelCase(name), width);
-  builder->append_line("`COLLECT_RULE(deparse_fsm, joinRules(vec(genDeparseLoadRule(StateDeparse%s, %d))));", CamelCase(name), width);
-  builder->append_line("`COLLECT_RULE(deparse_fsm, joinRules(vec(genDeparseSendRule(StateDeparse%s, %d))));", CamelCase(name), width);
-  num_rules += 3;
-  return false;
-}
-
-class DeparserStateVisitor : public Inspector {
-  public:
-    DeparserStateVisitor(CodeBuilder* builder) :
-      builder(builder) {}
-    bool preorder(const IR::BSV::DeparseState* state) override;
-  private:
-    CodeBuilder* builder;
-};
-
-bool DeparserStateVisitor::preorder(const IR::BSV::DeparseState* state) {
-  auto hdr = state->to<IR::Type_Header>();
-  auto name = hdr->name.name;
-  builder->append_format("PulseWire w_%s <- mkPulseWire();", name);
-  return false;
-}
-
-// Convert emit() to IR::BSV::DeparseState
-bool FPGADeparser::build() {
-  auto stat = controlBlock->container->body;
-  DeparserBuilder visitor(this, program);
-  stat->apply(visitor);
-  return true;
-}
-
-void FPGADeparser::emitEnums() {
-  builder->append_line("`ifdef DEPARSER_STRUCT");
-  builder->append_line("typedef enum {");
-  builder->incr_indent();
-  if (states.size() == 0) {
-    builder->append_line("StateDeparseStart");
-  } else {
-    builder->append_line("StateDeparseStart,");
-  }
-  for (auto r : states) {
-    auto name = r->name.name;
-    if (r != states.back()) {
-      builder->append_format("StateDeparse%s,", CamelCase(name));
-    } else {
-      builder->append_format("StateDeparse%s", CamelCase(name));
+void SVDeparser::calculateHeaderOrder() {
+    // Assign order to headers for emission
+    int order = 0;
+    for (auto state : deparseStates) {
+        headerOrder[state->headerName] = order++;
     }
-  }
-  builder->decr_indent();
-  builder->append_line("} DeparserState deriving (Bits, Eq, FShow);");
-  builder->append_line("`endif  // DEPARSER_STRUCT");
 }
 
-void FPGADeparser::emitRules() {
-  builder->append_line("`ifdef DEPARSER_RULES");
-  // deparse rules are mutually exclusive
-//  std::vector<cstring> exclusive_rules;
-//  for (auto r : states) {
-//    cstring rl = cstring("rl_deparse_") + r->name.toString() + cstring("_next");
-//    exclusive_rules.push_back(rl);
-//  }
-//  auto exclusive_annotation = cstring("(* mutually_exclusive=\"");
-//  for (auto r : exclusive_rules) {
-//    exclusive_annotation += r;
-//    if (r != exclusive_rules.back()) {
-//      exclusive_annotation += cstring(",");
-//    }
-//  }
-//  exclusive_annotation += cstring("\" *)");
-//  builder->append_line(exclusive_annotation);
-
-  int num_rules = 0;
-  DeparserRuleVisitor visitor(builder, num_rules);
-  for (auto r : states) {
-    r->apply(visitor);
-  }
-  builder->append_line("Vector#(%d, Rules) fsmRules = toVector(deparse_fsm);", num_rules);
-  builder->append_line("`endif  // DEPARSER_RULES");
+void SVDeparser::emit(SVCodeGen& codegen) {
+    auto builder = codegen.getDeparserBuilder();
+    emitModule(builder);
 }
 
-void FPGADeparser::emitStates() {
-  builder->append_line("`ifdef DEPARSER_STATE");
+void SVDeparser::emitModule(CodeBuilder* builder) {
+    // Module header
+    builder->appendLine("//");
+    builder->appendLine("// Deparser Module");
+    builder->appendLine("//");
+    builder->newline();
+    
+    builder->appendLine("`include \"types.svh\"");
+    builder->newline();
+    
+    // Module declaration
+    builder->appendLine("module deparser #(");
+    builder->increaseIndent();
+    builder->appendLine("parameter DATA_WIDTH = 512");
+    builder->decreaseIndent();
+    builder->appendLine(") (");
+    builder->increaseIndent();
+    
+    // Clock and reset
+    builder->appendLine("input  logic                      clk,");
+    builder->appendLine("input  logic                      rst_n,");
+    builder->newline();
+    
+    // Input interface
+    builder->appendLine("// Input from egress pipeline");
+    builder->appendLine("input  headers_t                  in_headers,");
+    builder->appendLine("input  metadata_t                 in_metadata,");
+    builder->appendLine("input  logic                      in_valid,");
+    builder->appendLine("output logic                      in_ready,");
+    builder->newline();
+    
+    // AXI-Stream output
+    builder->appendLine("// Packet output interface");
+    builder->appendLine("output logic [DATA_WIDTH-1:0]    m_axis_tdata,");
+    builder->appendLine("output logic [DATA_WIDTH/8-1:0]  m_axis_tkeep,");
+    builder->appendLine("output logic                      m_axis_tvalid,");
+    builder->appendLine("input  logic                      m_axis_tready,");
+    builder->appendLine("output logic                      m_axis_tlast,");
+    builder->appendLine("output logic [31:0]              m_axis_tuser");
+    
+    builder->decreaseIndent();
+    builder->appendLine(");");
+    builder->newline();
+    
+    // Internal signals
+    builder->appendLine("// Deparser state");
+    builder->appendLine("typedef enum logic [2:0] {");
+    builder->increaseIndent();
+    builder->appendLine("IDLE,");
+    builder->appendLine("EMIT_HEADERS,");
+    builder->appendLine("EMIT_PAYLOAD,");
+    builder->appendLine("DONE");
+    builder->decreaseIndent();
+    builder->appendLine("} deparse_state_t;");
+    builder->newline();
+    
+    builder->appendLine("deparse_state_t state, next_state;");
+    builder->newline();
+    
+    builder->appendLine("// Header assembly buffer");
+    builder->appendLine("logic [2047:0] header_buffer;  // Max header size");
+    builder->appendLine("logic [10:0] header_len;");
+    builder->appendLine("logic [10:0] emit_offset;");
+    builder->newline();
+    
+    // State machine
+    builder->appendLine("// State machine");
+    builder->appendLine("always_ff @(posedge clk) begin");
+    builder->increaseIndent();
+    builder->appendLine("if (!rst_n) begin");
+    builder->increaseIndent();
+    builder->appendLine("state <= IDLE;");
+    builder->decreaseIndent();
+    builder->appendLine("end else begin");
+    builder->increaseIndent();
+    builder->appendLine("state <= next_state;");
+    builder->decreaseIndent();
+    builder->appendLine("end");
+    builder->decreaseIndent();
+    builder->appendLine("end");
+    builder->newline();
+    
+    // State transitions
+    builder->appendLine("// Next state logic");
+    builder->appendLine("always_comb begin");
+    builder->increaseIndent();
+    builder->appendLine("next_state = state;");
+    builder->appendLine("case (state)");
+    builder->increaseIndent();
+    
+    builder->appendLine("IDLE: begin");
+    builder->increaseIndent();
+    builder->appendLine("if (in_valid && in_ready) begin");
+    builder->increaseIndent();
+    builder->appendLine("next_state = EMIT_HEADERS;");
+    builder->decreaseIndent();
+    builder->appendLine("end");
+    builder->decreaseIndent();
+    builder->appendLine("end");
+    
+    builder->appendLine("EMIT_HEADERS: begin");
+    builder->increaseIndent();
+    builder->appendLine("if (m_axis_tready && emit_offset >= header_len) begin");
+    builder->increaseIndent();
+    builder->appendLine("next_state = EMIT_PAYLOAD;");
+    builder->decreaseIndent();
+    builder->appendLine("end");
+    builder->decreaseIndent();
+    builder->appendLine("end");
+    
+    builder->appendLine("EMIT_PAYLOAD: begin");
+    builder->increaseIndent();
+    builder->appendLine("if (m_axis_tready && m_axis_tlast) begin");
+    builder->increaseIndent();
+    builder->appendLine("next_state = DONE;");
+    builder->decreaseIndent();
+    builder->appendLine("end");
+    builder->decreaseIndent();
+    builder->appendLine("end");
+    
+    builder->appendLine("DONE: begin");
+    builder->increaseIndent();
+    builder->appendLine("next_state = IDLE;");
+    builder->decreaseIndent();
+    builder->appendLine("end");
+    
+    builder->decreaseIndent();
+    builder->appendLine("endcase");
+    builder->decreaseIndent();
+    builder->appendLine("end");
+    builder->newline();
+    
+    // Packet assembly
+    emitPacketAssembly(builder);
+    builder->newline();
+    
+    // Stream output
+    emitStreamOutput(builder);
+    
+    builder->appendLine("endmodule");
+}
 
-  // pulsewire to initiate next state
-  DeparserStateVisitor visitor(builder);
-  for (auto r : states) {
-    r->apply(visitor);
-  }
-  builder->append_line("");
-
-  // Function: next_parse_state
-  auto len = states.size();
-  // bit0 is by default 0.
-  auto lenp1 = len + 1;
-  builder->append_format("function Bit#(%d) nextDeparseState(MetadataT metadata);", lenp1);
-  builder->incr_indent();
-  builder->append_format("Vector#(%d, Bool) headerValid;", lenp1);
-  builder->append_line("headerValid[0] = False;");
-  for (unsigned i = 0; i < states.size(); i++) {
-    cstring name = states.at(i)->indexed_name;
-    builder->append_format("headerValid[%d] = checkForward(metadata.hdr.%s);", i+1, name);
-  }
-  builder->append_line("let vec = pack(headerValid);");
-  builder->append_line("return vec;");
-  builder->decr_indent();
-  builder->append_line("endfunction");
-  builder->append_line("");
-
-  // Function: transit_next_state
-  builder->append_line("function Action transit_next_state(MetadataT metadata);");
-  builder->incr_indent();
-  builder->append_line("action");
-  builder->append_line("let vec = nextDeparseState(metadata);");
-  builder->append_line("if (vec == 0) begin");
-  builder->incr_indent();
-  builder->append_line("header_done <= True;");
-  builder->decr_indent();
-  builder->append_line("end");
-  builder->append_line("else begin");
-  builder->incr_indent();
-  auto nextVecLen = ceil(log2(lenp1));
-  builder->append_format("Bit#(%d) nextHeader = truncate(pack(countZerosLSB(vec)%% %d));", nextVecLen, lenp1 );
-  builder->append_line("DeparserState nextState = unpack(nextHeader);");
-  builder->append_line("case (nextState) matches");
-  builder->incr_indent();
-  for (unsigned i = 0; i < states.size(); i++) {
-    auto name = states.at(i)->name.name;
-    builder->append_format("StateDeparse%s: w_%s.send();", CamelCase(name), name);
-  }
-  builder->append_line("default: $display(\"ERROR: unknown states.\");");
-  builder->decr_indent();
-  builder->append_line("endcase");
-  builder->decr_indent();
-  builder->append_line("end");
-  builder->append_line("endaction");
-  builder->decr_indent();
-  builder->append_line("endfunction");
-
-  // Function: update_metadata
-  builder->append_line("function MetadataT update_metadata(DeparserState state);");
-  builder->incr_indent();
-  builder->append_line("let metadata = rg_metadata;");
-  if (states.size() > 0) {
-    builder->append_line("case (state) matches");
-    builder->incr_indent();
-    for (auto s : states) {
-      cstring name = s->name.toString();
-      cstring indexed_name = s->indexed_name;
-      builder->append_line("StateDeparse%s :", CamelCase(name));
-      builder->incr_indent();
-      builder->append_format("metadata.hdr.%s = updateState(metadata.hdr.%s, tagged StructDefines::NotPresent);", indexed_name, indexed_name);
-      builder->decr_indent();
+void SVDeparser::emitPacketAssembly(CodeBuilder* builder) {
+    std::stringstream ss;
+    
+    builder->appendLine("// Header assembly");
+    builder->appendLine("always_comb begin");
+    builder->increaseIndent();
+    builder->appendLine("header_buffer = '0;");
+    builder->appendLine("header_len = 0;");
+    builder->newline();
+    
+    // Concatenate headers in order
+    int offset = 0;
+    for (auto state : deparseStates) {
+        ss.str("");
+        ss << "if (in_headers." << state->headerName << "_valid) begin";
+        builder->appendLine(ss.str());
+        builder->increaseIndent();
+        
+        ss.str("");
+        ss << "header_buffer[" << (offset + state->width - 1) << ":" << offset 
+           << "] = in_headers." << state->headerName << ";";
+        builder->appendLine(ss.str());
+        
+        ss.str("");
+        ss << "header_len = header_len + " << state->width << ";";
+        builder->appendLine(ss.str());
+        
+        builder->decreaseIndent();
+        builder->appendLine("end");
+        
+        offset += state->width;
     }
-    builder->decr_indent();
-    builder->append_line("endcase");
-  }
-  builder->append_line("return metadata;");
-  builder->decr_indent();
-  builder->append_line("endfunction");
-  builder->append_line("let initState = StateDeparseStart;");
-  builder->append_line("`endif  // DEPARSER_STATE");
-
+    
+    builder->decreaseIndent();
+    builder->appendLine("end");
 }
 
-void FPGADeparser::emit(BSVProgram & bsv) {
-  builder = &bsv.getDeparserBuilder();
-  emitEnums();
-  emitRules();
-  emitStates();
+void SVDeparser::emitStreamOutput(CodeBuilder* builder) {
+    builder->appendLine("// AXI-Stream output generation");
+    builder->appendLine("always_ff @(posedge clk) begin");
+    builder->increaseIndent();
+    builder->appendLine("if (!rst_n) begin");
+    builder->increaseIndent();
+    builder->appendLine("m_axis_tdata <= '0;");
+    builder->appendLine("m_axis_tkeep <= '0;");
+    builder->appendLine("m_axis_tvalid <= 1'b0;");
+    builder->appendLine("m_axis_tlast <= 1'b0;");
+    builder->appendLine("emit_offset <= '0;");
+    builder->decreaseIndent();
+    builder->appendLine("end else begin");
+    builder->increaseIndent();
+    
+    builder->appendLine("case (state)");
+    builder->increaseIndent();
+    
+    builder->appendLine("EMIT_HEADERS: begin");
+    builder->increaseIndent();
+    builder->appendLine("if (m_axis_tready || !m_axis_tvalid) begin");
+    builder->increaseIndent();
+    builder->appendLine("m_axis_tdata <= header_buffer[emit_offset +: DATA_WIDTH];");
+    builder->appendLine("m_axis_tkeep <= '1;  // All bytes valid");
+    builder->appendLine("m_axis_tvalid <= 1'b1;");
+    builder->appendLine("emit_offset <= emit_offset + DATA_WIDTH;");
+    builder->appendLine("if (emit_offset + DATA_WIDTH >= header_len) begin");
+    builder->increaseIndent();
+    builder->appendLine("m_axis_tlast <= 1'b1;  // Simplified: headers only");
+    builder->decreaseIndent();
+    builder->appendLine("end");
+    builder->decreaseIndent();
+    builder->appendLine("end");
+    builder->decreaseIndent();
+    builder->appendLine("end");
+    
+    builder->appendLine("default: begin");
+    builder->increaseIndent();
+    builder->appendLine("if (m_axis_tready) begin");
+    builder->increaseIndent();
+    builder->appendLine("m_axis_tvalid <= 1'b0;");
+    builder->appendLine("m_axis_tlast <= 1'b0;");
+    builder->appendLine("emit_offset <= '0;");
+    builder->decreaseIndent();
+    builder->appendLine("end");
+    builder->decreaseIndent();
+    builder->appendLine("end");
+    
+    builder->decreaseIndent();
+    builder->appendLine("endcase");
+    
+    builder->decreaseIndent();
+    builder->appendLine("end");
+    builder->decreaseIndent();
+    builder->appendLine("end");
+    builder->newline();
+    
+    builder->appendLine("// Backpressure");
+    builder->appendLine("assign in_ready = (state == IDLE);");
 }
 
-}  // namespace FPGA
+}  // namespace SV

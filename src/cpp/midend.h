@@ -1,25 +1,28 @@
+#ifndef P4FPGA_MIDEND_H
+#define P4FPGA_MIDEND_H
 
-#ifndef EXTENSIONS_CPP_LIBP4FPGA_INCLUDE_MIDEND_H_
-#define EXTENSIONS_CPP_LIBP4FPGA_INCLUDE_MIDEND_H_
-
-#include "ir/ir.h"
-#include "options.h"
-#include "frontends/common/resolveReferences/referenceMap.h"
+#include "common.h"
 #include "frontends/p4/typeMap.h"
+#include "frontends/common/resolveReferences/referenceMap.h"
+#include "ir/pass_manager.h"
 
-namespace FPGA {
+namespace SV {
+
+class SVOptions;
 
 class MidEnd {
-    std::vector<DebugHook> hooks;
- public:
-    P4::ReferenceMap       refMap;
-    P4::TypeMap            typeMap;
-    const IR::ToplevelBlock* toplevel = nullptr;
-
-    void addDebugHook(DebugHook hook) { hooks.push_back(hook); }
-    const IR::ToplevelBlock* run(const IR::P4Program* program, const FPGAOptions& options);
+public:
+    P4::ReferenceMap refMap;
+    P4::TypeMap typeMap;
+    
+    MidEnd() {
+        refMap.setIsV1(true);  // Set for v1model
+    }
+    
+    const IR::ToplevelBlock* run(const SVOptions& options, 
+                                  const IR::P4Program* program);
 };
 
-}  // namespace FPGA
+}  // namespace SV
 
-#endif /* EXTENSIONS_CPP_LIBP4FPGA_INCLUDE_MIDEND_H_ */
+#endif

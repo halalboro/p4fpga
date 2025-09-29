@@ -1,770 +1,413 @@
-/*
-  Copyright 2015-2016 P4FPGA Project
-
-  Licensed under the Apache License, Version 2.0 (the "License");
-  you may not use this file except in compliance with the License.
-  You may obtain a copy of the License at
-
-  http://www.apache.org/licenses/LICENSE-2.0
-
-  Unless required by applicable law or agreed to in writing, software
-  distributed under the License is distributed on an "AS IS" BASIS,
-  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-  See the License for the specific language governing permissions and
-  limitations under the License.
-*/
-
+#include "common.h"
 #include "parser.h"
-#include "struct.h"
+#include "program.h"
+#include "lib/log.h"
+#include "lib/error.h"
+#include <sstream>
 #include <algorithm>
-#include "ir/ir.h"
-#include "string_utils.h"
-#include "vector_utils.h"
 
-namespace FPGA {
+namespace SV {
 
-cstring make_valid_ident(cstring name) {
-  return name.startsWith(".") ? name.substr(1) : name;
+SVParser::SVParser(SVProgram* program,
+                   const IR::ParserBlock* block,
+                   const P4::TypeMap* typeMap,
+                   const P4::ReferenceMap* refMap) :
+    program(program), 
+    parserBlock(block), 
+    typeMap(typeMap), 
+    refMap(refMap),
+    packet(nullptr),
+    headers(nullptr),
+    userMetadata(nullptr),
+    stdMetadata(nullptr),
+    startState(nullptr),
+    acceptState(nullptr),
+    totalHeaderBits(0) {
 }
 
-class SelectStmtCodeGen : public Inspector {
- public:
-  explicit SelectStmtCodeGen ( const IR::ParserState* state,
-                               const P4::TypeMap* typeMap,
-                               CodeBuilder* builder) :
-    builder(builder), state(state), typeMap(typeMap) {}
-  bool preorder(const IR::SelectExpression* expr) override;
-  bool preorder(const IR::ListExpression* expr) override;
-  bool preorder(const IR::PathExpression* path) override;
-  bool preorder(const IR::SelectCase* cas) override;
- private:
-  CodeBuilder* builder;
-  const IR::ParserState* state;
-  const P4::TypeMap* typeMap;
-  std::vector<cstring> match;
-  std::vector<cstring> params;
-  void emitFunctionProlog();
-  void emitFunctionEpilog();
-};
-
-bool SelectStmtCodeGen::preorder(const IR::ListExpression* expr) {
-  // QUESTION: how does typeMap maps ListExpression to Tuple#(Type_Bits)??
-  auto widthTuple = typeMap->getType(expr, true);
-  CHECK_NULL(widthTuple);
-  auto tpl = widthTuple->to<IR::Type_Tuple>();
-  CHECK_NULL(tpl);
-  // select -> (Bit#(n) key1, Bit#(n) key2) and list (key1, key2)
-  for (auto h : MakeZipRange(tpl->components, expr->components)) {
-    auto w = h.get<0>();
-    auto k = h.get<1>();
-    const IR::Member* member = k->to<IR::Member>();
-    if (member != nullptr) {
-      int width = w->width_bits();
-      // LOG1(" >>> select key " << member);
-      params.push_back("Bit#(" + std::to_string(width) + ") " + member->member);
-      match.push_back(member->member);
-    } else {
-      ::error("lookahead not handled yet");
-    }
-  }
-  // LOG1("param: " << params);
-  // LOG1("match: " << match);
-  return false;
-}
-
-void SelectStmtCodeGen::emitFunctionProlog() {
-  cstring name = make_valid_ident(state->name.toString());
-  if (params.size() != 0) {
-    builder->append_format("function Action compute_next_state_%s(%s);", name, join(params, ","));
-  } else {
-    builder->append_format("function Action compute_next_state_%s();", name);
-  }
-  builder->incr_indent();
-  builder->append_line("action");
-  if (match.size() != 0) {
-    builder->append_format("let v = {%s};", join(match, ","));
-  } else {
-    builder->append_line("let v = 0;");
-  }
-}
-
-void SelectStmtCodeGen::emitFunctionEpilog() {
-  builder->append_line("endaction");
-  builder->decr_indent();
-  builder->append_line("endfunction");
-}
-
-bool SelectStmtCodeGen::preorder(const IR::SelectCase* cas) {
-  cstring name = make_valid_ident(state->name.toString());
-  if (cas->keyset->is<IR::Constant>()) {
-    builder->append_format("%d: begin", cas->keyset->toString());
-    builder->incr_indent();
-    builder->append_line("w_%s_%s.send();", name, make_valid_ident(cas->state->toString()));
-    builder->decr_indent();
-    builder->append_line("end");
-  } else if (cas->keyset->is<IR::DefaultExpression>()) {
-    builder->append_line("default: begin");
-    builder->incr_indent();
-    builder->append_line("w_%s_%s.send();", name, make_valid_ident(cas->state->toString()));
-    builder->decr_indent();
-    builder->append_line("end");
-  }
-  return false;
-}
-
-bool SelectStmtCodeGen::preorder(const IR::SelectExpression* expr) {
-  // class SelectExpression : Expression
-  //   ListExpression            select;
-  //   inline Vector<SelectCase> selectCases;
-  CHECK_NULL(typeMap);
-  builder->append_line("`ifdef PARSER_FUNCTION");
-  visit(expr->select);
-  emitFunctionProlog();
-  builder->append_line("case(v) matches");
-  builder->incr_indent();
-  for (auto c: expr->selectCases) {
-    visit(c);
-  }
-  builder->decr_indent();
-  builder->append_line("endcase");
-  emitFunctionEpilog();
-  builder->append_line("`endif");
-  return false;
-}
-
-bool SelectStmtCodeGen::preorder(const IR::PathExpression* path) {
-  builder->append_line("`ifdef PARSER_FUNCTION");
-  builder->append_line("function Action compute_next_state_%s();", make_valid_ident(state->name.toString()));
-  builder->incr_indent();
-  builder->append_line("action");
-  builder->append_line("w_%s_%s.send();", make_valid_ident(state->toString()), path->toString());
-  builder->append_line("endaction");
-  builder->decr_indent();
-  builder->append_line("endfunction");
-  builder->append_line("`endif");
-  return false;
-}
-
-class ExtractStmtCodeGen : public Inspector {
- public:
-  explicit ExtractStmtCodeGen( const IR::ParserState* state,
-                               CodeBuilder* builder,
-                               int& num_rules) :
-    builder(builder), state(state), num_rules(num_rules) {}
-  bool preorder(const IR::MethodCallExpression* expr) override;
-  bool preorder(const IR::SelectCase* cas) override;
-  bool preorder(const IR::SelectExpression* expr) override;
-  bool preorder(const IR::PathExpression* expr) override;
- private:
-  CodeBuilder* builder;
-  const IR::ParserState* state;
-  int& num_rules;
-  std::set<cstring> visited;
-};
-
-bool ExtractStmtCodeGen::preorder (const IR::SelectCase* cas) {
-  cstring this_state = make_valid_ident(state->name.toString());
-  if (cas->keyset->is<IR::Constant>()) {
-    cstring next_state = make_valid_ident(cas->state->toString());
-    if (visited.find(this_state + next_state) != visited.end()) {
-      return false;
-    }
-    if (next_state == "accept") {
-      builder->append_line("`COLLECT_RULE(parse_fsm, joinRules(vec(genAcceptRule(w_%s_%s))));", this_state, next_state);
-    } else {
-      builder->append_line("`COLLECT_RULE(parse_fsm, joinRules(vec(genContRule(w_%s_%s, State%s, valueOf(%sSz)))));", this_state, next_state, CamelCase(next_state), CamelCase(next_state));
-    }
-    visited.insert(this_state + next_state);
-    num_rules++;
-  } else if (cas->keyset->is<IR::DefaultExpression>()) {
-    cstring next_state = make_valid_ident(cas->state->toString());
-
-    if (visited.find(this_state + next_state) != visited.end()) {
-      return false;
-    }
-
-    if (next_state == "accept") {
-      builder->append_line("`COLLECT_RULE(parse_fsm, joinRules(vec(genAcceptRule(w_%s_%s))));", this_state, next_state);
-    } else {
-      builder->append_line("`COLLECT_RULE(parse_fsm, joinRules(vec(genContRule(w_%s_%s, State%s, valueOf(%sSz)))));", this_state, next_state, CamelCase(next_state), CamelCase(next_state));
-    }
-
-    visited.insert(this_state + next_state);
-    num_rules++;
-  }
-  return false;
-}
-
-bool ExtractStmtCodeGen::preorder (const IR::SelectExpression* expr) {
-  for (auto c: expr->selectCases) {
-    visit(c);
-  }
-  return false;
-}
-
-bool ExtractStmtCodeGen::preorder (const IR::PathExpression*) {
-  return false;
-}
-
-bool ExtractStmtCodeGen::preorder (const IR::MethodCallExpression* expr) {
-  cstring this_state = make_valid_ident(state->name.toString());
-  for (auto h: MakeZipRange(*expr->typeArguments, *expr->arguments)) {
-    builder->append_line("`COLLECT_RULE(parse_fsm, joinRules(vec(genLoadRule(State%s, valueOf(%sSz)))));", CamelCase(this_state), CamelCase(this_state));
-    num_rules++;
-    builder->append_line("`COLLECT_RULE(parse_fsm, joinRules(vec(genExtractRule(State%s, valueOf(%sSz)))));", CamelCase(this_state), CamelCase(this_state));
-    num_rules++;
-  }
-  return false;
-}
-
-class ExtractLenCodeGen : public Inspector {
- public:
-  explicit ExtractLenCodeGen ( const IR::ParserState* state,
-                               const P4::TypeMap* typeMap,
-                               CodeBuilder* builder) :
-    builder(builder), state(state), typeMap(typeMap) {}
-  bool preorder(const IR::MethodCallExpression* expr) override;
- private:
-  CodeBuilder* builder;
-  const IR::ParserState* state;
-  const P4::TypeMap* typeMap;
-};
-
-bool ExtractLenCodeGen::preorder (const IR::MethodCallExpression* expr) {
-  LOG1("<<<" << expr->method->toString());
-  if (expr->method->toString() == "packet.extract") {
-    for (auto h: MakeZipRange(*expr->typeArguments, *expr->arguments)) {
-      auto typeName = h.get<0>();
-      auto header_type = typeMap->getType(typeName, true);
-      CHECK_NULL(header_type);
-      int header_width = header_type->width_bits();
-      builder->append_line("typedef %d %sSz;", header_width, CamelCase(make_valid_ident(state->toString())));
-    }
-  } else if (expr->method->toString() == "packet.lookahead") {
-    ::warning("look ahead not handled");
-  }
-  return false;
-}
-
-class ExtractFuncCodeGen : public Inspector {
- public:
-  explicit ExtractFuncCodeGen ( const IR::ParserState* state,
-                                const P4::TypeMap* typeMap,
-                                CodeBuilder* builder) :
-    builder(builder), state(state), typeMap(typeMap) {
-      printPath = false;
-    }
-  bool preorder(const IR::MethodCallExpression* expr) override;
-  bool preorder(const IR::ListExpression* expr) override;
-  bool preorder(const IR::AssignmentStatement* stmt) override;
-  bool preorder(const IR::Member* member) override;
-  bool preorder(const IR::Constant* constant) override;
- private:
-  CodeBuilder* builder;
-  const IR::ParserState* state;
-  const P4::TypeMap* typeMap;
-  std::vector<cstring> match;
-  bool printPath;
-  int index = 0;
-};
-
-bool ExtractFuncCodeGen::preorder(const IR::ListExpression* expr) {
-  // select -> list (key1, key2)
-  for (auto h : expr->components) {
-    const IR::Member* member = h->to<IR::Member>();
-    if (member != nullptr) {
-      auto header = member->expr->to<IR::Member>();
-      cstring name = header->member.toString() + "." + member->member.toString();
-      match.push_back(name);
-    } else {
-      ::error("lookahead not handled yet");
-    }
-  }
-  return false;
-}
-
-bool ExtractFuncCodeGen::preorder (const IR::AssignmentStatement* stmt) {
-  if (stmt->right->is<IR::Member>()) {
-    const IR::Member* expr = stmt->right->to<IR::Member>();
-    const IR::Member* header = expr->expr->to<IR::Member>();
-    cstring src_name = header->member.toString() + "." + expr->member.toString();
-
-    if (stmt->left->is<IR::Member>()) {
-      const IR::Member* left = stmt->left->to<IR::Member>();
-      auto type = typeMap->getType(left->expr);
-      const IR::Member* dst_hdr = left->expr->to<IR::Member>();
-      CHECK_NULL(dst_hdr);
-      cstring dst_name = dst_hdr->member.toString();
-      cstring tmp_var = left->member.toString();
-
-      builder->append_line("let %s = %s;", tmp_var, src_name);
-
-      builder->emitIndent();
-      builder->appendFormat("%s ", CamelCase(type->getP4Type()->toString()));
-      builder->appendFormat("%s ", dst_name);
-      builder->appendLine("= defaultValue;");
-
-      builder->emitIndent();
-      builder->appendFormat("%s.%s", dst_name, tmp_var);
-      builder->appendFormat("= %s;", tmp_var);
-      builder->newline();
-
-      builder->emitIndent();
-      builder->appendFormat("rg_%s", dst_name);
-      builder->appendFormat("<= tagged Valid %s;", dst_name);
-      builder->newline();
-    }
-  } else if (stmt->right->is<IR::Operation_Binary>()) {
-    auto expr = stmt->right->to<IR::Operation_Binary>();
-    if (stmt->left->is<IR::Member>()) {
-      const IR::Member* left = stmt->left->to<IR::Member>();
-      auto type = typeMap->getType(left->expr);
-      const IR::Member* dst_hdr = left->expr->to<IR::Member>();
-      CHECK_NULL(dst_hdr);
-      cstring dst_name = dst_hdr->member.toString();
-      cstring tmp_var = left->member.toString();
-
-      builder->emitIndent();
-      builder->appendFormat("%s ", CamelCase(type->getP4Type()->toString()));
-      builder->appendFormat("%s ", dst_name);
-      builder->appendFormat("= fromMaybe(?, rg_%s);", dst_name);
-      builder->newline();
-
-      // build expression tree properly
-      builder->emitIndent();
-      builder->appendFormat("let %s = ", tmp_var);
-      printPath=true;
-      visit(expr->left);
-      builder->appendFormat(stmt->right->toString());
-      visit(expr->right);
-      printPath=false;
-      builder->appendLine(";");
-
-      builder->emitIndent();
-      builder->appendFormat("%s.%s", dst_name, tmp_var);
-      builder->appendFormat("= %s;", tmp_var);
-      builder->newline();
-
-      builder->emitIndent();
-      builder->appendFormat("rg_%s", dst_name);
-      builder->appendFormat("<= tagged Valid %s;", dst_name);
-      builder->newline();
-    }
-  }
-  return false;
-}
-
-bool ExtractFuncCodeGen::preorder (const IR::Member* member) {
-  if (!printPath) return false;
-  const IR::Member* dst_hdr = member->expr->to<IR::Member>();
-  CHECK_NULL(dst_hdr);
-  cstring dst_name = dst_hdr->member.toString();
-  cstring dst_field = member->member.toString();
-  cstring dst_path = dst_name + "." + dst_field;
-  builder->appendFormat("%s", dst_path);
-  return false;
-}
-
-bool ExtractFuncCodeGen::preorder (const IR::Constant* constant) {
-  if (!printPath) return false;
-  builder->appendFormat(constant->toString());
-  return false;
-}
-
-bool ExtractFuncCodeGen::preorder (const IR::MethodCallExpression* expr) {
-  cstring this_state = make_valid_ident(state->name.toString());
-  visit(state->selectExpression);
-  for (auto h: MakeZipRange(*expr->typeArguments, *expr->arguments)) {
-    auto typeName = h.get<0>();
-    auto instName = h.get<1>();
-    auto header_type = typeMap->getType(typeName, true);
-    const IR::Member* member = instName->to<IR::Member>();
-    cstring header = member->member.toString();
-    builder->append_line("let %s = extract_%s(truncate(data));", header, typeName->toString());
-    for (auto stmt : state->components) {
-      if (stmt->is<IR::AssignmentStatement>()) {
-        visit(stmt);
-      }
-    }
-
-    builder->append_line("Header#(%s) header%d = defaultValue;", CamelCase(typeName->toString()), index);
-    builder->append_line("header%d.hdr = %s;", index, header);
-    builder->append_line("header%d.state = tagged Forward;", index);
-    builder->append_format("%s_out_ff.enq(tagged Valid header%d);", header, index);
-    index++;
-  }
-  if (match.size() != 0) {
-    builder->append_format("compute_next_state_%s(%s);", this_state, join(match, ","));
-  } else {
-    builder->append_format("compute_next_state_%s();", this_state);
-  }
-  return false;
-}
-
-class PulseWireCodeGen : public Inspector {
- public:
-  explicit PulseWireCodeGen ( const IR::ParserState* state,
-                              CodeBuilder* builder) :
-    builder(builder), state(state) {}
-  bool preorder(const IR::SelectCase* cas) override;
-  bool preorder (const IR::SelectExpression* expr) override;
-  bool preorder (const IR::PathExpression* expr) override;
- private:
-  CodeBuilder* builder;
-  const IR::ParserState* state;
-  std::set<cstring> visited;
-};
-
-bool PulseWireCodeGen::preorder(const IR::SelectCase* cas) {
-  cstring this_state = make_valid_ident(state->name.toString());
-  cstring next_state = make_valid_ident(cas->state->toString());
-  if (visited.find(next_state) != visited.end()) {
-    return false;
-  }
-  if (cas->keyset->is<IR::Constant>()) {
-    builder->append_line("PulseWire w_%s_%s <- mkPulseWire();", this_state, next_state);
-    visited.insert(next_state);
-  } else if (cas->keyset->is<IR::DefaultExpression>()) {
-    builder->append_line("PulseWire w_%s_%s <- mkPulseWire();", this_state, next_state);
-    visited.insert(next_state);
-  }
-  return false;
-}
-
-bool PulseWireCodeGen::preorder(const IR::PathExpression* expr) {
-  cstring this_state = make_valid_ident(state->name.toString());
-  cstring next_state = expr->toString();
-  if (visited.find(next_state) != visited.end()) {
-    return false;
-  }
-  builder->append_line("PulseWire w_%s_%s <- mkPulseWire();", this_state, next_state);
-  visited.insert(next_state);
-  return false;
-}
-
-bool PulseWireCodeGen::preorder (const IR::SelectExpression* expr) {
-  for (auto c: expr->selectCases) {
-    visit(c);
-  }
-  return false;
-}
-
-class DfifoCodeGen : public Inspector {
- public:
-  explicit DfifoCodeGen (CodeBuilder* builder) :
-    builder(builder) {}
-  bool preorder(const IR::MethodCallExpression* expr) override;
-
- private:
-  CodeBuilder* builder;
-  std::set<cstring> visited;
-};
-
-bool DfifoCodeGen::preorder(const IR::MethodCallExpression* expr) {
-  if (expr->method->toString() == "packet.extract") {
-    for (auto h: MakeZipRange(*expr->typeArguments, *expr->arguments)) {
-      auto typeName = h.get<0>();
-      auto instName = h.get<1>();
-      cstring type = CamelCase(typeName->toString());
-      const IR::Member* member = instName->to<IR::Member>();
-      cstring name = member->member;
-      if (visited.find(name) != visited.end()) {
+bool SVParser::build() {
+    // Get parameters (as defined in v1model)
+    auto pl = parserBlock->container->type->applyParams;
+    if (pl->size() != 4) {
+        P4::error("Expected parser to have exactly 4 parameters, got %1%", pl->size());
         return false;
-      }
-      builder->append_line("FIFOF#(Maybe#(Header#(%s))) %s_out_ff <- mkDFIFOF(tagged Invalid);", type, name);
-      visited.insert(name);
     }
-  } else if (expr->method->toString() == "packet.lookahead") {
-    ::warning("look ahead not handled");
-  }
-  return false;
+    
+    // Standard v1model parameter order
+    packet = pl->getParameter(0);
+    headers = pl->getParameter(1);
+    userMetadata = pl->getParameter(2);
+    stdMetadata = pl->getParameter(3);
+    
+    // Extract and analyze parser states
+    extractStates();
+    analyzeTransitions();
+    calculateHeaderOffsets();
+    
+    return true;
 }
 
-class RegCodeGen : public Inspector {
- public:
-  explicit RegCodeGen (const P4::TypeMap* typeMap,
-                       CodeBuilder* builder) :
-    builder(builder), typeMap(typeMap) {}
-  bool preorder(const IR::Type_Struct* strt);
- private:
-  CodeBuilder* builder;
-  const P4::TypeMap* typeMap;
-};
-
-bool RegCodeGen::preorder(const IR::Type_Struct* strt) {
-  for (auto f : strt->fields) {
-    auto type = typeMap->getType(f);
-    auto type_name = CamelCase(type->getP4Type()->toString());
-    auto name = f->toString();
-    builder->append_line("Reg#(Maybe#(%s)) rg_%s <- mkReg(tagged Invalid);", type_name, name);
-  }
-  return false;
-}
-
-class InitStateCodeGen : public Inspector {
- public:
-  explicit InitStateCodeGen (const P4::ReferenceMap* refMap,
-                             CodeBuilder* builder) :
-    builder(builder), refMap(refMap) {}
-  bool preorder(const IR::ParserState* state) override;
- private:
-  CodeBuilder* builder;
-  const P4::ReferenceMap* refMap;
-};
-
-bool InitStateCodeGen::preorder(const IR::ParserState* state) {
-  if (make_valid_ident(state->name.toString()) == "start") {
-    // NOTE: assume start state is actually called 'start'
-    if (state->components.size() == 0) {
-      if (state->selectExpression->is<IR::PathExpression>()) {
-        auto expr = state->selectExpression->to<IR::PathExpression>();
-        auto inst = refMap->getDeclaration(expr->path, true);
-        if (inst->is<IR::ParserState>()) {
-          auto pstate = inst->to<IR::ParserState>();
-          builder->append_line("let initState = State%s;", CamelCase(make_valid_ident(state->name.toString())));
+void SVParser::extractStates() {
+    // Find start state (first state in the list)
+    if (parserBlock->container->states.size() > 0) {
+        startState = parserBlock->container->states.at(0);
+    }
+    
+    // Process all states
+    for (auto state : parserBlock->container->states) {
+        auto svState = new SVParseState(state);
+        
+        // Extract statements (header extraction)
+        for (auto stmt : state->components) {
+            if (auto extract = stmt->to<IR::MethodCallStatement>()) {
+                auto method = extract->methodCall;
+                if (method && method->method->toString() == "extract") {
+                    // Handle IR::Argument properly
+                    if (method->arguments && method->arguments->size() > 0) {
+                        auto arg = method->arguments->at(0);
+                        if (arg->expression) {
+                            svState->extracts.push_back(arg->expression);
+                        }
+                    }
+                }
+            }
         }
-      }
-    } else {
-      builder->append_line("let initState = State%s;", CamelCase(make_valid_ident(state->name.toString())));
+        
+        // Handle transitions
+        if (state->selectExpression != nullptr) {
+            if (auto select = state->selectExpression->to<IR::SelectExpression>()) {
+                // Complex select expression
+                for (auto selectCase : select->selectCases) {
+                    // Track next state
+                    if (auto nextState = selectCase->state->to<IR::PathExpression>()) {
+                        svState->transitions[cstring("default")] = nextState->path->name;
+                    }
+                }
+            } else if (auto path = state->selectExpression->to<IR::PathExpression>()) {
+                // Simple transition
+                svState->transitions[cstring("always")] = path->path->name;
+            }
+        }
+        
+        stateMap[state->name] = svState;
+        stateList.push_back(svState);
+        
+        if (state->name == "accept") {
+            acceptState = state;
+        }
     }
-  }
-  return false;
 }
 
-FPGAParser::FPGAParser(FPGAProgram* program,
-                       const IR::ParserBlock* block,
-                       const P4::TypeMap* typeMap,
-                       const P4::ReferenceMap* refMap) :
-  program(program), refMap(refMap), typeMap(typeMap),
-  packet(nullptr), headers(nullptr), parserBlock(block) {
-}
-
-// FIXME: stack is not handled
-void FPGAParser::emitEnums() {
-  builder->append_line("`ifdef PARSER_STRUCT");
-  builder->append_line("typedef enum {");
-  builder->incr_indent();
-  std::vector<cstring> state_vec;
-  for (auto state: parserBlock->container->states) {
-    state_vec.push_back(make_valid_ident(state->name.toString()));
-  }
-  for (auto s : state_vec) {
-    if (s == state_vec.back())
-      builder->append_format("State%s", CamelCase(s));
-    else
-      builder->append_format("State%s,", CamelCase(s));
-  }
-  builder->decr_indent();
-  builder->append_line("} ParserState deriving (Bits, Eq);");
-  builder->append_line("`endif");
-}
-
-void FPGAParser::emitStructs(BSVProgram & bsv) {
-  // assume all headers are parsed_out
-  // optimization opportunity ??
-  auto type = typeMap->getType(headers);
-  CHECK_NULL(type);
-
-  CodeBuilder* struct_builder = &bsv.getStructBuilder();
-  StructCodeGen visitor(program, struct_builder);
-
-  const IR::Type_Struct* ir_struct = type->to<IR::Type_Struct>();
-  CHECK_NULL(ir_struct);
-
-  for (auto f : ir_struct->fields) {
-    auto field_t = typeMap->getType(f);
-    if (field_t->is<IR::Type_Header>()) {
-      field_t->apply(visitor);
-    } else if (field_t->is<IR::Type_Stack>()) {
-      const IR::Type_Stack* stack_t = field_t->to<IR::Type_Stack>();
-      const IR::Type_Header* header_t = stack_t->elementType->to<IR::Type_Header>();
-      CHECK_NULL(header_t);
-      header_t->apply(visitor);
+void SVParser::analyzeTransitions() {
+    // Analyze state transitions and build transition conditions
+    for (auto& p : stateMap) {
+        auto name = p.first;
+        auto state = p.second;
+        LOG3("State " << name << " has " << state->transitions.size() << " transitions");
     }
-  }
+}
 
-  auto meta = typeMap->getType(userMetadata);
-  CHECK_NULL(meta);
-
-  auto meta_struct = meta->to<IR::Type_Struct>();
-
-  for (auto f : meta_struct->fields) {
-    auto field_t = typeMap->getType(f);
-    if (field_t->is<IR::Type_Struct>()) {
-      field_t->apply(visitor);
+void SVParser::calculateHeaderOffsets() {
+    // Calculate bit offsets for each header field
+    totalHeaderBits = 0;
+    
+    if (!headers) return;
+    
+    auto headersType = typeMap->getType(headers);
+    
+    if (headersType && headersType->is<IR::Type_Struct>()) {
+        auto structType = headersType->to<IR::Type_Struct>();
+        for (auto field : structType->fields) {
+            auto fieldType = typeMap->getType(field);
+            int width = fieldType->width_bits();
+            headerOffsets[field->name] = totalHeaderBits;
+            headerWidths[field->name] = width;
+            totalHeaderBits += width;
+            LOG3("Header field " << field->name << " at offset " << headerOffsets[field->name] 
+                 << " width " << width);
+        }
     }
-  }
 }
 
-// convert every field in struct headers to its origial header type
-void FPGAParser::emitAcceptedHeaders(const IR::Type_Struct* headers) {
-  for (auto h : headers->fields) {
-    auto node = h->getNode();
-    auto type = typeMap->getType(node, true);
-    auto name = h->name.toString();
-    if (type->is<IR::Type_Header>()) {
-      builder->append_format("let %s <- toGet(%s_out_ff).get;", name, name);
-      builder->append_format("meta.hdr.%s = %s;", name, name);
-      for (auto m : program->metadata) {
-        auto member = m.second;
-      }
-    } else if (type->is<IR::Type_Stack>()) {
-      ::warning("TODO: generate out_ff for header stack;");
-    } else {
-      ::error("Unknown header type ", type);
+void SVParser::emit(SVCodeGen& codegen) {
+    auto builder = codegen.getParserBuilder();
+    std::stringstream ss;
+    
+    // Module header
+    builder->appendLine("//");
+    builder->appendLine("// P4 Parser Module");
+    ss << "// Generated from: " << parserBlock->container->name;
+    builder->appendLine(ss.str());
+    builder->appendLine("//");
+    builder->newline();
+    
+    builder->appendLine("`include \"types.svh\"");
+    builder->newline();
+    
+    // Module declaration
+    builder->appendLine("module parser #(");
+    builder->increaseIndent();
+    builder->appendLine("parameter DATA_WIDTH = 512");
+    builder->decreaseIndent();
+    builder->appendLine(") (");
+    builder->increaseIndent();
+    
+    // Clock and reset
+    builder->appendLine("input  logic                      clk,");
+    builder->appendLine("input  logic                      rst_n,");
+    builder->newline();
+    
+    // AXI-Stream input
+    builder->appendLine("// Packet input interface");
+    builder->appendLine("input  logic [DATA_WIDTH-1:0]    s_axis_tdata,");
+    builder->appendLine("input  logic [DATA_WIDTH/8-1:0]  s_axis_tkeep,");
+    builder->appendLine("input  logic                      s_axis_tvalid,");
+    builder->appendLine("output logic                      s_axis_tready,");
+    builder->appendLine("input  logic                      s_axis_tlast,");
+    builder->newline();
+    
+    // Output interface
+    builder->appendLine("// Parsed headers and metadata output");
+    builder->appendLine("output headers_t                  out_headers,");
+    builder->appendLine("output metadata_t                 out_metadata,");
+    builder->appendLine("output logic                      out_valid,");
+    builder->appendLine("input  logic                      out_ready");
+    
+    builder->decreaseIndent();
+    builder->appendLine(");");
+    builder->newline();
+    
+    // Internal signals
+    builder->appendLine("// Internal signals");
+    builder->appendLine("parser_state_t current_state, next_state;");
+    builder->appendLine("logic [DATA_WIDTH-1:0] packet_buffer, packet_buffer_next;");
+    builder->appendLine("logic [9:0] extract_offset, extract_offset_next;");
+    builder->appendLine("headers_t headers_reg, headers_next;");
+    builder->appendLine("metadata_t metadata_reg, metadata_next;");
+    builder->appendLine("logic parsing_done, load_packet;");
+    builder->newline();
+    
+    emitStateEnum(builder);
+    builder->newline();
+    
+    emitStateMachine(builder);
+    builder->newline();
+    emitHeaderExtraction(builder);
+    builder->newline();
+    emitTransitionLogic(builder);
+    builder->newline();
+    emitInterface(builder);
+    
+    builder->appendLine("endmodule");
+}
+
+void SVParser::emitStateEnum(CodeBuilder* builder) {
+    std::stringstream ss;
+    
+    builder->appendLine("// Parser states");
+    builder->appendLine("typedef enum logic [3:0] {");
+    builder->increaseIndent();
+    
+    int stateNum = 0;
+    for (auto state : stateList) {
+        std::string upperName = state->name.string();
+        std::transform(upperName.begin(), upperName.end(), upperName.begin(), ::toupper);
+        
+        ss.str("");
+        ss << "STATE_" << upperName << " = 4'd" << stateNum;
+        if (stateNum < stateList.size() - 1) {
+            ss << ",";
+        }
+        builder->appendLine(ss.str());
+        stateNum++;
     }
-  }
+    
+    builder->decreaseIndent();
+    builder->appendLine("} parser_state_t;");
 }
 
-// User declared metadata are used in two places:
-// - parser
-// - pipeline
-// When used in parser, there is no need to create an out_ff.
-//
-void FPGAParser::emitUserMetadata(const IR::Type_Struct* metadata) {
-  for (auto h : metadata->fields) {
-    cstring header = h->toString();
-    builder->append_line("meta.meta.%s = rg_%s;", header, header);
-  }
+void SVParser::emitStateMachine(CodeBuilder* builder) {
+    builder->appendLine("// Main state machine");
+    builder->appendLine("always_ff @(posedge clk) begin");
+    builder->increaseIndent();
+    builder->appendLine("if (!rst_n) begin");
+    builder->increaseIndent();
+    builder->appendLine("current_state <= STATE_START;");
+    builder->appendLine("packet_buffer <= '0;");
+    builder->appendLine("extract_offset <= '0;");
+    builder->appendLine("headers_reg <= '0;");
+    builder->appendLine("metadata_reg <= '0;");
+    builder->decreaseIndent();
+    builder->appendLine("end else begin");
+    builder->increaseIndent();
+    builder->appendLine("current_state <= next_state;");
+    builder->appendLine("packet_buffer <= packet_buffer_next;");
+    builder->appendLine("extract_offset <= extract_offset_next;");
+    builder->appendLine("headers_reg <= headers_next;");
+    builder->appendLine("metadata_reg <= metadata_next;");
+    builder->decreaseIndent();
+    builder->appendLine("end");
+    builder->decreaseIndent();
+    builder->appendLine("end");
 }
 
-void FPGAParser::emitAcceptRule() {
-  builder->append_line("rule rl_accept if (delay_ff.notEmpty);");
-  builder->incr_indent();
-  builder->append_line("delay_ff.deq;");
-  builder->append_line("MetadataT meta = defaultValue;");
-  for (auto h : *program->program->getDeclarations()) {
-    // In V1 model, metadata comes from three sources:
-    // - standard_metadata, metadata, header
-    if (h->is<IR::Type_Struct>()) {
-      auto h_struct = h->to<IR::Type_Struct>();
-      auto name = h_struct->name.toString();
-      // only handle one of the three above
-      if (name == "standard_metadata") {
-        // TODO: emitStandardMetadata();
-      } else if (name == "metadata") {
-        // this struct contains all extracted metadata
-        LOG1("metadata" << h_struct);
-        emitUserMetadata(h_struct);
-      } else if (name == "headers") {
-        LOG1("headers " << h_struct);
-        emitAcceptedHeaders(h_struct);
-      } else {
-        // - struct used by externs, such as checksum
-      }
+void SVParser::emitHeaderExtraction(CodeBuilder* builder) {
+    std::stringstream ss;
+    
+    builder->appendLine("// Header extraction logic");
+    builder->appendLine("always_comb begin");
+    builder->increaseIndent();
+    builder->appendLine("headers_next = headers_reg;");
+    builder->appendLine("metadata_next = metadata_reg;");
+    builder->appendLine("packet_buffer_next = packet_buffer;");
+    builder->appendLine("extract_offset_next = extract_offset;");
+    builder->newline();
+    
+    builder->appendLine("case (current_state)");
+    builder->increaseIndent();
+    
+    // Generate extraction logic for each state
+    for (auto state : stateList) {
+        std::string upperName = state->name.string();
+        std::transform(upperName.begin(), upperName.end(), upperName.begin(), ::toupper);
+        
+        ss.str("");
+        ss << "STATE_" << upperName << ": begin";
+        builder->appendLine(ss.str());
+        builder->increaseIndent();
+        
+        // Handle extracts in this state
+        if (!state->extracts.empty()) {
+            builder->appendLine("// Extract headers");
+            for (auto extract : state->extracts) {
+                if (auto member = extract->to<IR::Member>()) {
+                    auto headerName = member->member.toString();
+                    if (headerWidths.count(member->member)) {
+                        int width = headerWidths[member->member];
+                        
+                        ss.str("");
+                        ss << "headers_next." << headerName << " = packet_buffer[extract_offset +: " << width << "];";
+                        builder->appendLine(ss.str());
+                        
+                        ss.str("");
+                        ss << "extract_offset_next = extract_offset + " << width << ";";
+                        builder->appendLine(ss.str());
+                    }
+                }
+            }
+        }
+        
+        builder->decreaseIndent();
+        builder->appendLine("end");
     }
-  }
-  builder->append_line("rg_tmp[0] <= 0;");
-  //builder->append_line("rg_shift_amt[0] <= 0;");
-  builder->append_line("rg_buffered[0] <= 0;");
-  builder->append_line("meta_in_ff.enq(meta);");
-  builder->decr_indent();
-  builder->append_line("endrule");
+    
+    builder->appendLine("default: begin");
+    builder->increaseIndent();
+    builder->appendLine("// Stay in current state");
+    builder->decreaseIndent();
+    builder->appendLine("end");
+    
+    builder->decreaseIndent();
+    builder->appendLine("endcase");
+    builder->decreaseIndent();
+    builder->appendLine("end");
 }
 
-// emit BSV_IR with BSV-specific CodeGenInspector
-void FPGAParser::emit(BSVProgram & bsv) {
-  CHECK_NULL(typeMap);
+void SVParser::emitTransitionLogic(CodeBuilder* builder) {
+    std::stringstream ss;
+    
+    builder->appendLine("// State transition logic");
+    builder->appendLine("always_comb begin");
+    builder->increaseIndent();
+    builder->appendLine("next_state = current_state;");
+    builder->appendLine("parsing_done = 1'b0;");
+    builder->appendLine("load_packet = 1'b0;");
+    builder->newline();
+    
+    builder->appendLine("case (current_state)");
+    builder->increaseIndent();
+    
+    for (auto state : stateList) {
+        std::string upperName = state->name.string();
+        std::transform(upperName.begin(), upperName.end(), upperName.begin(), ::toupper);
+        
+        ss.str("");
+        ss << "STATE_" << upperName << ": begin";
+        builder->appendLine(ss.str());
+        builder->increaseIndent();
+        
+        if (state->name == "start") {
+            builder->appendLine("if (s_axis_tvalid && s_axis_tready) begin");
+            builder->increaseIndent();
+            builder->appendLine("load_packet = 1'b1;");
 
-  builder = &bsv.getParserBuilder();
-
-  // translate
-  emitEnums();
-  // translate
-  emitStructs(bsv);
-
-  // translate select statement to bluespec function
-  for (auto state: parserBlock->container->states) {
-    SelectStmtCodeGen selectCodeGen(state, typeMap, builder);
-    state->selectExpression->apply(selectCodeGen);
-  }
-
-  builder->append_line("`ifdef PARSER_FUNCTION");
-  for (auto state: parserBlock->container->states) {
-    InitStateCodeGen initStateCodeGen(refMap, builder);
-    state->apply(initStateCodeGen);
-  }
-  builder->append_line("`endif");
-
-  builder->append_line("`ifdef PARSER_STRUCT");
-  int num_rules = 0;
-  for (auto state: parserBlock->container->states) {
-    ExtractLenCodeGen extractLenCodeGen(state, typeMap, builder);
-    state->apply(extractLenCodeGen);
-  }
-  builder->append_line("`endif");
-
-  builder->append_line("`ifdef PARSER_FUNCTION");
-  builder->append_line("function Action extract_header(ParserState state, Bit#(512) data);");
-  builder->incr_indent();
-  builder->append_line("action");
-  builder->append_line("case (state) matches");
-  builder->incr_indent();
-  for (auto state: parserBlock->container->states) {
-    cstring this_state = make_valid_ident(state->name.toString());
-    builder->append_line("State%s : begin", CamelCase(this_state));
-    builder->incr_indent();
-    ExtractFuncCodeGen extractCodeGen(state, typeMap, builder);
-    state->apply(extractCodeGen);
-    builder->decr_indent();
-    builder->append_line("end");
-  }
-  builder->decr_indent();
-  builder->append_line("endcase");
-  builder->append_line("endaction");
-  builder->decr_indent();
-  builder->append_line("endfunction");
-  builder->append_line("`endif");
-
-  builder->append_line("`ifdef PARSER_RULES");
-  for (auto state: parserBlock->container->states) {
-    ExtractStmtCodeGen extractCodeGen(state, builder, num_rules);
-    state->apply(extractCodeGen);
-  }
-  builder->append_line("Vector#(%d, Rules) fsmRules = toVector(parse_fsm);", num_rules);
-  builder->append_line("`endif");
-
-  builder->append_line("`ifdef PARSER_RULES");
-  emitAcceptRule();
-  builder->append_line("`endif");
-
-  // emit state variables
-  // PulseWire for state transition
-  builder->append_line("`ifdef PARSER_STATE");
-  for (auto state: parserBlock->container->states) {
-    PulseWireCodeGen pulsewireCodeGen(state, builder);
-    state->selectExpression->apply(pulsewireCodeGen);
-  }
-
-  // DFIFOF for exporting extracted header
-  for (auto state: parserBlock->container->states) {
-    DfifoCodeGen dfifoCodeGen(builder);
-    state->apply(dfifoCodeGen);
-  }
-
-  // Register for local metadata modified by set_metadata()
-  auto usermeta = typeMap->getType(userMetadata);
-  RegCodeGen visitor(typeMap, builder);
-  usermeta->apply(visitor);
-
-  builder->append_line("`endif");
+            if (state->transitions.count(cstring("always"))) {
+                std::string nextStateName = state->transitions.at(cstring("always")).string();
+                std::transform(nextStateName.begin(), nextStateName.end(), nextStateName.begin(), ::toupper);
+                
+                ss.str("");
+                ss << "next_state = STATE_" << nextStateName << ";";
+                builder->appendLine(ss.str());
+            }
+            builder->decreaseIndent();
+            builder->appendLine("end");
+        } else if (state->name == "accept") {
+            builder->appendLine("parsing_done = 1'b1;");
+            builder->appendLine("if (out_ready) begin");
+            builder->increaseIndent();
+            builder->appendLine("next_state = STATE_START;");
+            builder->decreaseIndent();
+            builder->appendLine("end");
+        } else {
+            // Regular state transitions
+            for (auto& p : state->transitions) {
+                auto condition = p.first;
+                auto nextStateName = p.second.string();
+                
+                if (condition == "always") {
+                    std::transform(nextStateName.begin(), nextStateName.end(), nextStateName.begin(), ::toupper);
+                    
+                    ss.str("");
+                    ss << "next_state = STATE_" << nextStateName << ";";
+                    builder->appendLine(ss.str());
+                }
+            }
+        }
+        
+        builder->decreaseIndent();
+        builder->appendLine("end");
+    }
+    
+    builder->appendLine("default: begin");
+    builder->increaseIndent();
+    builder->appendLine("next_state = STATE_START;");
+    builder->decreaseIndent();
+    builder->appendLine("end");
+    
+    builder->decreaseIndent();
+    builder->appendLine("endcase");
+    builder->decreaseIndent();
+    builder->appendLine("end");
 }
 
-// build IR::BSV from mid-end IR
-bool FPGAParser::build() {
-  // ParameterList
-  auto pl = parserBlock->container->type->applyParams;
-  // as defined in v1model.h
-  if (pl->size() != 4) {
-    ::error("Expected parser to have exactly 4 parameters");
-    return false;
-  }
-  auto model = program->v1model;
-  packet = pl->getParameter(model.parser.packetParam.index);
-  headers = pl->getParameter(model.parser.headersParam.index);
-  userMetadata = pl->getParameter(model.parser.metadataParam.index);
-  stdMetadata = pl->getParameter(model.parser.standardMetadataParam.index);
-  return true;
+void SVParser::emitInterface(CodeBuilder* builder) {
+    builder->appendLine("// AXI-Stream interface logic");
+    builder->appendLine("assign s_axis_tready = (current_state == STATE_START);");
+    builder->appendLine("assign out_valid = parsing_done;");
+    builder->appendLine("assign out_headers = headers_reg;");
+    builder->appendLine("assign out_metadata = metadata_reg;");
+    builder->newline();
+    
+    builder->appendLine("// Packet loading");
+    builder->appendLine("always_ff @(posedge clk) begin");
+    builder->increaseIndent();
+    builder->appendLine("if (load_packet) begin");
+    builder->increaseIndent();
+    builder->appendLine("packet_buffer <= s_axis_tdata;");
+    builder->decreaseIndent();
+    builder->appendLine("end");
+    builder->decreaseIndent();
+    builder->appendLine("end");
 }
 
-}  // namespace FPGA
+}  // namespace SV

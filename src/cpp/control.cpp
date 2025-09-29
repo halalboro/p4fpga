@@ -1,486 +1,498 @@
-/*
-  Copyright 2015-2016 P4FPGA Project
-
-  Licensed under the Apache License, Version 2.0 (the "License");
-  you may not use this file except in compliance with the License.
-  You may obtain a copy of the License at
-
-  http://www.apache.org/licenses/LICENSE-2.0
-
-
-  Unless required by applicable law or agreed to in writing, software
-  distributed under the License is distributed on an "AS IS" BASIS,
-  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-  See the License for the specific language governing permissions and
-  limitations under the License.
-*/
-
-#include "ir/ir.h"
+#include "common.h"
 #include "control.h"
 #include "table.h"
 #include "action.h"
-#include "struct.h"
-#include "union.h"
-#include "string_utils.h"
-#include "vector_utils.h"
+#include "analyzer.h"
+#include "lib/log.h"
+#include "bsvprogram.h"
+#include <sstream>
 
-namespace FPGA {
+namespace SV {
 
-class ExpressionConverter : public Inspector {
- public:
-  cstring bsv = "";
-  explicit ExpressionConverter () {}
-  bool preorder(const IR::MethodCallExpression* expr){
-    auto m = expr->method->to<IR::Member>();
-    if (m->member == "isValid") {
-      bsv += cstring("meta.") + m->expr->toString() + cstring(" matches tagged Valid .h");
+// Constructor implementation
+SVControl::SVControl(SVProgram* program,
+                     const IR::ControlBlock* block,
+                     const TypeMap* typeMap,
+                     const ReferenceMap* refMap) :
+    program(program), 
+    controlBlock(block), 
+    typeMap(typeMap), 
+    refMap(refMap),
+    totalStages(0) {
+    
+    p4control = block->container;
+    controlName = p4control->name;
+    isIngress = (controlName.string().find("ingress") != std::string::npos);
+}
+
+// Destructor
+SVControl::~SVControl() {
+    // Clean up allocated memory
+    for (auto& p : svTables) {
+        delete p.second;
     }
-    return false;
-  }
-  bool preorder(const IR::Grt* expr) {
-    //bsv += cstring("(");
-    visit(expr->left);
-    bsv += cstring(" > ");
-    visit(expr->right);
-    //bsv += cstring(")");
-    return false;
-  }
-  bool preorder(const IR::LAnd* expr) {
-    //bsv += cstring("(");
-    visit(expr->left);
-    bsv += cstring(" &&& ");
-    visit(expr->right);
-    //bsv += cstring(")");
-    return false;
-  }
-  bool preorder(const IR::Constant* cst) {
-    bsv += cstring(cst->toString());
-    return false;
-  }
-  bool preorder(const IR::Member* expr) {
-    bsv += cstring("h.hdr.") + expr->member.toString();
-    return false;
-  }
-};
-
-bool FPGAControl::build() {
-  const IR::P4Control* cont = controlBlock->container;
-  LOG1("Processing " << cont);
-  cfg = new CFG();
-  cfg->build(cont, program->refMap, program->typeMap);
-  LOG1(cfg);
-
-  if (cfg->entryPoint->successors.size() == 0) {
-    LOG1("init table null");
-  } else {
-    BUG_CHECK(cfg->entryPoint->successors.size() == 1, "Expected 1 start node for %1%", cont);
-    auto start = (*(cfg->entryPoint->successors.edges.begin()))->endpoint;
-    LOG1("start node" << start);
-  }
-
-  // build map <cstring, IR::P4Action*>
-  LOG1("Building action map");
-  for (auto s : *controlBlock->container->getDeclarations()) {
-    if (s->is<IR::P4Action>()) {
-      auto action = s->to<IR::P4Action>();
-      // Do not use annotated name, as P4Table will use original name
-      cstring name = nameFromAnnotation(action->annotations, action->name);
-      // auto name = action->name;
-      actions.emplace(name, action);
-      LOG1("add to action map " << name);
+    for (auto& p : svActions) {
+        delete p.second;
     }
-  }
+    for (auto stage : pipelineStages) {
+        delete stage;
+    }
+}
 
-  // constantValue : compile-time allocated resource, such as table..
-  // build map <cstring, IR::P4Table*>
-  LOG1("Building table map");
-  for (auto c : controlBlock->constantValue) {
-    auto b = c.second;
-    if (!b->is<IR::Block>()) continue;
-    if (b->is<IR::TableBlock>()) {
-      auto tblblk = b->to<IR::TableBlock>();
-      auto table = tblblk->container;
-      auto name = nameFromAnnotation(table->annotations, table->name);
-      LOG1("add table " << name);
-      tables.emplace(name.c_str(), table);
+bool SVControl::build() {
+    LOG1("Building control block: " << controlName);
+    
+    // Extract tables and actions from IR
+    extractTables();
+    extractActions();
+    
+    // Build control flow graph
+    ControlGraphBuilder cgBuilder;
+    controlBlock->container->body->apply(cgBuilder);
+    cfg = cgBuilder.cfg;
+    
+    // Analyze pipeline and assign stages
+    analyzePipeline();
+    assignPipelineStages();
+    
+    return true;
+}
 
-      // populate map <Action, Table> with annotated name
-      for (auto a : table->getActionList()->actionList) {
-        auto path = a->getPath();
-        auto decl = refMap->getDeclaration(path, true);
-        if (decl->is<IR::P4Action>()) {
-          auto action = decl->to<IR::P4Action>();
-          cstring name = nameFromAnnotation(action->annotations, action->name);
-          action_to_table[name] = table;
+void SVControl::extractTables() {
+    // Extract all tables from the control block
+    for (auto decl : controlBlock->container->controlLocals) {
+        if (auto table = decl->to<IR::P4Table>()) {
+            auto svTable = new SVTable(this, table);
+            svTables[table->name] = svTable;
+            LOG2("Found table: " << table->name);
+            
+            // Track table-action relationships
+            for (auto action : table->getActionList()->actionList) {
+                if (auto elem = action->to<IR::ActionListElement>()) {
+                    if (auto method = elem->expression->to<IR::MethodCallExpression>()) {
+                        auto actionName = method->method->toString();
+                        action_to_table[actionName].insert(table->name);
+                    }
+                }
+            }
         }
-      }
+    }
+}
 
-      // populate map <Metadata, Table>
-      auto keys = table->getKey();
-      if (keys == nullptr) {
-        LOG4("Table has no key : " << name);
-        continue;
-      }
-
-      for (auto key : keys->keyElements) {
-        auto element = key->to<IR::KeyElement>();
-        if (element->expression->is<IR::Member>()) {
-          auto m = element->expression->to<IR::Member>();
-
-          program->metadata.insert(std::make_pair(m->toString(), m));
-
-          auto type = program->typeMap->getType(m->expr, true);
-          LOG1("meta type" << m);
-          // from meta
-          if (type->is<IR::Type_Struct>()) {
-            auto t = type->to<IR::Type_StructLike>();
-            auto f = t->getField(m->member);
-            metadata_to_table[f].insert(table);
-            // from hdr
-          } else if (type->is<IR::Type_Header>()) {
-            auto t = type->to<IR::Type_StructLike>();
-            auto f = t->getField(m->member);
-            metadata_to_table[f].insert(table);
-          }
+void SVControl::extractActions() {
+    // Extract all actions from the control block
+    for (auto decl : controlBlock->container->controlLocals) {
+        if (auto action = decl->to<IR::P4Action>()) {
+            auto svAction = new SVAction(this, action);
+            svActions[action->name] = svAction;
+            LOG2("Found action: " << action->name);
         }
-      }
-    } else if (b->is<IR::ExternBlock>()) {
-      auto ctrblk = b->to<IR::ExternBlock>();
-      LOG1("extern " << ctrblk);
-    } else {
-      ::error("Unexpected block %s nested within control", b->toString());
     }
-  }
-
-  for (auto n : metadata_to_action) {
-    // LOG1("action " << n.first << action_to_table[n.second]);
-    metadata_to_table[n.first].insert(action_to_table[n.second]);
-  }
-
-  return true;
 }
 
-void FPGAControl::emitEntryRule(const CFG::Node* node) {
-  builder->append_format("rule rl_entry if (entry_req_ff.notEmpty);");
-  builder->incr_indent();
-  builder->append_line("entry_req_ff.deq;");
-  builder->append_line("let _req = entry_req_ff.first;");
-  builder->append_line("let meta = _req.meta;");
-  builder->append_line("let pkt = _req.pkt;");
-  builder->append_line("MetadataRequest req = MetadataRequest {pkt: pkt, meta: meta};");
-  if (tables.size() == 0) {
-    builder->append_line("exit_req_ff.enq(req);");
-    builder->append_format("dbprint(3, $format(\"exit\", fshow(meta)));");
-  } else {
-    BUG_CHECK(node->successors.size() == 1, "Expected 1 start node for %1%", node);
-    auto start = (*(node->successors.edges.begin()))->endpoint;
-    builder->append_format("%s_req_ff.enq(req);", start->name);
-    builder->append_format("dbprint(3, $format(\"%s\", fshow(meta)));", start->name);
-  }
-  builder->decr_indent();
-  builder->append_line("endrule");
-}
-
-void FPGAControl::emitTableRule(const CFG::TableNode* node) {
-  auto table = node->table->to<IR::P4Table>();
-  auto name = nameFromAnnotation(table->annotations, table->name);
-  builder->append_format("rule rl_%s if (%s_rsp_ff.notEmpty);", name, name);
-  builder->incr_indent();
-  builder->append_format("%s_rsp_ff.deq;", name);
-  builder->append_format("let _rsp = %s_rsp_ff.first;", name);
-  // find next states
-  builder->append_line("let meta = _rsp.meta;");
-  builder->append_line("let pkt = _rsp.pkt;");
-  builder->append_line("case (_rsp) matches");
-  builder->incr_indent();
-  for (auto s : node->successors.edges) {
-    if (s->label == nullptr) {
-      builder->append_line("default: begin");
-      builder->incr_indent();
-      builder->append_line("MetadataRequest req = MetadataRequest { pkt : pkt, meta : meta};");
-      builder->append_line("%s_req_ff.enq(req);", s->endpoint->name);
-      builder->append_format("dbprint(3, $format(\"default \", fshow(meta)));");
-      builder->decr_indent();
-      builder->append_line("end");
-    } else {
-      builder->append_line("%s: begin", s->label);
-      builder->incr_indent();
-      builder->append_line("MetadataRequest req = MetadataRequest { pkt : pkt, meta : meta};");
-      builder->append_line("%s_req_ff.enq(req);", s->endpoint->name);
-      builder->append_format("dbprint(3, $format(\"%s \", fshow(meta)));", s->label);
-      builder->decr_indent();
-      builder->append_line("end");
+void SVControl::analyzePipeline() {
+    // Analyze dependencies and determine pipeline stages
+    // Simplified: each table gets its own stage for now
+    totalStages = svTables.size();
+    if (totalStages == 0) {
+        totalStages = 1;  // At least one stage for pass-through
     }
-  }
-  builder->decr_indent();
-  builder->append_line("endcase");
-  builder->decr_indent();
-  builder->append_line("endrule");
+    LOG1("Control " << controlName << " has " << totalStages << " pipeline stages");
 }
 
-void FPGAControl::emitCondRule(const CFG::IfNode* node) {
-  //auto sig = cstring("w_") + node->name;
-  auto name = node->name;
-  builder->append_format("rule rl_%s if (%s_req_ff.notEmpty);", node->name, node->name);
-  builder->incr_indent();
-  auto stmt = node->statement->to<IR::IfStatement>();
-  // LOG1(node << " succ " << node->successors.edges);
-  builder->append_format("%s_req_ff.deq;", name);
-  builder->append_format("let _req = %s_req_ff.first;", name);
-  builder->append_line("let meta = _req.meta;");
-
-  auto ifTrue = cstring("");
-  auto ifFalse = cstring("");
-  for (auto e : node->successors.edges) {
-    if (e->isBool()) {
-      if (e->getBool()) {
-        ifTrue = e->getNode()->name + cstring("_req_ff.enq(_req);");
-      } else {
-        ifFalse = e->getNode()->name + cstring("_req_ff.enq(_req);");
-      }
+void SVControl::assignPipelineStages() {
+    // Assign tables to pipeline stages
+    // Simplified: sequential assignment
+    int stageNum = 0;
+    for (auto& p : svTables) {
+        auto name = p.first;
+        auto svTable = p.second;
+        
+        auto stage = new PipelineStage(stageNum++);
+        stage->tables.push_back(svTable);
+        
+        // Add associated actions
+        auto p4table = svTable->getP4Table();
+        for (auto action : p4table->getActionList()->actionList) {
+            if (auto elem = action->to<IR::ActionListElement>()) {
+                if (auto method = elem->expression->to<IR::MethodCallExpression>()) {
+                    auto actionName = method->method->toString();
+                    if (svActions.count(actionName)) {
+                        stage->actions.push_back(svActions[actionName]);
+                    }
+                }
+            }
+        }
+        
+        pipelineStages.push_back(stage);
     }
-  }
-  ExpressionConverter visitor;
-  stmt->condition->apply(visitor);
-  if (ifTrue != "") {
-    builder->append_format("if (%s) begin", visitor.bsv);
-    builder->incr_indent();
-    builder->append_format(ifTrue);
-    builder->append_format("dbprint(3, $format(\"%s true\", fshow(meta)));", node->name);
-    builder->decr_indent();
-    builder->append_line("end");
-  }
-  if (ifFalse != "") {
-    builder->append_line("else begin");
-    builder->incr_indent();
-    builder->append_format(ifFalse);
-    builder->append_format("dbprint(3, $format(\"%s false\", fshow(meta)));", node->name);
-    builder->decr_indent();
-    builder->append_line("end");
-  }
-  builder->decr_indent();
-  builder->append_line("endrule");
 }
 
-void FPGAControl::emitDeclaration() {
-  // basic block instances
-  for (auto b : actions) {
-    auto name = nameFromAnnotation(b.second->annotations, b.second->name);
-    auto type = CamelCase(name);
-    // ensure NoAction is translated to noAction
-    builder->append_format("Control::%sAction %s_action <- mkEngine(toList(vec(step_1)));", type, camelCase(name));
-  }
-  for (auto t : tables) {
-    auto table = t.second->to<IR::P4Table>();
-    if (table == nullptr)
-      continue;
-    auto name = nameFromAnnotation(table->annotations, table->name);
-    auto type = CamelCase(name);
-    builder->append_line("%sMatchTable %s_table <- mkMatchTable_%s(\"%s\");", type, name, type, name);
-    builder->append_line("Control::%sTable %s <- mkTable(table_request, table_execute, %s_table);", type, name, name);
-    builder->append_line("messageM(printType(typeOf(%s_table)));", name);
-    builder->append_line("messageM(printType(typeOf(%s)));", name);
-  }
+void SVControl::emit(SVCodeGen& codegen) {
+    CodeBuilder* builder = isIngress ? 
+        codegen.getIngressBuilder() : 
+        codegen.getEgressBuilder();
+    
+    emitModule(builder);
 }
 
-void FPGAControl::emitFifo() {
-  builder->append_line("FIFOF#(MetadataRequest) entry_req_ff <- mkFIFOF;");
-  builder->append_line("FIFOF#(MetadataRequest) entry_rsp_ff <- mkFIFOF;");
-  for (auto t : tables) {
-    auto table = t.second->to<IR::P4Table>();
-    auto name = nameFromAnnotation(table->annotations, table->name);
-    builder->append_line("FIFOF#(MetadataRequest) %s_req_ff <- mkFIFOF;", name);
-    builder->append_line("FIFOF#(MetadataRequest) %s_rsp_ff <- mkFIFOF;", name);
-  }
+void SVControl::emitModule(CodeBuilder* builder) {
+    std::stringstream ss;
+    
+    // Module header
+    builder->appendLine("//");
+    ss << "// " << (isIngress ? "Ingress" : "Egress") << " Pipeline Module";
+    builder->appendLine(ss.str());
+    builder->appendLine("//");
+    builder->newline();
+    
+    builder->appendLine("`include \"types.svh\"");
+    builder->newline();
+    
+    // Module declaration
+    ss.str("");
+    ss << "module " << (isIngress ? "ingress" : "egress") << "_pipeline #(";
+    builder->appendLine(ss.str());
+    builder->increaseIndent();
+    builder->appendLine("parameter DATA_WIDTH = 512");
+    builder->decreaseIndent();
+    builder->appendLine(") (");
+    builder->increaseIndent();
+    
+    // Clock and reset
+    builder->appendLine("input  logic                      clk,");
+    builder->appendLine("input  logic                      rst_n,");
+    builder->newline();
+    
+    // Input interface
+    builder->appendLine("// Input from previous stage");
+    builder->appendLine("input  headers_t                  in_headers,");
+    builder->appendLine("input  metadata_t                 in_metadata,");
+    builder->appendLine("input  logic                      in_valid,");
+    builder->appendLine("output logic                      in_ready,");
+    builder->newline();
+    
+    // Output interface
+    builder->appendLine("// Output to next stage");
+    builder->appendLine("output headers_t                  out_headers,");
+    builder->appendLine("output metadata_t                 out_metadata,");
+    builder->appendLine("output logic                      out_valid,");
+    builder->appendLine("input  logic                      out_ready");
+    
+    builder->decreaseIndent();
+    builder->appendLine(");");
+    builder->newline();
+    
+    // Pipeline registers
+    emitPipelineRegisters(builder);
+    builder->newline();
+    
+    // Table instances
+    emitTableInstances(builder);
+    builder->newline();
+    
+    // Action logic
+    emitActionLogic(builder);
+    builder->newline();
+    
+    // Control flow
+    emitControlFlow(builder);
+    
+    builder->appendLine("endmodule");
+}
 
-  if (cfg != nullptr) {
-    for (auto node : cfg->allNodes) {
-      if (node->is<CFG::IfNode>()) {
-        auto n = node->to<CFG::IfNode>();
-        builder->append_line("FIFOF#(MetadataRequest) %s_req_ff <- mkFIFOF;", n->name);
-        //builder->append_line("PulseWire w_%s <- mkPulseWire;", n->name);
-      }
+void SVControl::emitPipelineRegisters(CodeBuilder* builder) {
+    std::stringstream ss;
+    builder->appendLine("// Pipeline stage registers");
+    
+    for (int i = 0; i <= totalStages; i++) {
+        ss.str("");
+        ss << "headers_t   stage" << i << "_headers;";
+        builder->appendLine(ss.str());
+        
+        ss.str("");
+        ss << "metadata_t  stage" << i << "_metadata;";
+        builder->appendLine(ss.str());
+        
+        ss.str("");
+        ss << "logic       stage" << i << "_valid;";
+        builder->appendLine(ss.str());
+        
+        ss.str("");
+        ss << "logic       stage" << i << "_ready;";
+        builder->appendLine(ss.str());
+        builder->newline();
     }
-  }
-  builder->append_line("FIFOF#(MetadataRequest) exit_req_ff <- mkFIFOF;");
-  builder->append_line("FIFOF#(MetadataRequest) exit_rsp_ff <- mkFIFOF;");
-}
-
-void FPGAControl::emitConnection() {
-  // table to fifo
-  for (auto t : tables) {
-    auto table = t.second->to<IR::P4Table>();
-    auto name = nameFromAnnotation(table->annotations, table->name);
-    builder->append_line("mkConnection(toClient(%s_req_ff, %s_rsp_ff), %s.prev_control_state);", name, name, name);
-
-    int idx = 0;
-    for (auto a: table->getActionList()->actionList) {
-      auto path = a->getPath();
-      auto decl = refMap->getDeclaration(path, true);
-      if (decl->is<IR::P4Action>()) {
-        auto action = decl->to<IR::P4Action>();
-        auto action_name = nameFromAnnotation(action->annotations, action->name);
-        builder->append_format("mkConnection(%s.next_control_state[%d], %s_action.prev_control_state);", name, idx, camelCase(action_name));
-        idx ++ ;
-      }
+    
+    builder->appendLine("// Connect input to stage 0");
+    builder->appendLine("assign stage0_headers = in_headers;");
+    builder->appendLine("assign stage0_metadata = in_metadata;");
+    builder->appendLine("assign stage0_valid = in_valid;");
+    builder->appendLine("assign in_ready = stage0_ready;");
+    builder->newline();
+    
+    ss.str("");
+    ss << "// Connect stage " << totalStages << " to output";
+    builder->appendLine(ss.str());
+    
+    ss.str("");
+    ss << "assign out_headers = stage" << totalStages << "_headers;";
+    builder->appendLine(ss.str());
+    
+    ss.str("");
+    ss << "assign out_metadata = stage" << totalStages << "_metadata;";
+    builder->appendLine(ss.str());
+    
+    ss.str("");
+    ss << "assign out_valid = stage" << totalStages << "_valid;";
+    builder->appendLine(ss.str());
+    
+    ss.str("");
+    ss << "assign stage" << totalStages << "_ready = out_ready;";
+    builder->appendLine(ss.str());
+    builder->newline();
+    
+    // Generate pipeline registers between stages
+    builder->appendLine("// Pipeline registers");
+    for (int i = 0; i < totalStages; i++) {
+        ss.str("");
+        ss << "// Stage " << i << " -> Stage " << (i+1);
+        builder->appendLine(ss.str());
+        
+        builder->appendLine("always_ff @(posedge clk) begin");
+        builder->increaseIndent();
+        builder->appendLine("if (!rst_n) begin");
+        builder->increaseIndent();
+        
+        ss.str("");
+        ss << "stage" << (i+1) << "_valid <= 1'b0;";
+        builder->appendLine(ss.str());
+        
+        builder->decreaseIndent();
+        
+        ss.str("");
+        ss << "end else if (stage" << (i+1) << "_ready) begin";
+        builder->appendLine(ss.str());
+        builder->increaseIndent();
+        
+        ss.str("");
+        ss << "stage" << (i+1) << "_headers <= stage" << i << "_headers;";
+        builder->appendLine(ss.str());
+        
+        ss.str("");
+        ss << "stage" << (i+1) << "_metadata <= stage" << i << "_metadata;";
+        builder->appendLine(ss.str());
+        
+        ss.str("");
+        ss << "stage" << (i+1) << "_valid <= stage" << i << "_valid;";
+        builder->appendLine(ss.str());
+        
+        builder->decreaseIndent();
+        builder->appendLine("end");
+        builder->decreaseIndent();
+        builder->appendLine("end");
+        builder->newline();
+        
+        // Ready signal flows backward
+        ss.str("");
+        ss << "assign stage" << i << "_ready = stage" << (i+1) << "_ready || !stage" << (i+1) << "_valid;";
+        builder->appendLine(ss.str());
+        builder->newline();
     }
-  }
 }
 
-void FPGAControl::emitTables() {
-  CHECK_NULL(cpp_builder);
-  cpp_builder->append_line("#include <iostream>");
-  cpp_builder->append_line("#include <unordered_map>");
-  cpp_builder->append_line("#ifdef __cplusplus");
-  cpp_builder->append_line("extern \"C\" {");
-  cpp_builder->append_line("#endif");
-  cpp_builder->append_line("#include <stdio.h>");
-  cpp_builder->append_line("#include <stdlib.h>");
-  cpp_builder->append_line("#include <string.h>");
-  cpp_builder->append_line("#include <stdint.h>");
-  for (auto t : tables) {
-    TableCodeGen visitor(this, builder, cpp_builder, type_builder);
-    t.second->apply(visitor);
-  }
-  cpp_builder->append_line("#ifdef __cplusplus");
-  cpp_builder->append_line("}");
-  cpp_builder->append_line("#endif");
-}
-
-void FPGAControl::emitActions(BSVProgram & bsv) {
-  for (auto b : actions) {
-    ActionCodeGen visitor(this, bsv, builder);
-    b.second->apply(visitor);
- //   auto stmt = b.second->body->to<IR::BlockStatement>();
- //   if (stmt == nullptr) continue;
- //   // encode to cpu instruction
- //   for (auto path : *stmt->components) {
- //   //  path->apply(visitor);
- //   }
-  }
-}
-
-void FPGAControl::emitActionTypes(BSVProgram & bsv) {
-  CodeBuilder* builder = &bsv.getUnionBuilder();
-  UnionCodeGen visitor(this, builder);
-  visitor.emit();
-  for (auto b : tables) {
-    UnionCodeGen visitor(this, builder);
-    b.second->apply(visitor);
-  }
-}
-
-void FPGAControl::emitAPI(cstring cbname) {
-  for (auto t : tables) {
-    const IR::Key* key = t.second->getKey();
-    if (key == nullptr) continue;
-
-    const IR::P4Table* tbl = t.second;
-    cstring name = nameFromAnnotation(tbl->annotations, tbl->name);
-    cstring type = CamelCase(name);
-    api_def->appendFormat("method Action %s_add_entry(", name);
-    api_def->appendFormat("%sReqT key, ", type);
-    api_def->appendFormat("%sRspT val", type);
-    api_def->appendLine(");");
-  }
-  for (auto t : tables) {
-    const IR::Key* key = t.second->getKey();
-    if (key == nullptr) continue;
-
-    const IR::P4Table* tbl = t.second;
-    cstring name = nameFromAnnotation(tbl->annotations, tbl->name);
-    prog_decl->appendFormat("method %s_add_entry", name);
-    prog_decl->appendFormat("=%s", cbname);
-    prog_decl->appendFormat(".%s_add_entry;", name);
-    prog_decl->newline();
-
-    api_decl->appendFormat("method %s_add_entry = prog", name);
-    api_decl->appendFormat(".%s_add_entry;", name);
-    api_decl->newline();
-  }
-}
-
-// control block module
-void FPGAControl::emit(BSVProgram & bsv, CppProgram & cpp) {
-  auto cbname = controlBlock->container->name.toString();
-  auto cbtype = CamelCase(cbname);
-  builder = &bsv.getControlBuilder();
-  cpp_builder = &cpp.getSimBuilder();
-  type_builder = &bsv.getConnectalTypeBuilder();
-  api_def = &bsv.getAPIDefBuilder();
-  api_decl = &bsv.getAPIDeclBuilder();
-  prog_decl = &bsv.getProgDeclBuilder();
-
-  emitTables();
-  emitActions(bsv);
-  emitActionTypes(bsv);
-
-  // TODO: synthesize boundary
-  builder->append_format("// =============== control %s ==============", cbname);
-  builder->append_line("interface %s;", cbtype);
-  builder->incr_indent();
-  builder->append_line("interface PipeIn#(MetadataRequest) prev;");
-  builder->append_line("interface PipeOut#(MetadataRequest) next;");
-  for (auto t : tables) {
-    auto tname = t.first;
-    auto type = CamelCase(tname);
-    builder->append_line("method Action %s_add_entry(ConnectalTypes::%sReqT key, ConnectalTypes::%sRspT value);", tname, type, type);
-  }
-  builder->append_line("method Action set_verbosity(int verbosity);");
-  builder->decr_indent();
-  builder->append_line("endinterface");
-  builder->append_line("module mk%s (%s);", cbtype, cbtype);
-  builder->incr_indent();
-  builder->append_line("`PRINT_DEBUG_MSG");
-  emitFifo();
-  emitDeclaration();
-  emitConnection();
-
-  // emit control flow
-  if (cfg != nullptr) {
-    if (cfg->entryPoint != nullptr) {
-      emitEntryRule(cfg->entryPoint);
+void SVControl::emitTableInstances(CodeBuilder* builder) {
+    std::stringstream ss;
+    builder->appendLine("// Table instances");
+    
+    int stageNum = 0;
+    for (auto stage : pipelineStages) {
+        for (auto svTable : stage->tables) {
+            auto tableName = svTable->getName();
+            
+            ss.str("");
+            ss << "// Table: " << tableName;
+            builder->appendLine(ss.str());
+            
+            // Table lookup signals
+            ss.str("");
+            ss << "logic [" << (svTable->getKeyWidth()-1) << ":0] table_" << tableName << "_key;";
+            builder->appendLine(ss.str());
+            
+            ss.str("");
+            ss << "logic table_" << tableName << "_key_valid;";
+            builder->appendLine(ss.str());
+            
+            ss.str("");
+            ss << "logic table_" << tableName << "_hit;";
+            builder->appendLine(ss.str());
+            
+            ss.str("");
+            ss << "logic [7:0] table_" << tableName << "_action_id;";
+            builder->appendLine(ss.str());
+            
+            ss.str("");
+            ss << "logic [" << (svTable->getActionDataWidth()-1) << ":0] table_" << tableName << "_action_data;";
+            builder->appendLine(ss.str());
+            builder->newline();
+            
+            // Table module instance
+            ss.str("");
+            ss << "table_" << tableName << " table_" << tableName << "_inst (";
+            builder->appendLine(ss.str());
+            builder->increaseIndent();
+            
+            builder->appendLine(".clk(clk),");
+            builder->appendLine(".rst_n(rst_n),");
+            
+            ss.str("");
+            ss << ".lookup_key(table_" << tableName << "_key),";
+            builder->appendLine(ss.str());
+            
+            ss.str("");
+            ss << ".lookup_valid(stage" << stageNum << "_valid),";
+            builder->appendLine(ss.str());
+            
+            ss.str("");
+            ss << ".lookup_ready(stage" << (stageNum+1) << "_ready),";
+            builder->appendLine(ss.str());
+            
+            ss.str("");
+            ss << ".hit(table_" << tableName << "_hit),";
+            builder->appendLine(ss.str());
+            
+            ss.str("");
+            ss << ".action_id(table_" << tableName << "_action_id),";
+            builder->appendLine(ss.str());
+            
+            ss.str("");
+            ss << ".action_data(table_" << tableName << "_action_data)";
+            builder->appendLine(ss.str());
+            
+            builder->decreaseIndent();
+            builder->appendLine(");");
+            builder->newline();
+            
+            // Key extraction from headers/metadata
+            ss.str("");
+            ss << "// Extract key for table " << tableName;
+            builder->appendLine(ss.str());
+            
+            builder->appendLine("always_comb begin");
+            builder->increaseIndent();
+            
+            ss.str("");
+            ss << "table_" << tableName << "_key = '0;";
+            builder->appendLine(ss.str());
+            
+            // Generate key extraction based on table keys
+            auto p4table = svTable->getP4Table();
+            auto keys = p4table->getKey();
+            if (keys != nullptr) {
+                int offset = 0;
+                for (auto key : keys->keyElements) {
+                    auto element = key->to<IR::KeyElement>();
+                    if (element && element->expression->is<IR::Member>()) {
+                        auto member = element->expression->to<IR::Member>();
+                        // Simplified: assume key comes from headers
+                        ss.str("");
+                        ss << "table_" << tableName << "_key[" << (offset+31) << ":" << offset 
+                           << "] = stage" << stageNum << "_headers." << member->member << ";";
+                        builder->appendLine(ss.str());
+                        offset += 32;  // Simplified: assume 32-bit fields
+                    }
+                }
+            }
+            
+            builder->decreaseIndent();
+            builder->appendLine("end");
+            builder->newline();
+        }
+        stageNum++;
     }
-    for (auto node : cfg->allNodes) {
-      if (node->is<CFG::TableNode>()) {
-        auto t = node->to<CFG::TableNode>();
-        emitTableRule(t);
-      } else if (node->is<CFG::IfNode>()) {
-        auto n = node->to<CFG::IfNode>();
-        emitCondRule(n);
-      }
+}
+
+void SVControl::emitActionLogic(CodeBuilder* builder) {
+    std::stringstream ss;
+    builder->appendLine("// Action execution logic");
+    
+    int stageNum = 0;
+    for (auto stage : pipelineStages) {
+        for (auto svTable : stage->tables) {
+            auto tableName = svTable->getName();
+            
+            ss.str("");
+            ss << "// Actions for table " << tableName;
+            builder->appendLine(ss.str());
+            
+            builder->appendLine("always_comb begin");
+            builder->increaseIndent();
+            
+            // Default: pass through
+            ss.str("");
+            ss << "stage" << (stageNum+1) << "_headers = stage" << stageNum << "_headers;";
+            builder->appendLine(ss.str());
+            
+            ss.str("");
+            ss << "stage" << (stageNum+1) << "_metadata = stage" << stageNum << "_metadata;";
+            builder->appendLine(ss.str());
+            builder->newline();
+            
+            ss.str("");
+            ss << "if (table_" << tableName << "_hit) begin";
+            builder->appendLine(ss.str());
+            builder->increaseIndent();
+            
+            ss.str("");
+            ss << "case (table_" << tableName << "_action_id)";
+            builder->appendLine(ss.str());
+            builder->increaseIndent();
+            
+            // Generate cases for each action
+            int actionId = 0;
+            for (auto svAction : stage->actions) {
+                auto actionName = svAction->getName();
+                
+                ss.str("");
+                ss << "8'd" << actionId << ": begin  // " << actionName;
+                builder->appendLine(ss.str());
+                builder->increaseIndent();
+                
+                ss.str("");
+                ss << "// Execute action " << actionName;
+                builder->appendLine(ss.str());
+                
+                // Action implementation would be called here
+                // svAction->emitExecute(builder, "stage" + std::to_string(stageNum));
+                
+                builder->decreaseIndent();
+                builder->appendLine("end");
+                actionId++;
+            }
+            
+            builder->appendLine("default: begin");
+            builder->increaseIndent();
+            builder->appendLine("// No action");
+            builder->decreaseIndent();
+            builder->appendLine("end");
+            
+            builder->decreaseIndent();
+            builder->appendLine("endcase");
+            builder->decreaseIndent();
+            builder->appendLine("end");
+            
+            builder->decreaseIndent();
+            builder->appendLine("end");
+            builder->newline();
+        }
+        stageNum++;
     }
-  }
-  // emit interfaces
-  builder->append_line("interface prev = toPipeIn(entry_req_ff);");
-  builder->append_line("interface next = toPipeOut(exit_req_ff);");
-  for (auto t : tables) {
-    auto tname = t.first;
-    builder->append_line("method %s_add_entry = %s.add_entry;", tname, tname);
-  }
-  builder->append_line("method Action set_verbosity (int verbosity);");
-  builder->incr_indent();
-  builder->append_line("cf_verbosity <= verbosity;");
-  for (auto t : tables) {
-    auto tname = t.first;
-    builder->append_line("%s.set_verbosity(verbosity);", tname);
-  }
-  builder->decr_indent();
-  builder->append_line("endmethod");
-  builder->decr_indent();
-  builder->append_line("endmodule");
-
-  emitAPI(cbname);
 }
 
-cstring FPGAControl::toP4Action (cstring inst) {
-  auto k = actions.find(inst);
-  if (k != actions.end()) {
-    cstring action_name = nameFromAnnotation(k->second->annotations, k->second->name);
-    return action_name;
-  } else {
-    return nullptr;
-  }
+void SVControl::emitControlFlow(CodeBuilder* builder) {
+    builder->appendLine("// Control flow logic");
+    builder->appendLine("// TODO: Implement conditional execution based on metadata");
+    builder->newline();
 }
 
-}  // namespace FPGA
+}  // namespace SV

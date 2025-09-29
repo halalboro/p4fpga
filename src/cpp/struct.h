@@ -1,54 +1,43 @@
-/*
-  Copyright 2015-2016 P4FPGA Project
+#ifndef EXTENSIONS_CPP_LIBP4FPGA_INCLUDE_STRUCT_H_
+#define EXTENSIONS_CPP_LIBP4FPGA_INCLUDE_STRUCT_H_
 
-  Licensed under the Apache License, Version 2.0 (the "License");
-  you may not use this file except in compliance with the License.
-  You may obtain a copy of the License at
+#include "common.h"
+#include <map>
+#include <vector>
 
-  http://www.apache.org/licenses/LICENSE-2.0
+namespace SV {
 
-  Unless required by applicable law or agreed to in writing, software
-  distributed under the License is distributed on an "AS IS" BASIS,
-  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-  See the License for the specific language governing permissions and
-  limitations under the License.
-*/
-
-#ifndef EXTENSIONS_CPP_LIBP4FPGA_INCLUDE_FSTRUCT_H_
-#define EXTENSIONS_CPP_LIBP4FPGA_INCLUDE_FSTRUCT_H_
-
-#include "ir/ir.h"
-#include "program.h"
-#include "bsvprogram.h"
-#include "string_utils.h"
-
-namespace FPGA {
+class SVProgram;
 
 class StructCodeGen : public Inspector {
- public:
-  StructCodeGen(const FPGAProgram* program, CodeBuilder* builder) :
-    program(program), builder(builder) {}
-  bool preorder(const IR::Type_Header* header) override;
-  bool preorder(const IR::Type_Struct* header) override;
-  void emit();
- private:
-  const FPGAProgram* program;
-  CodeBuilder* builder;
-  std::map<cstring, const IR::Type_Header*> header_map;
+public:
+    StructCodeGen(const SVProgram* program, CodeBuilder* builder) :
+        program(program), builder(builder) {}
+    
+    bool preorder(const IR::Type_Header* header) override;
+    bool preorder(const IR::Type_Struct* strct) override;
+    void emit();
+    
+private:
+    const SVProgram* program;
+    CodeBuilder* builder;
+    std::map<cstring, const IR::Type_Header*> header_map;
+    std::map<cstring, const IR::Type_Struct*> struct_map;
 };
 
 class HeaderCodeGen : public Inspector {
- public:
-  HeaderCodeGen(CodeBuilder* builder) :
-    builder(builder) {}
-  bool preorder(const IR::StructField* fld) override;
-  bool preorder(const IR::Type_Header* hdr) override;
-  bool preorder(const IR::Type_Stack* stk) override;
- private:
-  CodeBuilder* builder;
-  std::vector<cstring> headers;
+public:
+    HeaderCodeGen(CodeBuilder* builder) :
+        builder(builder) {}
+    
+    bool preorder(const IR::StructField* field) override;
+    bool preorder(const IR::Type_Header* header) override;
+    
+private:
+    CodeBuilder* builder;
+    std::vector<cstring> headers;
 };
 
-}  // namespace FPGA
+}  // namespace SV
 
-#endif /* EXTENSIONS_CPP_LIBP4FPGA_INCLUDE_FSTRUCT_H_ */
+#endif

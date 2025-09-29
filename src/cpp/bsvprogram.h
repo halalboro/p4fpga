@@ -1,104 +1,61 @@
-//#pragma once
+#ifndef P4FPGA_BSVPROGRAM_H
+#define P4FPGA_BSVPROGRAM_H
 
-#ifndef P4FPGA_INCLUDE_BSVPROGRAM_H_
-#define P4FPGA_INCLUDE_BSVPROGRAM_H_
+#include "common.h"
+#include <string>
 
-#include "ir/ir.h"
-#include "lib/sourceCodeBuilder.h"
-#include "frontends/p4/typeMap.h"
+namespace SV {
 
-namespace FPGA {
-
-class CodeBuilder : public Util::SourceCodeBuilder {
- public:
-    explicit CodeBuilder() {}
-
-    template <typename... TArgs>
-    void append_line(const char* fmt, TArgs&&... args);
-
-    template <typename... TArgs>
-    void append_format(const char* fmt, TArgs&&... args);
-
-    void incr_indent() { increaseIndent(); }
-    void decr_indent() { decreaseIndent(); }
-
-    template <typename TValue, typename... TArgs>
-      std::string format_string(boost::format& message, TValue&& arg, TArgs&&... args);
-    std::string format_string(boost::format& message) { return message.str(); };
+class SVCodeGen {
+public:
+    SVCodeGen() {}
+    virtual ~SVCodeGen() {}
+    
+    // Builder getters
+    CodeBuilder* getParserBuilder() { return &parserBuilder; }
+    CodeBuilder* getIngressBuilder() { return &ingressBuilder; }
+    CodeBuilder* getEgressBuilder() { return &egressBuilder; }
+    CodeBuilder* getDeparserBuilder() { return &deparserBuilder; }
+    CodeBuilder* getTopBuilder() { return &topBuilder; }
+    CodeBuilder* getTypesBuilder() { return &typesBuilder; }
+    CodeBuilder* getInterfacesBuilder() { return &interfacesBuilder; }
+    CodeBuilder* getTablesBuilder() { return &tablesBuilder; }
+    CodeBuilder* getActionsBuilder() { return &actionsBuilder; }
+    
+    // Module getters
+    std::string getTopModule() const { return topBuilder.toString(); }
+    std::string getParserModule() const { return parserBuilder.toString(); }
+    std::string getIngressModule() const { return ingressBuilder.toString(); }
+    std::string getEgressModule() const { return egressBuilder.toString(); }
+    std::string getDeparserModule() const { return deparserBuilder.toString(); }
+    std::string getTablesModule() const { return tablesBuilder.toString(); }
+    std::string getActionsModule() const { return actionsBuilder.toString(); }
+    std::string getTypeDefinitions() const { return typesBuilder.toString(); }
+    std::string getInterfaces() const { return interfacesBuilder.toString(); }
+    
+    // These are now implemented in the .cpp file
+    std::string getTestbench() const;
+    std::string getMakefile() const;
+    
+    // Helper methods (implemented in .cpp)
+    void emitHeader(CodeBuilder* builder, const std::string& moduleName);
+    void emitAxiStreamInterface(CodeBuilder* builder,
+                                const std::string& name,
+                                bool isMaster);
+    void emitPipelineStage(CodeBuilder* builder, int stage);
+    
+private:
+    CodeBuilder parserBuilder;
+    CodeBuilder ingressBuilder;    // Separate builder for ingress
+    CodeBuilder egressBuilder;     // Separate builder for egress
+    CodeBuilder deparserBuilder;
+    CodeBuilder topBuilder;
+    CodeBuilder typesBuilder;
+    CodeBuilder interfacesBuilder;
+    CodeBuilder tablesBuilder;     // Added for tables
+    CodeBuilder actionsBuilder;    // Added for actions
 };
 
-template <typename TValue, typename... TArgs>
-  std::string CodeBuilder::format_string(boost::format& message, TValue&& arg, TArgs&&... args) {
-  message % std::forward<TValue>(arg);
-  return format_string(message, std::forward<TArgs>(args)...);
-}
+}  // namespace SV
 
-template <typename... TArgs>
-  void CodeBuilder::append_format(const char* fmt, TArgs&&... args) {
-  emitIndent();
-  boost::format msg(fmt);
-  std::string s = format_string(msg, std::forward<TArgs>(args)...);
-  appendFormat(s.c_str());
-  newline();
-}
-
-template <typename... TArgs>
-  void CodeBuilder::append_line(const char* fmt, TArgs&&... args) {
-    emitIndent();
-    boost::format msg(fmt);
-    std::string s = format_string(msg, std::forward<TArgs>(args)...);
-    appendLine(s.c_str());
-  }
-
-class BSVProgram {
- public:
-  BSVProgram() { }
-  CodeBuilder& getParserBuilder() { return parserBuilder_; }
-  CodeBuilder& getDeparserBuilder() { return deparserBuilder_; }
-  CodeBuilder& getStructBuilder() { return structBuilder_; }
-  CodeBuilder& getUnionBuilder()  { return unionBuilder_; }
-  CodeBuilder& getControlBuilder() { return controlBuilder_; }
-  CodeBuilder& getAPIDefBuilder() { return apiDefBuilder_; }
-  CodeBuilder& getAPIDeclBuilder() { return apiDeclBuilder_; }
-  CodeBuilder& getProgDeclBuilder() { return progDeclBuilder_; }
-  CodeBuilder& getConnectalTypeBuilder() { return connectalTypeBuilder_; }
-
- private:
-  CodeBuilder parserBuilder_;
-  CodeBuilder deparserBuilder_;
-  CodeBuilder structBuilder_;
-  CodeBuilder unionBuilder_;
-  CodeBuilder controlBuilder_;
-  CodeBuilder apiDefBuilder_;
-  CodeBuilder apiDeclBuilder_;
-  CodeBuilder progDeclBuilder_;
-  CodeBuilder connectalTypeBuilder_;
-};
-
-class CppProgram {
- public:
-  CppProgram() {}
-  CodeBuilder& getSimBuilder() { return simBuilder_; }
- private:
-  CodeBuilder simBuilder_;
-};
-
-class Profiler {
- public:
-  Profiler() {}
-  CodeBuilder& getTableProfiler() { return tableProfiler_; }
- private:
-  CodeBuilder tableProfiler_;
-};
-
-class Partitioner {
- public:
-  Partitioner() {}
-  CodeBuilder& getPartitioner() { return p4Partitioner_; }
- private:
-  CodeBuilder p4Partitioner_;
-};
-
-} // namespace FPGA
-
-#endif  /* P4FPGA_INCLUDE_BSVPROGRAM_H_ */
+#endif

@@ -1,79 +1,79 @@
-/*
-  Copyright 2015-2016 P4FPGA Project
+#ifndef EXTENSIONS_CPP_LIBP4FPGA_INCLUDE_CONTROL_H_
+#define EXTENSIONS_CPP_LIBP4FPGA_INCLUDE_CONTROL_H_
 
-  Licensed under the Apache License, Version 2.0 (the "License");
-  you may not use this file except in compliance with the License.
-  You may obtain a copy of the License at
-
-  http://www.apache.org/licenses/LICENSE-2.0
-
-
-  Unless required by applicable law or agreed to in writing, software
-  distributed under the License is distributed on an "AS IS" BASIS,
-  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-  See the License for the specific language governing permissions and
-  limitations under the License.
-*/
-
-#ifndef EXTENSIONS_CPP_LIBP4FPGA_INCLUDE_FCONTROL_H_
-#define EXTENSIONS_CPP_LIBP4FPGA_INCLUDE_FCONTROL_H_
-
-#include "ir/ir.h"
-#include "program.h"
+#include "common.h"
 #include "analyzer.h"
-#include "action.h"
+#include <vector>
+#include <map>
+#include <set>
+#include <string>
 
-namespace FPGA {
+namespace SV {
 
-class FPGAParser;
+class SVProgram;
+class SVCodeGen;
+class SVTable;
+class SVAction;
 
-class FPGAControl { // : public FPGAObject {
- public:
-    const P4::ReferenceMap*       refMap;
-    const P4::TypeMap*            typeMap;
-    const IR::ControlBlock*       controlBlock;
-    FPGAProgram*                  program;
-    FPGA::CFG*                    cfg;
-    CodeBuilder*                  builder;
-    CodeBuilder*                  cpp_builder;
-    CodeBuilder*                  type_builder;
-    CodeBuilder*                  api_def;
-    CodeBuilder*                  api_decl;
-    CodeBuilder*                  prog_decl;
-
-    // map from action name to P4Action
-    std::map<cstring, const IR::P4Action*>    actions;
-    // map from table name to TableBlock
-    std::map<cstring, const IR::P4Table*>     tables;
-    // map from extern name to ExternBlock
-    std::map<cstring, const IR::ExternBlock*> externs;
-
-    std::map<const IR::StructField*, std::set<const IR::P4Table*>> metadata_to_table;
-    std::map<const IR::StructField*, cstring> metadata_to_action;
-    std::map<cstring, const IR::P4Table*> action_to_table;
-
-    explicit FPGAControl(FPGAProgram* program,
-                         const IR::ControlBlock* block,
-                         const P4::TypeMap* typeMap,
-                         const P4::ReferenceMap* refMap)
-      : refMap(refMap), typeMap(typeMap), controlBlock(block), program(program) {}
-
-    virtual ~FPGAControl() {}
-    cstring toP4Action (cstring inst);
-    void emit(BSVProgram & bsv, CppProgram & cpp);
-    void emitTableRule(const CFG::TableNode* node);
-    void emitCondRule(const CFG::IfNode* node);
-    void emitEntryRule(const CFG::Node* node);
-    void emitDeclaration();
-    void emitConnection();
-    void emitFifo();
-    void emitTables();
-    void emitActions(BSVProgram & bsv);
-    void emitActionTypes(BSVProgram & bsv);
-    void emitAPI(cstring cbtype);
-    bool build();
+class PipelineStage {
+public:
+    int stageNumber;
+    std::vector<SVTable*> tables;
+    std::vector<SVAction*> actions;
+    std::set<cstring> dependencies;
+    
+    PipelineStage() : stageNumber(0) {}
+    PipelineStage(int num) : stageNumber(num) {}
 };
 
-}  // namespace FPGA
+class SVControl {
+private:
+    SVProgram* program;
+    const IR::ControlBlock* controlBlock;
+    const IR::P4Control* p4control;
+    const TypeMap* typeMap;
+    const ReferenceMap* refMap;
+    
+    cstring controlName;
+    bool isIngress;
+    int totalStages;
+    
+    std::map<cstring, SVTable*> svTables;
+    std::map<cstring, SVAction*> svActions;
+    std::map<cstring, std::set<cstring>> action_to_table;
+    SV::CFG* cfg;
+    std::vector<PipelineStage*> pipelineStages;
+    
+    void extractTables();
+    void extractActions();
+    void analyzePipeline();
+    
+public:
+    void setIsIngress(bool value) { isIngress = value; }
+    SVProgram* getProgram() const { return program; }
+    SVControl(SVProgram* program,
+              const IR::ControlBlock* block,
+              const TypeMap* typeMap,
+              const ReferenceMap* refMap);
+    
+    ~SVControl();  // Add destructor to clean up allocated memory
+    
+    bool build();
+    void emit(SVCodeGen& codegen);
+    void assignPipelineStages();
+    void emitModule(CodeBuilder* builder);
+    void emitPipelineRegisters(CodeBuilder* builder);
+    void emitTableInstances(CodeBuilder* builder);
+    void emitActionLogic(CodeBuilder* builder);
+    void emitControlFlow(CodeBuilder* builder);
+    
+    int getStageCount() const { return totalStages; }
+    cstring getName() const { return controlName; }
+    bool getIsIngress() const { return isIngress; }
+    
+    std::map<const IR::Node*, const IR::Type*> metadata_to_table;
+};
 
-#endif /* EXTENSIONS_CPP_LIBP4FPGA_INCLUDE_FCONTROL_H_ */
+}  // namespace SV
+
+#endif

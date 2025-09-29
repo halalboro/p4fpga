@@ -1,232 +1,160 @@
-/*
-  Copyright 2015-2016 P4FPGA Project
-
-  Licensed under the Apache License, Version 2.0 (the "License");
-  you may not use this file except in compliance with the License.
-  You may obtain a copy of the License at
-
-  http://www.apache.org/licenses/LICENSE-2.0
-
-
-  Unless required by applicable law or agreed to in writing, software
-  distributed under the License is distributed on an "AS IS" BASIS,
-  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-  See the License for the specific language governing permissions and
-  limitations under the License.
-*/
-#include "ir/ir.h"
+#include "common.h"
 #include "action.h"
-#include "frontends/p4/methodInstance.h"
-#include "string_utils.h"
+#include "lib/log.h"
+#include <sstream>
 
-namespace FPGA {
+namespace SV {
 
-bool ActionCodeGen::preorder(const IR::AssignmentStatement* stmt) {
-  auto type = control->program->typeMap->getType(stmt->left, true);
-  if (type != nullptr) {
-    if (type->is<IR::Type_Bits>()) {
-      auto bits = type->to<IR::Type_Bits>();
-      builder->append_line("// INST (%d) %s = %s", bits->width_bits(), stmt->left, stmt->right);
-    } else {
-      builder->append_line("// INST (%d) %s = %s", stmt->left, stmt->right);
-    }
-  }
-  visit(stmt->left);
-  visit(stmt->right);
-  return false;
-}
-
-bool ActionCodeGen::preorder(const IR::Expression* expression) {
-  // accessing part of metadata struct, thus member type
-  if (expression->is<IR::Member>()) {
-    auto m = expression->to<IR::Member>();
-    auto type = control->program->typeMap->getType(m->expr, true);
-    if (type->is<IR::Type_Struct>()) {
-      auto t = type->to<IR::Type_StructLike>();
-      auto f = t->getField(m->member);
-    }
-  }
-  return false;
-}
-
-bool ActionCodeGen::preorder(const IR::MethodCallExpression* expression) {
-  auto mi = P4::MethodInstance::resolve(expression,
-                                        control->program->refMap,
-                                        control->program->typeMap);
-  auto apply = mi->to<P4::ApplyMethod>();
-  if (apply != nullptr) {
-    LOG1("handle apply");
-    return false;
-  }
-
-  auto ext = mi->to<P4::ExternMethod>();
-  if (ext != nullptr) {
-    LOG1("MethodCall extern type");
-    // ext->type : register
-    // ext->expr : register name
-    builder->append_line("// INST extern %s %s", ext->method->name.toString(), ext->expr->toString());
-    return false;
-  }
-
-  auto actioncall = mi->to<P4::ActionCall>();
-  if (actioncall != nullptr) {
-    LOG1("action call");
-    builder->append_line(expression->toString());
-    return false;
-  }
-
-  auto extFunc = mi->to<P4::ExternFunction>();
-  if (extFunc != nullptr) {
-    if (extFunc->method->name == "mark_to_drop") {
-      builder->append_line("// mark_to_drop ");
-    } else {
-      builder->append_line("// INST extern %s", extFunc->method->name.toString());
-    }
-    return false;
-  }
-
-  return false;
-}
-
-void ActionCodeGen::emitCpuRspRule(const IR::P4Action* action) {
-  auto name = action->name;
-  auto type = CamelCase(name);
-  auto table = control->action_to_table[name];
-  auto table_name = nameFromAnnotation(table->annotations, table->name);
-  auto table_type = CamelCase(table_name);
-  std::vector<cstring> fields;
-  if (action->parameters->size() > 0) {
-    auto params = action->parameters->to<IR::ParameterList>();
-    if (params != nullptr) {
-      for (auto p : params->parameters) {
-        fields.push_back(p->name);
-      }
-    }
-    LOG1("// Action Response: need to update metadata");
-  }
-  builder->append_line("rule rl_cpu_resp if (cpu.not_running());");
-  builder->incr_indent();
-  builder->append_line("let pkt <- toGet(curr_packet_ff).get;"); // FIXME: bottleneck
-  builder->append_format("%sActionRsp rsp = tagged %sRspT { pkt: pkt, meta: metadata};", table_type, type);
-  builder->append_line("tx_info_prev_control_state.enq(rsp);");
-  builder->decr_indent();
-  builder->append_line("endrule");
-}
-
-void ActionCodeGen::emitActionBegin(const IR::P4Action* action) {
-  cstring name = nameFromAnnotation(action->annotations, action->name);
-  cstring orig_name = action->name.toString();
-  cstring type = CamelCase(name);
-  LOG1("action name " << name << " " << orig_name);
-  const IR::P4Table* table = control->action_to_table[name];
-  if (table == nullptr) {
-    ::error("unable to find table from action %s", name);
-  }
-  table_name = nameFromAnnotation(table->annotations, table->name);
-  table_type = CamelCase(table_name);
-}
-
-void ActionCodeGen::emitDropAction(const IR::P4Action* action) {
-  cstring name = nameFromAnnotation(action->annotations, action->name);
-  cstring type = CamelCase(name);
-  const IR::P4Table* table = control->action_to_table[name];
-  if (table == nullptr) {
-    ::error("unable to find table from action %s", name);
-  }
-  cstring table_name = nameFromAnnotation(table->annotations, table->name);
-  cstring table_type = CamelCase(table_name);
-
-  builder->append_line("typedef Engine#(1, MetadataRequest, %sParam) %sAction;", table_type, type);
-}
-
-void ActionCodeGen::emitNoAction(const IR::P4Action* action) {
-  cstring name = nameFromAnnotation(action->annotations, action->name);
-  cstring type = CamelCase(name);
-  const IR::P4Table* table = control->action_to_table[name];
-  if (table == nullptr) {
-    ::error("unable to find table from action %s", name);
-  }
-  cstring table_name = nameFromAnnotation(table->annotations, table->name);
-  cstring table_type = CamelCase(table_name);
-
-  builder->append_line("typedef Engine#(1, MetadataRequest, %sParam) %sAction;", table_type, type);
-}
-
-void ActionCodeGen::emitModifyAction(const IR::P4Action* action) {
-  cstring name = nameFromAnnotation(action->annotations, action->name);
-  cstring type = CamelCase(name);
-  const IR::P4Table* table = control->action_to_table[name];
-  if (table == nullptr) {
-    ::error("unable to find table from action %s", name);
-  }
-  cstring table_name = nameFromAnnotation(table->annotations, table->name);
-  cstring table_type = CamelCase(table_name);
-  builder->append_line("typedef Engine#(1, MetadataRequest, %sParam) %sAction;", table_type, type);
-  builder->append_line("instance Action_execute #(%sParam);", table_type);
-  // FIXME: do one step for now..
-  builder->incr_indent();
-  builder->append_line("function ActionValue#(MetadataRequest) step_1 (MetadataRequest meta, %sParam param);", table_type);
-  builder->incr_indent();
-  builder->append_line("actionvalue");
-  builder->incr_indent();
-  builder->append_line("$display(\"(%%0d) step 1: \", $time, fshow(meta));");
-  // table->params
-  // invoke each action
-  builder->append_line("return meta;");
-  builder->decr_indent();
-  builder->append_line("endactionvalue");
-  builder->decr_indent();
-  builder->append_line("endfunction");
-  builder->decr_indent();
-  builder->append_line("endinstance");
-}
-
-bool ActionCodeGen::isDropAction(const IR::P4Action* action) {
-  bool is_drop = false;
-  if (action->body == nullptr) {
-    return false;
-  }
-  for (auto s : action->body->components) {
-    auto stmt = s->to<IR::MethodCallStatement>();
-    if (stmt == nullptr) continue;
-    auto expr = stmt->methodCall->to<IR::MethodCallExpression>();
-    if (expr == nullptr) continue;
-
-    if (expr->method->is<IR::PathExpression>()) {
-      auto path = expr->method->to<IR::PathExpression>();
-      if (path != nullptr && path->path->name == "mark_to_drop") {
-        return true;
-      }
-    }
-  }
-  return is_drop;
-}
-
-bool ActionCodeGen::isNoAction(const IR::P4Action* action) {
-  bool is_nop = false;
-  if (action->body == nullptr) {
+bool SVAction::build() {
+    LOG2("Building action: " << actionName);
+    
+    extractParameters();
+    analyzeBody();
+    
     return true;
-  }
-  if (action->body->components.size() == 0) {
-    return true;
-  }
-  return is_nop;
 }
 
-void ActionCodeGen::postorder(const IR::P4Action* action) {
-  auto stmt = action->body->to<IR::BlockStatement>();
-
-  if (stmt == nullptr) {
-    return;
-  }
-  emitActionBegin(action);
-  if (isDropAction(action)) {
-    emitDropAction(action);
-  } else if (isNoAction(action)) {
-    emitNoAction(action);
-  } else {
-    emitModifyAction(action);
-  }
+void SVAction::extractParameters() {
+    for (auto param : p4action->parameters->parameters) {
+        parameters.push_back(param);
+        if (auto type = param->type->to<IR::Type_Bits>()) {
+            parameterWidth += type->size;
+        }
+    }
+    LOG3("Action " << actionName << " has " << parameters.size() 
+         << " parameters, width: " << parameterWidth);
 }
 
-}  // namespace FPGA
+void SVAction::analyzeBody() {
+    // Analyze action body to determine what fields are modified
+    for (auto stmt : p4action->body->components) {
+        if (auto assign = stmt->to<IR::AssignmentStatement>()) {
+            if (auto lhs = assign->left->to<IR::Member>()) {
+                auto fieldName = lhs->member;
+                // Store the assignment for code generation
+                fieldModifications[fieldName] = cstring::literal("modified");
+                LOG3("Action " << actionName << " modifies field: " << fieldName);
+            }
+        } else if (auto methodCall = stmt->to<IR::MethodCallStatement>()) {
+            auto method = methodCall->methodCall->method->toString();
+            LOG3("Action " << actionName << " calls method: " << method);
+        }
+    }
+}
+
+void SVAction::emitExecute(CodeBuilder* builder, const std::string& prefix) {
+    if (isNoAction()) {
+        builder->appendLine("// NoAction - pass through");
+        return;
+    }
+    
+    if (isDropAction()) {
+        builder->appendLine("// Drop action");
+        builder->append("// TODO: implement drop");
+        return;
+    }
+    
+    builder->append("// TODO: action implementation");
+    
+    // Process action body
+    for (auto stmt : p4action->body->components) {
+        if (auto assign = stmt->to<IR::AssignmentStatement>()) {
+            emitAssignment(builder, assign, prefix);
+        } else if (auto methodCall = stmt->to<IR::MethodCallStatement>()) {
+            if (auto expr = methodCall->methodCall) {
+                emitMethodCall(builder, expr, prefix);
+            }
+        }
+    }
+}
+
+void SVAction::emitAssignment(CodeBuilder* builder, 
+                              const IR::AssignmentStatement* stmt,
+                              const std::string& prefix) {
+    // Generate assignment statement
+    if (auto lhs = stmt->left->to<IR::Member>()) {
+        std::string target;
+        std::string source;
+        
+        // Determine target location (header or metadata)
+        if (auto lhsExpr = lhs->expr->to<IR::Member>()) {
+            auto structName = lhsExpr->member;
+            auto fieldName = lhs->member;
+            
+            if (structName == "hdr") {
+                target = prefix + "_headers." + fieldName.toString();
+            } else if (structName == "meta") {
+                target = prefix + "_metadata." + fieldName.toString();
+            } else {
+                target = prefix + "_metadata.standard_metadata." + fieldName.toString();
+            }
+        }
+        
+        // Generate source expression
+        if (auto constant = stmt->right->to<IR::Constant>()) {
+            source = std::to_string(constant->asLong()) + "'d" + std::to_string(constant->asLong());
+        } else if (auto rhs = stmt->right->to<IR::Member>()) {
+            if (auto rhsExpr = rhs->expr->to<IR::Member>()) {
+                auto structName = rhsExpr->member;
+                auto fieldName = rhs->member;
+                
+                if (structName == "hdr") {
+                    source = prefix + "_headers." + fieldName.toString();
+                } else if (structName == "meta") {
+                    source = prefix + "_metadata." + fieldName.toString();
+                } else {
+                    source = prefix + "_metadata.standard_metadata." + fieldName.toString();
+                }
+            }
+        } else if (auto param = stmt->right->to<IR::PathExpression>()) {
+            // Action parameter
+            source = "action_data[" + param->path->name.toString() + "]";
+        } else {
+            source = "0";  // Default
+        }
+        
+        // Build the assignment string
+        std::stringstream ss;
+        ss << target << " <= " << source << ";";
+        builder->appendLine(ss.str());
+    }
+}
+
+void SVAction::emitMethodCall(CodeBuilder* builder,
+                             const IR::MethodCallExpression* expr,
+                             const std::string& prefix) {
+    auto methodName = expr->method->toString();
+    
+    if (methodName == "setValid") {
+        // Set header validity
+        if (expr->arguments->size() > 0) {
+            auto arg = expr->arguments->at(0);
+            if (arg->expression && arg->expression->is<IR::Member>()) {
+                auto member = arg->expression->to<IR::Member>();
+                auto headerName = member->member.toString();
+                std::stringstream ss;
+                ss << prefix << "_headers." << headerName << "_valid = 1'b1;";
+                builder->appendLine(ss.str());
+            }
+        }
+    } else if (methodName == "setInvalid") {
+        // Clear header validity
+        if (expr->arguments->size() > 0) {
+            auto arg = expr->arguments->at(0);
+            if (arg->expression && arg->expression->is<IR::Member>()) {
+                auto member = arg->expression->to<IR::Member>();
+                auto headerName = member->member.toString();
+                std::stringstream ss;
+                ss << prefix << "_headers." << headerName << "_valid = 1'b0;";
+                builder->appendLine(ss.str());
+            }
+        }
+    } else if (methodName == "mark_to_drop") {
+        // Mark packet for dropping
+        std::stringstream ss;
+        ss << prefix << "_metadata.drop_flag = 1'b1;";
+        builder->appendLine(ss.str());
+    }
+}
+
+}  // namespace SV

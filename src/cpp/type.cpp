@@ -1,14 +1,19 @@
+#include "common.h"
 #include "type.h"
 #include "bsvprogram.h"
+#include "string_utils.h"
+#include <sstream>
 
-namespace FPGA {
+namespace SV {
 
-FPGATypeFactory* FPGATypeFactory::instance;
+FPGATypeFactory* FPGATypeFactory::instance = nullptr;
 
 FPGAType* FPGATypeFactory::create(const IR::Type* type) {
     CHECK_NULL(type);
     CHECK_NULL(typeMap);
+    
     FPGAType* result = nullptr;
+    
     if (type->is<IR::Type_Boolean>()) {
         result = new FPGABoolType();
     } else if (type->is<IR::Type_Bits>()) {
@@ -25,81 +30,65 @@ FPGAType* FPGATypeFactory::create(const IR::Type* type) {
         result = create(canon);
         result = new FPGATypeName(type->to<IR::Type_Name>(), result);
     } else {
-        // TODO: need to support header stack
-        ::error("Type %1% unsupported by FPGA", type);
+        P4::error("Type %1% unsupported by FPGA", type);
     }
-
+    
     return result;
 }
 
-void
-FPGABoolType::declare(BSVProgram & bsv, cstring id, bool asPointer) {
-    emit(bsv);
-    if (asPointer)
-        bsv.getParserBuilder().append("*");
-    bsv.getParserBuilder().appendFormat(" %s", id.c_str());
+void FPGABoolType::emit(SVCodeGen& codegen) {
+    auto builder = codegen.getTypesBuilder();
+    builder->append("logic");
 }
 
-unsigned FPGAScalarType::alignment() const {
-    if (width <= 8)
-        return 1;
-    else if (width <= 16)
-        return 2;
-    else if (width <= 32)
-        return 4;
-    else
-        // compiled as char*
-        return 1;
+void FPGABoolType::declare(SVCodeGen& codegen, cstring id, bool asPointer) {
+    auto builder = codegen.getTypesBuilder();
+    builder->append("logic ");
+    builder->append(id);
 }
 
-void FPGAScalarType::emit(BSVProgram & bsv) {
-    auto prefix = isSigned ? "i" : "u";
-
-    if (width <= 8)
-        bsv.getParserBuilder().appendFormat("%s8", prefix);
-    else if (width <= 16)
-        bsv.getParserBuilder().appendFormat("%s16", prefix);
-    else if (width <= 32)
-        bsv.getParserBuilder().appendFormat("%s32", prefix);
-    else
-        bsv.getParserBuilder().appendFormat("char*");
-}
-
-void
-FPGAScalarType::declare(BSVProgram & bsv, cstring id, bool asPointer) {
-    if (width <= 32) {
-        emit(bsv);
-        if (asPointer)
-            bsv.getParserBuilder().append("*");
-        bsv.getParserBuilder().spc();
-        bsv.getParserBuilder().append(id);
+std::string FPGAScalarType::getSVType() const {
+    std::stringstream ss;
+    if (width == 1) {
+        ss << "logic";
     } else {
-        if (asPointer)
-            bsv.getParserBuilder().append("char*");
-        else
-            bsv.getParserBuilder().appendFormat("char %s[%d]", id.c_str(), bytesRequired());
+        ss << "logic ";
+        if (isSigned) ss << "signed ";
+        ss << "[" << (width-1) << ":0]";
     }
+    return ss.str();
 }
 
-//////////////////////////////////////////////////////////
+void FPGAScalarType::emit(SVCodeGen& codegen) {
+    auto builder = codegen.getTypesBuilder();
+    builder->append(getSVType());
+}
 
-FPGAStructType::FPGAStructType(const IR::Type_StructLike* strct) :
-        FPGAType(strct) {
-    if (strct->is<IR::Type_Struct>())
-        kind = "struct";
-    else if (strct->is<IR::Type_Header>())
-        kind = "struct";
-    else
+void FPGAScalarType::declare(SVCodeGen& codegen, cstring id, bool asPointer) {
+    auto builder = codegen.getTypesBuilder();
+    builder->append(getSVType());
+    builder->append(" ");
+    builder->append(id);
+}
+
+FPGAStructType::FPGAStructType(const IR::Type_StructLike* strct) : FPGAType(strct) {
+    if (strct->is<IR::Type_Struct>()) {
+        kind = cstring("struct");
+    } else if (strct->is<IR::Type_Header>()) {
+        kind = cstring("header");
+    } else {
         BUG("Unexpected struct type %1%", strct);
-    name = strct->name.name;
+    }
+    
+    name = SnakeCase(strct->name);
     width = 0;
     implWidth = 0;
-
+    
     for (auto f : strct->fields) {
         auto type = FPGATypeFactory::instance->create(f->type);
         auto wt = dynamic_cast<IHasWidth*>(type);
         if (wt == nullptr) {
-            ::error("FPGA: Unsupported type in struct %s", f->type);
+            P4::error("FPGA: Unsupported type in struct %1%", f->type);
         } else {
             width += wt->widthInBits();
             implWidth += wt->implementationWidthInBits();
@@ -108,56 +97,87 @@ FPGAStructType::FPGAStructType(const IR::Type_StructLike* strct) :
     }
 }
 
-void
-FPGAStructType::declare(BSVProgram & bsv, cstring id, bool asPointer) {
-    bsv.getParserBuilder().append(kind);
-    if (asPointer)
-        bsv.getParserBuilder().append("*");
-    const char* n = name.c_str();
-    bsv.getParserBuilder().appendFormat(" %s %s", n, id.c_str());
+void FPGAStructType::declare(SVCodeGen& codegen, cstring id, bool asPointer) {
+    auto builder = codegen.getTypesBuilder();
+    builder->append(name);
+    builder->append("_t ");
+    builder->append(id);
 }
 
-void FPGAStructType::emit(BSVProgram & bsv) {
-    bsv.getParserBuilder().emitIndent();
-    bsv.getParserBuilder().append(kind);
-    bsv.getParserBuilder().spc();
-    bsv.getParserBuilder().append(name);
-    bsv.getParserBuilder().spc();
-    bsv.getParserBuilder().blockStart();
-
+void FPGAStructType::emit(SVCodeGen& codegen) {
+    auto builder = codegen.getTypesBuilder();
+    std::stringstream ss;
+    
+    // Comment
+    ss << "// " << (kind == "header" ? "Header" : "Struct") << " type: " << type->toString();
+    builder->appendLine(ss.str());
+    
+    // Typedef struct packed
+    ss.str("");
+    ss << "typedef struct packed {";
+    builder->appendLine(ss.str());
+    builder->increaseIndent();
+    
+    // Emit fields
     for (auto f : fields) {
-        auto type = f->type;
-        bsv.getParserBuilder().emitIndent();
-
-        type->declare(bsv, f->field->name, false);
-        bsv.getParserBuilder().append("; ");
-        bsv.getParserBuilder().append("/* ");
-        bsv.getParserBuilder().append(type->type->toString());
-        bsv.getParserBuilder().append(" */");
-        bsv.getParserBuilder().newline();
+        auto fieldType = f->type;
+        builder->emitIndent();
+        
+        // Get the SystemVerilog type string
+        std::string svType = fieldType->getSVType();
+        builder->append(svType);
+        builder->append(" ");
+        builder->append(f->field->name);
+        builder->append(";");
+        
+        // Add comment with original P4 type
+        builder->append("  // ");
+        builder->append(f->field->type->toString());
+        builder->newline();
     }
-
-    if (type->is<IR::Type_Header>()) {
-        bsv.getParserBuilder().emitIndent();
-        auto type = FPGATypeFactory::instance->create(IR::Type_Boolean::get());
-        type->declare(bsv, "ebpf_valid", false);
-        bsv.getParserBuilder().endOfStatement(true);
+    
+    // If it's a header, add validity bit
+    if (kind == "header") {
+        builder->emitIndent();
+        builder->append("logic _valid;  // Header validity");
+        builder->newline();
     }
-
-    bsv.getParserBuilder().blockEnd(false);
-    bsv.getParserBuilder().endOfStatement(true);
+    
+    builder->decreaseIndent();
+    ss.str("");
+    ss << "} " << name << "_t;";
+    builder->appendLine(ss.str());
+    builder->newline();
+    
+    // Generate initialization function
+    ss.str("");
+    ss << "function " << name << "_t init_" << name << "();";
+    builder->appendLine(ss.str());
+    builder->increaseIndent();
+    
+    ss.str("");
+    ss << name << "_t result;";
+    builder->appendLine(ss.str());
+    
+    builder->appendLine("result = '0;");
+    if (kind == "header") {
+        builder->appendLine("result._valid = 1'b0;");
+    }
+    builder->appendLine("return result;");
+    
+    builder->decreaseIndent();
+    builder->appendLine("endfunction");
+    builder->newline();
 }
 
-///////////////////////////////////////////////////////////////
-
-void FPGATypeName::declare(BSVProgram & bsv, cstring id, bool asPointer) {
-    canonical->declare(bsv, id, asPointer);
+void FPGATypeName::declare(SVCodeGen& codegen, cstring id, bool asPointer) {
+    canonical->declare(codegen, id, asPointer);
 }
 
 unsigned FPGATypeName::widthInBits() {
     auto wt = dynamic_cast<IHasWidth*>(canonical);
     if (wt == nullptr) {
-        ::error("Type %1% does not have a fixed witdh", type);
+        P4::error("Type %1% does not have a fixed width", typeName);
         return 0;
     }
     return wt->widthInBits();
@@ -166,10 +186,10 @@ unsigned FPGATypeName::widthInBits() {
 unsigned FPGATypeName::implementationWidthInBits() {
     auto wt = dynamic_cast<IHasWidth*>(canonical);
     if (wt == nullptr) {
-        ::error("Type %1% does not have a fixed witdh", type);
+        P4::error("Type %1% does not have a fixed width", typeName);
         return 0;
     }
     return wt->implementationWidthInBits();
 }
 
-}  // namespace FPGA
+}  // namespace SV

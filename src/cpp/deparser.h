@@ -1,44 +1,56 @@
-/*
-  Copyright 2015-2016 P4FPGA Project
+#ifndef _BACKENDS_SV_DEPARSER_H_
+#define _BACKENDS_SV_DEPARSER_H_
 
-  Licensed under the Apache License, Version 2.0 (the "License");
-  you may not use this file except in compliance with the License.
-  You may obtain a copy of the License at
+#include "common.h"
+#include <vector>
+#include <map>
 
-  http://www.apache.org/licenses/LICENSE-2.0
+namespace SV {
 
-  Unless required by applicable law or agreed to in writing, software
-  distributed under the License is distributed on an "AS IS" BASIS,
-  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-  See the License for the specific language governing permissions and
-  limitations under the License.
-*/
+class SVProgram;
+class SVCodeGen;
 
-#ifndef _BACKENDS_FPGA_FPGADEPARSER_H_
-#define _BACKENDS_FPGA_FPGADEPARSER_H_
-
-#include "ir/ir.h"
-#include "program.h"
-
-namespace FPGA {
-
-class FPGADeparser : public FPGAObject {
- public:
-  const FPGAProgram* program;
-  const IR::ControlBlock* controlBlock;
-  std::vector<IR::BSV::DeparseState*> states;
-  CodeBuilder* builder;
-
-  void emitEnums();
-  void emitRules();
-  void emitStates();
-
-  explicit FPGADeparser(const FPGAProgram* program, const IR::ControlBlock* block)
-    : program(program), controlBlock(block) { };
-  void emit(BSVProgram &bsv ) override;
-  bool build();
+class SVDeparseState {
+public:
+    cstring headerName;
+    const IR::Type_Header* headerType;
+    int width;
+    bool isConditional;
+    
+    SVDeparseState(cstring name, const IR::Type_Header* type) :
+        headerName(name), headerType(type), width(0), isConditional(false) {}
 };
 
-}  // namespace FPGA
+class SVDeparser : public FPGAObject {
+public:
+    const SVProgram* program;
+    const IR::ControlBlock* controlBlock;
+    
+    std::vector<SVDeparseState*> deparseStates;
+    std::map<cstring, int> headerOrder;
+    
+    explicit SVDeparser(const SVProgram* program, const IR::ControlBlock* block) :
+        program(program), controlBlock(block) {}
+    
+    ~SVDeparser() {
+        // Clean up allocated memory
+        for (auto state : deparseStates) {
+            delete state;
+        }
+    }
+    
+    void emit(SVCodeGen& codegen);
+    bool build();
+    
+private:
+    void extractEmitStatements();
+    void calculateHeaderOrder();
+    
+    void emitModule(CodeBuilder* builder);
+    void emitPacketAssembly(CodeBuilder* builder);
+    void emitStreamOutput(CodeBuilder* builder);
+};
+
+}  // namespace SV
 
 #endif

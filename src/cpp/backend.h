@@ -1,26 +1,24 @@
+#ifndef _BACKENDS_SV_BACKEND_H_
+#define _BACKENDS_SV_BACKEND_H_
 
-#ifndef EXTENSIONS_CPP_LIBP4FPGA_INCLUDE_BACKEND_H_
-#define EXTENSIONS_CPP_LIBP4FPGA_INCLUDE_BACKEND_H_
+#include "common.h"
 
-#include "options.h"
-#include "ir/ir.h"
-#include "bsvprogram.h"
-#include "frontends/p4/evaluator/evaluator.h"
-
-namespace FPGA {
+namespace SV {
 
 class Backend {
-    std::vector<DebugHook> hooks;
- public:
-    P4::ReferenceMap*     refMap;
-    P4::TypeMap*          typeMap;
-
-    void run(const FPGAOptions& options, const IR::ToplevelBlock* block,
-             P4::ReferenceMap* refMap, P4::TypeMap* typeMap);
-    explicit Backend(P4::ReferenceMap* refMap, P4::TypeMap* typeMap) :
-        refMap(refMap), typeMap(typeMap) {}
+    P4::ReferenceMap* refMap;
+    P4::TypeMap* typeMap;
+    
+public:
+    Backend(P4::ReferenceMap* rm, P4::TypeMap* tm) : 
+        refMap(rm), typeMap(tm) {}
+    
+    void run(const SVOptions& options,
+             const IR::ToplevelBlock* toplevel,
+             P4::ReferenceMap* refMap,
+             P4::TypeMap* typeMap);
 };
 
-}  // namespace FPGA
+}  // namespace SV
 
-#endif /* EXTENSIONS_CPP_LIBP4FPGA_INCLUDE_BACKEND_H_ */
+#endif

@@ -1,46 +1,60 @@
-/*
-  Copyright 2015-2016 P4FPGA Project
+#ifndef EXTENSIONS_CPP_LIBP4FPGA_INCLUDE_OPTIONS_H_
+#define EXTENSIONS_CPP_LIBP4FPGA_INCLUDE_OPTIONS_H_
 
-  Licensed under the Apache License, Version 2.0 (the "License");
-  you may not use this file except in compliance with the License.
-  You may obtain a copy of the License at
+#include "common.h"
+#include "frontends/common/options.h"
+#include "frontends/common/parser_options.h"
+#include <string>
 
-  http://www.apache.org/licenses/LICENSE-2.0
+namespace SV {
 
-  Unless required by applicable law or agreed to in writing, software
-  distributed under the License is distributed on an "AS IS" BASIS,
-  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-  See the License for the specific language governing permissions and
-  limitations under the License.
-*/
-
-#ifndef FPGA_OPTIONS_H
-#define FPGA_OPTIONS_H
-
-#include <getopt.h>
-#include <frontends/common/options.h>
-
-class FPGAOptions : public CompilerOptions {
- public:
-  std::vector<cstring> partitions;
-  bool dumpTable = false;
-  cstring runtime = nullptr;
-  FPGAOptions() {
-    registerOption("-P", "partition1[,partition2]",
-                   [this](const char *arg) {
-                      auto copy = strdup(arg);
-                      while (auto partition = strsep(&copy, ","))
-                        partitions.push_back(partition);
-                      return true;},
-                   "Partition control flow at specific table id");
-    registerOption("--profile", nullptr,
-                   [this](const char*) { dumpTable = true; return true; },
-                   "Dump table resource utilization");
-    registerOption("-R", "runtime",
-                   [this](const char* arg) {
-                      runtime = arg; return true; },
-                   "Runtime type (stream/sharedmem)");
-  }
+class SVOptions : public CompilerOptions {
+public:
+    // Output directory for generated SystemVerilog files
+    cstring outputDir;
+    // Generate testbench
+    bool generateTestbench = false;
+    // Target FPGA platform
+    cstring targetPlatform;
+    // Clock frequency (for timing annotations)
+    unsigned clockFrequency = 250;
+    
+    SVOptions() : outputDir("."), targetPlatform("xilinx") {
+        registerOption("--output-dir", "dir",
+                      [this](const char* arg) {
+                          outputDir = cstring(arg);
+                          return true;
+                      },
+                      "Directory for SystemVerilog output files");
+        
+        registerOption("--testbench", nullptr,
+                      [this](const char*) {
+                          generateTestbench = true;
+                          return true;
+                      },
+                      "Generate SystemVerilog testbench");
+        
+        registerOption("--fpga-target", "platform",
+                      [this](const char* arg) {
+                          targetPlatform = cstring(arg);
+                          return true;
+                      },
+                      "Target FPGA platform (generic, xilinx, intel)");
+        
+        registerOption("--clock-freq", "mhz",
+                      [this](const char* arg) {
+                          clockFrequency = std::stoi(arg);
+                          return true;
+                      },
+                      "Clock frequency in MHz (default: 250)");
+    }
 };
+
+// Use the provided template for context
+using SVContext = P4::P4CContextWithOptions<SVOptions>;
+
+using FPGAOptions = SVOptions;
+
+} // namespace SV
 
 #endif
