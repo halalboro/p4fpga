@@ -17,15 +17,18 @@ private:
     const IR::ParserBlock* parserBlock;
     const TypeMap* typeMap;
     const ReferenceMap* refMap;
-    
-public:
+
+    // Parser parameters
     const IR::Parameter* packet;
     const IR::Parameter* headers;
     const IR::Parameter* userMetadata;
     const IR::Parameter* stdMetadata;
     
-    std::map<cstring, SVParseState*> stateMap;  // Changed to SVParseState*
-    std::vector<SVParseState*> stateList;        // Changed to SVParseState*
+    // Parser states
+    std::map<cstring, SVParseState*> stateMap;
+    std::vector<SVParseState*> stateList;
+    
+    // Header information
     std::map<cstring, int> headerOffsets;
     std::map<cstring, int> headerWidths;
     
@@ -33,7 +36,7 @@ public:
     const IR::ParserState* acceptState;
     int totalHeaderBits;
     
-    void extractStates();
+    // Private helper methods for emission
     void analyzeTransitions();
     void calculateHeaderOffsets();
     void emitStateEnum(CodeBuilder* builder);
@@ -42,6 +45,10 @@ public:
     void emitTransitionLogic(CodeBuilder* builder);
     void emitInterface(CodeBuilder* builder);
     
+    // REMOVED: extractStates() - no longer used
+    // REMOVED: emitParserStates() - replaced by emitStateEnum()
+    // REMOVED: emitStateTransitions() - replaced by emitTransitionLogic()
+
 public:
     SVParser(SVProgram* program,
              const IR::ParserBlock* block,
@@ -59,6 +66,6 @@ public:
     void emit(SVCodeGen& codegen);
 };
 
-}  // namespace SV
+} // namespace SV
 
 #endif

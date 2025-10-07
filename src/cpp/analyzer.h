@@ -1,5 +1,5 @@
-#ifndef _BACKENDS_SV_ANALYZER_H_
-#define _BACKENDS_SV_ANALYZER_H_
+#ifndef P4FPGA_ANALYZER_H
+#define P4FPGA_ANALYZER_H
 
 #include "common.h"
 #include "ir/visitor.h"
@@ -7,7 +7,8 @@
 namespace SV {
 
 // Control Flow Graph for analyzing control blocks
-class CFG {
+// Renamed from CFG to ControlFlowGraph to match control.cpp
+class ControlFlowGraph {
 public:
     class Node;
     
@@ -27,11 +28,18 @@ public:
         
         explicit Node(const IR::Node* n) : node(n) {
             if (auto table = n->to<IR::P4Table>()) {
-                name = table->name;  // Fixed: removed toString()
+                name = table->name;
             } else if (auto action = n->to<IR::P4Action>()) {
-                name = action->name;  // Fixed: removed toString()
+                name = action->name;
             } else {
-                name = cstring("node");  // Fixed: proper cstring construction
+                name = cstring("node");
+            }
+        }
+        
+        ~Node() {
+            // Clean up edges
+            for (auto edge : successors) {
+                delete edge;
             }
         }
     };
@@ -43,17 +51,23 @@ public:
     void addNode(const IR::Node* n);
     void addEdge(const IR::Node* from, const IR::Node* to, cstring label = cstring());
     bool checkForCycles() const;
-    ~CFG();  // Destructor to clean up memory
+    
+    ~ControlFlowGraph() {
+        // Clean up nodes
+        for (auto& pair : nodeMap) {
+            delete pair.second;
+        }
+    }
 };
 
 // Visitor to build control flow graph
 class ControlGraphBuilder : public Inspector {
 public:
-    CFG* cfg;
-    CFG::Node* currentNode = nullptr;
+    ControlFlowGraph* cfg;  // Changed from CFG* to ControlFlowGraph*
+    ControlFlowGraph::Node* currentNode = nullptr;
     
     ControlGraphBuilder() {
-        cfg = new CFG();
+        cfg = new ControlFlowGraph();
         setName("ControlGraphBuilder");
     }
     
@@ -69,4 +83,4 @@ public:
 
 }  // namespace SV
 
-#endif
+#endif  // P4FPGA_ANALYZER_H

@@ -1,6 +1,5 @@
 #ifndef EXTENSIONS_CPP_LIBP4FPGA_INCLUDE_CONTROL_H_
 #define EXTENSIONS_CPP_LIBP4FPGA_INCLUDE_CONTROL_H_
-
 #include "common.h"
 #include "analyzer.h"
 #include <vector>
@@ -33,16 +32,16 @@ private:
     const IR::P4Control* p4control;
     const TypeMap* typeMap;
     const ReferenceMap* refMap;
-    
     cstring controlName;
     bool isIngress;
     int totalStages;
-    
     std::map<cstring, SVTable*> svTables;
     std::map<cstring, SVAction*> svActions;
     std::map<cstring, std::set<cstring>> action_to_table;
-    SV::CFG* cfg;
+    SV::ControlFlowGraph* cfg;
     std::vector<PipelineStage*> pipelineStages;
+    void emitIfStatement(CodeBuilder* builder, const IR::IfStatement* ifStmt);
+    std::string translateCondition(const IR::Expression* condition, int stageNum);
     
     void extractTables();
     void extractActions();
@@ -51,12 +50,15 @@ private:
 public:
     void setIsIngress(bool value) { isIngress = value; }
     SVProgram* getProgram() const { return program; }
+    
+    // ADD THIS METHOD HERE IN SVControl's public section
+    const std::map<cstring, SVTable*>& getTables() const { return svTables; }
+    
     SVControl(SVProgram* program,
               const IR::ControlBlock* block,
               const TypeMap* typeMap,
               const ReferenceMap* refMap);
-    
-    ~SVControl();  // Add destructor to clean up allocated memory
+    ~SVControl();
     
     bool build();
     void emit(SVCodeGen& codegen);
@@ -74,6 +76,6 @@ public:
     std::map<const IR::Node*, const IR::Type*> metadata_to_table;
 };
 
-}  // namespace SV
+} // namespace SV
 
 #endif

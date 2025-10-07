@@ -73,6 +73,18 @@ namespace SV {
     using P4::error;
     using P4::warning;
     
+    struct ExtractedParserState {
+        cstring name;
+        bool isStart;
+        bool isAccept;
+        std::vector<cstring> extractedHeaders;  // Names of headers to extract
+        std::map<cstring, cstring> transitions;  // condition -> next_state
+        
+        ExtractedParserState(cstring n) : name(n), isStart(false), isAccept(false) {}
+    };
+    
+    extern std::map<P4::cstring, std::vector<ExtractedParserState>> g_extractedParserStates;
+
     // Forward declarations for SV backend classes
     class SVProgram;
     class SVCodeGen;
@@ -95,10 +107,15 @@ namespace SV {
         cstring name;
         std::vector<const IR::Expression*> extracts;
         std::map<cstring, cstring> transitions;
-        const IR::ParserState* p4state;
         
-        SVParseState(const IR::ParserState* state) : 
-            name(state->name), p4state(state) {}
+        SVParseState(const IR::ParserState* state) {
+            if (state) {
+                name = state->name;
+            } else {
+                name = cstring("INVALID");
+                P4::warning("SVParseState created with null state");
+            }
+        }
     };
     
     // Helper function for formatted output (since appendFormat doesn't exist)

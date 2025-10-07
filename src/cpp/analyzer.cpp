@@ -4,83 +4,76 @@
 
 namespace SV {
 
-// CFG Implementation
-void CFG::addNode(const IR::Node* n) {
+// ControlFlowGraph implementation
+
+void ControlFlowGraph::addNode(const IR::Node* n) {
     if (nodeMap.find(n) == nodeMap.end()) {
         nodeMap[n] = new Node(n);
     }
 }
 
-void CFG::addEdge(const IR::Node* from, const IR::Node* to, cstring label) {
+void ControlFlowGraph::addEdge(const IR::Node* from, const IR::Node* to, cstring label) {
     addNode(from);
     addNode(to);
     auto edge = new Edge(nodeMap[to], label);
     nodeMap[from]->successors.push_back(edge);
 }
 
-bool CFG::checkForCycles() const {
-    // Simplified cycle detection - would need DFS in production
+bool ControlFlowGraph::checkForCycles() const {
+    // TODO: Implement cycle detection
     return false;
 }
 
-CFG::~CFG() {
-    // Clean up allocated memory
-    for (auto& pair : nodeMap) {
-        for (auto edge : pair.second->successors) {
-            delete edge;
-        }
-        delete pair.second;
-    }
-}
+// ControlGraphBuilder implementation
 
-// ControlGraphBuilder Implementation
 bool ControlGraphBuilder::preorder(const IR::BlockStatement* block) {
-    LOG3("CFG: Processing block statement");
-    
+    LOG3("ControlGraphBuilder visiting block statement");
     // Process each statement in the block
     for (auto stmt : block->components) {
         visit(stmt);
     }
-    
-    return false;  // Don't visit children again
+    return false;  // Already visited children
 }
 
 bool ControlGraphBuilder::preorder(const IR::IfStatement* stmt) {
-    LOG3("CFG: Processing if statement");
+    LOG3("ControlGraphBuilder visiting if statement");
     
-    // Create nodes for then/else branches
-    auto ifNode = new CFG::Node(stmt);
+    // Create a node for the if statement
     cfg->addNode(stmt);
     
     if (currentNode) {
-        cfg->addEdge(currentNode->node, stmt, cstring("condition"));  // Fixed: proper cstring
+        cfg->addEdge(currentNode->node, stmt, cstring(""));
     }
     
-    // Process then branch
-    auto savedNode = currentNode;
-    currentNode = ifNode;
-    visit(stmt->ifTrue);
+    // Create a dummy node for the if statement itself
+    auto ifNode = new ControlFlowGraph::Node(stmt);
     
-    // Process else branch if exists
+    // Visit then branch
+    currentNode = ifNode;
+    if (stmt->ifTrue) {
+        visit(stmt->ifTrue);
+    }
+    
+    // Visit else branch if it exists
     if (stmt->ifFalse) {
         currentNode = ifNode;
         visit(stmt->ifFalse);
     }
     
-    currentNode = savedNode;
-    return false;
+    return false;  // Already visited children
 }
 
 bool ControlGraphBuilder::preorder(const IR::MethodCallExpression* expr) {
-    std::string methodName = expr->method->toString().string();  // Get as std::string
-    LOG3("CFG: Processing method call: " << methodName);
+    LOG3("ControlGraphBuilder visiting method call expression");
     
-    // Track table apply() calls
-    if (methodName.find("apply") != std::string::npos) {  // Fixed: use std::string methods
+    // Check if this is a table apply
+    if (expr->method->toString() == "apply") {
         cfg->addNode(expr);
+        
         if (currentNode) {
-            cfg->addEdge(currentNode->node, expr, cstring("apply"));  // Fixed: proper cstring
+            cfg->addEdge(currentNode->node, expr, cstring(""));
         }
+        
         currentNode = cfg->nodeMap[expr];
     }
     
@@ -88,26 +81,30 @@ bool ControlGraphBuilder::preorder(const IR::MethodCallExpression* expr) {
 }
 
 bool ControlGraphBuilder::preorder(const IR::SwitchStatement* stmt) {
-    LOG3("CFG: Processing switch statement");
+    LOG3("ControlGraphBuilder visiting switch statement");
     
-    auto switchNode = new CFG::Node(stmt);
+    // Create a node for the switch
     cfg->addNode(stmt);
     
     if (currentNode) {
-        cfg->addEdge(currentNode->node, stmt, cstring("switch"));  // Fixed: proper cstring
+        cfg->addEdge(currentNode->node, stmt, cstring(""));
     }
     
-    // Process each case
+    // Create node for the switch statement
+    auto switchNode = new ControlFlowGraph::Node(stmt);
+    
+    // Visit each case
     for (auto switchCase : stmt->cases) {
-        auto savedNode = currentNode;
         currentNode = switchNode;
+        
         if (switchCase->statement) {
+            // Add edge with case label
+            cstring label = switchCase->label->toString();
             visit(switchCase->statement);
         }
-        currentNode = savedNode;
     }
     
-    return false;
+    return false;  // Already visited children
 }
 
 }  // namespace SV

@@ -47,15 +47,12 @@ public:
         egress(nullptr),
         deparser(nullptr) {}
     
-    ~SVProgram() {
-        delete parser;
-        delete ingress;
-        delete egress;
-        delete deparser;
-    }
+    ~SVProgram();  // Declare destructor, implement in .cpp
     
     bool build();
     void emit(SVCodeGen& codegen);
+    
+private:
     void emitTopModule(SVCodeGen& codegen);
     void emitTypeDefinitions(CodeBuilder* builder);
     void emitHeaders(CodeBuilder* builder);
@@ -64,6 +61,6 @@ public:
     void emitInterfaces(CodeBuilder* builder);
 };
 
-}  // namespace SV
+} // namespace SV
 
 #endif

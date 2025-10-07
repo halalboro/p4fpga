@@ -1,5 +1,5 @@
-#ifndef _BACKENDS_SV_BACKEND_H_
-#define _BACKENDS_SV_BACKEND_H_
+#ifndef BACKENDS_SV_BACKEND_H_
+#define BACKENDS_SV_BACKEND_H_
 
 #include "common.h"
 
@@ -13,7 +13,7 @@ public:
     Backend(P4::ReferenceMap* rm, P4::TypeMap* tm) : 
         refMap(rm), typeMap(tm) {}
     
-    void run(const SVOptions& options,
+    bool run(const SVOptions& options,
              const IR::ToplevelBlock* toplevel,
              P4::ReferenceMap* refMap,
              P4::TypeMap* typeMap);
@@ -21,4 +21,4 @@ public:
 
 }  // namespace SV
 
-#endif
+#endif  // BACKENDS_SV_BACKEND_H_

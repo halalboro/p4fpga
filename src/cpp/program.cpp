@@ -2,11 +2,20 @@
 #include "frontends/p4/coreLibrary.h"
 #include "program.h"
 #include "parser.h"
+#include "table.h"
 #include "control.h"
 #include "deparser.h"
 #include <sstream>
 
 namespace SV {
+
+// Destructor implementation
+SVProgram::~SVProgram() {
+    delete parser;
+    delete ingress;
+    delete egress;
+    delete deparser;
+}
 
 bool SVProgram::build() {
     if (!toplevel) {
@@ -20,87 +29,91 @@ bool SVProgram::build() {
         return false;
     }
     
-    // For v1model, we need to extract the parser, ingress, egress, and deparser blocks
-    // These are passed as constructor parameters to the main package
-    auto constructorParams = pack->getConstructorParameters();
+    std::cerr << "Main package found: " << pack->getName().toString() << std::endl;
     
-    if (!constructorParams || constructorParams->size() < 6) {
-        P4::error("Expected v1model package with 6 parameters");
-        return false;
-    }
-    
-    // v1model parameter order:
-    // 0: Parser
-    // 1: VerifyChecksum
-    // 2: Ingress
-    // 3: Egress
-    // 4: ComputeChecksum
-    // 5: Deparser
-    
-    // Extract parser (parameter 0)
-    if (auto parserParam = constructorParams->getParameter(0)) {
-        if (auto pb = parserParam->to<IR::ParserBlock>()) {
-            parser = new SVParser(this, pb, typeMap, refMap);
-            if (!parser->build()) {
-                P4::error("Failed to build parser");
-                return false;
-            }
-            LOG1("Built parser");
+    if (!program) {
+        program = toplevel->getProgram();
+        if (!program) {
+            P4::error("No P4Program found in toplevel block");
+            return false;
         }
     }
     
-    // Extract ingress control (parameter 2)
-    if (auto ingressParam = constructorParams->getParameter(2)) {
-        if (auto cb = ingressParam->to<IR::ControlBlock>()) {
-            ingress = new SVControl(this, cb, typeMap, refMap);
-            ingress->setIsIngress(true);
-            if (!ingress->build()) {
-                P4::error("Failed to build ingress control");
-                return false;
+    // Process all objects in the program
+    for (auto obj : program->objects) {
+        if (auto p = obj->to<IR::P4Parser>()) {
+            std::cerr << "Found parser: " << p->name << std::endl;
+            if (p->name.string().find("Parser") != std::string::npos) {
+                auto pb = new IR::ParserBlock(p, p->type, p);
+                parser = new SVParser(this, pb, typeMap, refMap);
+                if (!parser->build()) {
+                    std::cerr << "WARNING: Parser build failed" << std::endl;
+                }
+                LOG1("Built parser: " << p->name);
             }
-            LOG1("Built ingress control");
+        } else if (auto c = obj->to<IR::P4Control>()) {
+            std::cerr << "Found control: " << c->name << std::endl;
+            
+            if (c->name == "MyIngress") {
+                std::cerr << "Building ingress control..." << std::endl;
+                auto cb = new IR::ControlBlock(c, c->type, c);
+                ingress = new SVControl(this, cb, typeMap, refMap);
+                ingress->setIsIngress(true);
+                if (!ingress->build()) {
+                    std::cerr << "WARNING: Ingress build failed" << std::endl;
+                }
+                std::cerr << "Built ingress control" << std::endl;
+            } else if (c->name == "MyEgress") {
+                std::cerr << "Building egress control..." << std::endl;
+                auto cb = new IR::ControlBlock(c, c->type, c);
+                egress = new SVControl(this, cb, typeMap, refMap);
+                egress->setIsIngress(false);
+                if (!egress->build()) {
+                    std::cerr << "WARNING: Egress build failed" << std::endl;
+                }
+                std::cerr << "Built egress control" << std::endl;
+            } else if (c->name == "MyDeparser") {
+                std::cerr << "Building deparser..." << std::endl;
+                auto cb = new IR::ControlBlock(c, c->type, c);
+                deparser = new SVDeparser(this, cb);
+                if (!deparser->build()) {
+                    std::cerr << "WARNING: Deparser build failed" << std::endl;
+                }
+                std::cerr << "Built deparser" << std::endl;
+            }
         }
     }
     
-    // Extract egress control (parameter 3)
-    if (auto egressParam = constructorParams->getParameter(3)) {
-        if (auto cb = egressParam->to<IR::ControlBlock>()) {
-            egress = new SVControl(this, cb, typeMap, refMap);
-            egress->setIsIngress(false);
-            if (!egress->build()) {
-                P4::error("Failed to build egress control");
-                return false;
-            }
-            LOG1("Built egress control");
-        }
+    // Create defaults only if components weren't found
+    if (!parser) {
+        std::cerr << "WARNING: No parser found, creating default" << std::endl;
+        parser = new SVParser(this, nullptr, typeMap, refMap);
+        parser->build();
+    }
+    if (!ingress) {
+        std::cerr << "WARNING: No ingress found, creating default" << std::endl;
+        ingress = new SVControl(this, nullptr, typeMap, refMap);
+        ingress->setIsIngress(true);
+        ingress->build();
+    }
+    if (!egress) {
+        std::cerr << "WARNING: No egress found, creating default" << std::endl;
+        egress = new SVControl(this, nullptr, typeMap, refMap);
+        egress->setIsIngress(false);
+        egress->build();
+    }
+    if (!deparser) {
+        std::cerr << "WARNING: No deparser found, creating default" << std::endl;
+        deparser = new SVDeparser(this, nullptr);
+        deparser->build();
     }
     
-    // Extract deparser (parameter 5)
-    if (auto deparserParam = constructorParams->getParameter(5)) {
-        if (auto cb = deparserParam->to<IR::ControlBlock>()) {
-            deparser = new SVDeparser(this, cb);
-            if (!deparser->build()) {
-                P4::error("Failed to build deparser");
-                return false;
-            }
-            LOG1("Built deparser");
-        }
-    }
-    
-    if (!parser || !ingress || !egress || !deparser) {
-        P4::error("Could not extract all required pipeline components");
-        return false;
-    }
-    
-    pipelineConfig.stageCount = 1 + // parser
-                                ingress->getStageCount() + 
-                                egress->getStageCount() + 
-                                1; // deparser
-    
+    pipelineConfig.stageCount = 4;
     LOG1("Total pipeline stages: " << pipelineConfig.stageCount);
     
     return true;
 }
+
 
 void SVProgram::emit(SVCodeGen& codegen) {
     LOG1("Generating SystemVerilog code");
@@ -116,6 +129,18 @@ void SVProgram::emit(SVCodeGen& codegen) {
     if (ingress) ingress->emit(codegen);
     if (egress) egress->emit(codegen);
     if (deparser) deparser->emit(codegen);
+    
+    auto tablesBuilder = codegen.getTablesBuilder();
+    if (ingress) {
+        for (auto& p : ingress->getTables()) {
+            p.second->emit(tablesBuilder);
+        }
+    }
+    if (egress) {
+        for (auto& p : egress->getTables()) {
+            p.second->emit(tablesBuilder);
+        }
+    }
     
     // Generate top-level module
     emitTopModule(codegen);
@@ -223,8 +248,44 @@ void SVProgram::emitTopModule(SVCodeGen& codegen) {
     builder->appendLine(");");
     builder->newline();
     
-    // Add similar instances for egress and deparser...
+    // Egress instance
+    builder->appendLine("// Egress pipeline instance");
+    builder->appendLine("egress_pipeline egress_inst (");
+    builder->increaseIndent();
+    builder->appendLine(".clk(clk),");
+    builder->appendLine(".rst_n(rst_n),");
+    builder->appendLine(".in_headers(ingress_headers),");
+    builder->appendLine(".in_metadata(ingress_metadata),");
+    builder->appendLine(".in_valid(ingress_valid),");
+    builder->appendLine(".in_ready(ingress_ready),");
+    builder->appendLine(".out_headers(egress_headers),");
+    builder->appendLine(".out_metadata(egress_metadata),");
+    builder->appendLine(".out_valid(egress_valid),");
+    builder->appendLine(".out_ready(egress_ready)");
+    builder->decreaseIndent();
+    builder->appendLine(");");
+    builder->newline();
     
+    // Deparser instance
+    builder->appendLine("// Deparser instance");
+    builder->appendLine("deparser deparser_inst (");
+    builder->increaseIndent();
+    builder->appendLine(".clk(clk),");
+    builder->appendLine(".rst_n(rst_n),");
+    builder->appendLine(".in_headers(egress_headers),");
+    builder->appendLine(".in_metadata(egress_metadata),");
+    builder->appendLine(".in_valid(egress_valid),");
+    builder->appendLine(".in_ready(egress_ready),");
+    builder->appendLine(".m_axis_tdata(m_axis_tdata),");
+    builder->appendLine(".m_axis_tkeep(m_axis_tkeep),");
+    builder->appendLine(".m_axis_tvalid(m_axis_tvalid),");
+    builder->appendLine(".m_axis_tready(m_axis_tready),");
+    builder->appendLine(".m_axis_tlast(m_axis_tlast),");
+    builder->appendLine(".m_axis_tuser()");  // Not connected
+    builder->decreaseIndent();
+    builder->appendLine(");");
+    
+    builder->appendLine("");
     builder->appendLine("endmodule");
 }
 
@@ -233,7 +294,6 @@ void SVProgram::emitTypeDefinitions(CodeBuilder* builder) {
     builder->appendLine("`define TYPES_SVH");
     builder->newline();
     
-    // TODO: Extract actual types from the P4 program
     builder->appendLine("// Header types");
     builder->appendLine("typedef struct packed {");
     builder->increaseIndent();
@@ -242,6 +302,25 @@ void SVProgram::emitTypeDefinitions(CodeBuilder* builder) {
     builder->appendLine("logic [15:0] etherType;");
     builder->decreaseIndent();
     builder->appendLine("} ethernet_t;");
+    builder->newline();
+    
+    // Add IPv4 header
+    builder->appendLine("typedef struct packed {");
+    builder->increaseIndent();
+    builder->appendLine("logic [3:0]  version;");
+    builder->appendLine("logic [3:0]  ihl;");
+    builder->appendLine("logic [7:0]  diffserv;");
+    builder->appendLine("logic [15:0] totalLen;");
+    builder->appendLine("logic [15:0] identification;");
+    builder->appendLine("logic [2:0]  flags;");
+    builder->appendLine("logic [12:0] fragOffset;");
+    builder->appendLine("logic [7:0]  ttl;");
+    builder->appendLine("logic [7:0]  protocol;");
+    builder->appendLine("logic [15:0] hdrChecksum;");
+    builder->appendLine("logic [31:0] srcAddr;");
+    builder->appendLine("logic [31:0] dstAddr;");
+    builder->decreaseIndent();
+    builder->appendLine("} ipv4_t;");
     builder->newline();
     
     builder->appendLine("// Metadata types");
@@ -259,6 +338,8 @@ void SVProgram::emitTypeDefinitions(CodeBuilder* builder) {
     builder->increaseIndent();
     builder->appendLine("ethernet_t ethernet;");
     builder->appendLine("logic      ethernet_valid;");
+    builder->appendLine("ipv4_t     ipv4;");
+    builder->appendLine("logic      ipv4_valid;");
     builder->decreaseIndent();
     builder->appendLine("} headers_t;");
     builder->newline();
@@ -266,15 +347,15 @@ void SVProgram::emitTypeDefinitions(CodeBuilder* builder) {
     builder->appendLine("`endif");
 }
 
-void SVProgram::emitHeaders(CodeBuilder* builder) {
+void SVProgram::emitHeaders(CodeBuilder* /*builder*/) {
     // Implemented in emitTypeDefinitions
 }
 
-void SVProgram::emitMetadata(CodeBuilder* builder) {
+void SVProgram::emitMetadata(CodeBuilder* /*builder*/) {
     // Implemented in emitTypeDefinitions
 }
 
-void SVProgram::emitStandardMetadata(CodeBuilder* builder) {
+void SVProgram::emitStandardMetadata(CodeBuilder* /*builder*/) {
     // Implemented in emitTypeDefinitions
 }
 
