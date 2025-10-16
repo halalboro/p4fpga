@@ -1,5 +1,7 @@
+// control.h
 #ifndef EXTENSIONS_CPP_LIBP4FPGA_INCLUDE_CONTROL_H_
 #define EXTENSIONS_CPP_LIBP4FPGA_INCLUDE_CONTROL_H_
+
 #include "common.h"
 #include "analyzer.h"
 #include <vector>
@@ -14,15 +16,12 @@ class SVCodeGen;
 class SVTable;
 class SVAction;
 
-class PipelineStage {
-public:
-    int stageNumber;
-    std::vector<SVTable*> tables;
-    std::vector<SVAction*> actions;
-    std::set<cstring> dependencies;
-    
-    PipelineStage() : stageNumber(0) {}
-    PipelineStage(int num) : stageNumber(num) {}
+// NEW: Configuration structure for submodules
+struct ControlConfig {
+    uint8_t matchType;        // 0=Exact, 1=LPM, 2=Ternary, 3=Range
+    uint8_t actionConfig;     // Bitmask: [Hash|Encap|Decap|Modify|Drop|Forward]
+    uint32_t tableSize;
+    uint32_t keyWidth;
 };
 
 class SVControl {
@@ -34,26 +33,30 @@ private:
     const ReferenceMap* refMap;
     cstring controlName;
     bool isIngress;
-    int totalStages;
+    
     std::map<cstring, SVTable*> svTables;
     std::map<cstring, SVAction*> svActions;
     std::map<cstring, std::set<cstring>> action_to_table;
-    SV::ControlFlowGraph* cfg;
-    std::vector<PipelineStage*> pipelineStages;
-    void emitIfStatement(CodeBuilder* builder, const IR::IfStatement* ifStmt);
-    std::string translateCondition(const IR::Expression* condition, int stageNum);
+    
+    // Pipeline emission helpers (DEPRECATED - will be removed)
+    void emitModuleHeader(CodeBuilder* builder);
+    void emitPortDeclarations(CodeBuilder* builder);
+    void emitInternalSignals(CodeBuilder* builder);
+    void emitTableStructDefinition(CodeBuilder* builder);
+    void emitTableStorage(CodeBuilder* builder);
+    void emitTableLookupLogic(CodeBuilder* builder);
+    void emitActionExecutionLogic(CodeBuilder* builder);
+    void emitChecksumUpdateLogic(CodeBuilder* builder);
+    void emitStatisticsCounters(CodeBuilder* builder);
+    void emitSimpleTableControl(CodeBuilder* builder);
+    
+    // Helper to get parsed header inputs needed
+    std::vector<std::pair<cstring, int>> getRequiredParsedFields();
     
     void extractTables();
     void extractActions();
-    void analyzePipeline();
-    
+
 public:
-    void setIsIngress(bool value) { isIngress = value; }
-    SVProgram* getProgram() const { return program; }
-    
-    // ADD THIS METHOD HERE IN SVControl's public section
-    const std::map<cstring, SVTable*>& getTables() const { return svTables; }
-    
     SVControl(SVProgram* program,
               const IR::ControlBlock* block,
               const TypeMap* typeMap,
@@ -61,21 +64,21 @@ public:
     ~SVControl();
     
     bool build();
-    void emit(SVCodeGen& codegen);
-    void assignPipelineStages();
-    void emitModule(CodeBuilder* builder);
-    void emitPipelineRegisters(CodeBuilder* builder);
-    void emitTableInstances(CodeBuilder* builder);
-    void emitActionLogic(CodeBuilder* builder);
-    void emitControlFlow(CodeBuilder* builder);
     
-    int getStageCount() const { return totalStages; }
+    // DEPRECATED: Will be replaced by extractConfiguration()
+    void emit(SVCodeGen& codegen);
+    
+    // NEW: Extract configuration for submodules
+    ControlConfig extractConfiguration();
+    
+    void setIsIngress(bool value) { isIngress = value; }
+    SVProgram* getProgram() const { return program; }
+    const std::map<cstring, SVTable*>& getTables() const { return svTables; }
+    const std::map<cstring, SVAction*>& getActions() const { return svActions; }
     cstring getName() const { return controlName; }
     bool getIsIngress() const { return isIngress; }
-    
-    std::map<const IR::Node*, const IR::Type*> metadata_to_table;
 };
 
 } // namespace SV
 
-#endif
+#endif // EXTENSIONS_CPP_LIBP4FPGA_INCLUDE_CONTROL_H_

@@ -21,6 +21,7 @@ public:
     CodeBuilder* getInterfacesBuilder() { return &interfacesBuilder; }
     CodeBuilder* getTablesBuilder() { return &tablesBuilder; }
     CodeBuilder* getActionsBuilder() { return &actionsBuilder; }
+    CodeBuilder* getPipelineBuilder() { return &ingressBuilder; }  
     
     // Module getters
     std::string getTopModule() const { return topBuilder.toString(); }

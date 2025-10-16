@@ -1,10 +1,11 @@
+// parser.h
 #ifndef EXTENSIONS_CPP_LIBP4FPGA_INCLUDE_PARSER_H_
 #define EXTENSIONS_CPP_LIBP4FPGA_INCLUDE_PARSER_H_
 
 #include "common.h"
 #include <vector>
 #include <map>
-#include <algorithm>
+#include <cstdint>
 
 namespace SV {
 
@@ -17,53 +18,76 @@ private:
     const IR::ParserBlock* parserBlock;
     const TypeMap* typeMap;
     const ReferenceMap* refMap;
-
+    
     // Parser parameters
     const IR::Parameter* packet;
     const IR::Parameter* headers;
     const IR::Parameter* userMetadata;
     const IR::Parameter* stdMetadata;
     
-    // Parser states
-    std::map<cstring, SVParseState*> stateMap;
-    std::vector<SVParseState*> stateList;
+    // Header information for extraction
+    struct HeaderInfo {
+        cstring name;
+        int startBit;
+        int width;
+        std::vector<std::pair<cstring, int>> fields; // field name, width
+    };
     
-    // Header information
-    std::map<cstring, int> headerOffsets;
-    std::map<cstring, int> headerWidths;
+    std::vector<HeaderInfo> headerSequence;
+    std::map<cstring, const IR::Type_Header*> headerTypes;
     
-    const IR::ParserState* startState;
-    const IR::ParserState* acceptState;
-    int totalHeaderBits;
+    // Conditional parsing info
+    struct ConditionalParse {
+        cstring headerName;
+        cstring conditionField;
+        cstring conditionValue;
+    };
     
-    // Private helper methods for emission
-    void analyzeTransitions();
+    std::vector<ConditionalParse> conditionalHeaders;
+    
+    // NEW: Parser configuration (8-bit value)
+    uint8_t parserConfig;
+    
+    // Private helper methods
+    void analyzeHeaderTypes();
+    void analyzeParserFlow();
     void calculateHeaderOffsets();
-    void emitStateEnum(CodeBuilder* builder);
-    void emitStateMachine(CodeBuilder* builder);
-    void emitHeaderExtraction(CodeBuilder* builder);
-    void emitTransitionLogic(CodeBuilder* builder);
-    void emitInterface(CodeBuilder* builder);
+    void extractParserConfiguration();  // NEW
     
-    // REMOVED: extractStates() - no longer used
-    // REMOVED: emitParserStates() - replaced by emitStateEnum()
-    // REMOVED: emitStateTransitions() - replaced by emitTransitionLogic()
-
+    // Configuration bit positions
+    enum ParserConfigBits {
+        PARSE_ETHERNET = 0,
+        PARSE_VLAN     = 1,
+        PARSE_IPV4     = 2,
+        PARSE_IPV6     = 3,
+        PARSE_TCP      = 4,
+        PARSE_UDP      = 5,
+        PARSE_VXLAN    = 6
+    };
+    
 public:
     SVParser(SVProgram* program,
              const IR::ParserBlock* block,
              const TypeMap* typeMap,
              const ReferenceMap* refMap);
     
-    ~SVParser() {
-        // Clean up allocated states
-        for (auto& p : stateMap) {
-            delete p.second;
-        }
-    }
+    ~SVParser() {}
     
     bool build();
     void emit(SVCodeGen& codegen);
+    
+    // NEW: Get parser configuration
+    uint8_t getParserConfig() const { return parserConfig; }
+    
+    // NEW: Get configuration as binary string for SystemVerilog
+    std::string getParserConfigString() const;
+    
+    const std::vector<HeaderInfo>& getHeaderSequence() const { 
+        return headerSequence; 
+    }
+    
+    // NEW: Check if specific header is parsed
+    bool parsesHeader(const cstring& headerName) const;
 };
 
 } // namespace SV
