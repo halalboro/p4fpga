@@ -9,7 +9,8 @@ module match #(
     parameter MATCH_TYPE = 1,        // 0=Exact, 1=LPM, 2=Ternary, 3=Range
     parameter KEY_WIDTH = 32,
     parameter TABLE_SIZE = 1024,
-    parameter ACTION_DATA_WIDTH = 128
+    parameter ACTION_DATA_WIDTH = 128,
+    parameter DATA_WIDTH = 512
 ) (
     input  wire                           aclk,
     input  wire                           aresetn,
@@ -22,6 +23,19 @@ module match #(
     input  wire                           lookup_valid,
     output reg                            lookup_ready,
     
+    // ADDED: Header validity preservation
+    input  wire                           ipv4_valid_in,
+    
+    // ADDED: Header fields pass-through
+    input  wire [47:0]                    eth_dst_addr_in,
+    input  wire [47:0]                    eth_src_addr_in,
+    input  wire [7:0]                     ipv4_ttl_in,
+    
+    // ADDED: Packet data pass-through
+    input  wire [DATA_WIDTH-1:0]          packet_data_in,
+    input  wire [DATA_WIDTH/8-1:0]        packet_keep_in,
+    input  wire                           packet_last_in,
+    
     // ==========================================
     // Match Results
     // ==========================================
@@ -29,6 +43,15 @@ module match #(
     output reg  [2:0]                     match_action_id,
     output reg  [ACTION_DATA_WIDTH-1:0]   match_action_data,
     output reg                            match_valid,
+    
+    // ADDED: Preserved outputs
+    output reg                            ipv4_valid_out,
+    output reg  [47:0]                    eth_dst_addr_out,
+    output reg  [47:0]                    eth_src_addr_out,
+    output reg  [7:0]                     ipv4_ttl_out,
+    output reg  [DATA_WIDTH-1:0]          packet_data_out,
+    output reg  [DATA_WIDTH/8-1:0]        packet_keep_out,
+    output reg                            packet_last_out,
     
     // ==========================================
     // Table Programming Interface
@@ -61,6 +84,18 @@ module match #(
     table_entry_t table_mem [0:TABLE_SIZE-1];
     
     // ==========================================
+    // ADDED: Pipeline registers for pass-through
+    // ==========================================
+    reg                           ipv4_valid_d1;
+    reg  [47:0]                   eth_dst_d1;
+    reg  [47:0]                   eth_src_d1;
+    reg  [7:0]                    ipv4_ttl_d1;
+    reg  [DATA_WIDTH-1:0]         packet_data_d1;
+    reg  [DATA_WIDTH/8-1:0]       packet_keep_d1;
+    reg                           packet_last_d1;
+    reg                           lookup_valid_d1;
+    
+    // ==========================================
     // Internal Signals
     // ==========================================
     reg  [KEY_WIDTH-1:0] match_mask;
@@ -91,6 +126,25 @@ module match #(
     end
     
     // ==========================================
+    // ADDED: Stage 1 - Register inputs
+    // ==========================================
+    always_ff @(posedge aclk or negedge aresetn) begin
+        if (!aresetn) begin
+            ipv4_valid_d1  <= 1'b0;
+            lookup_valid_d1 <= 1'b0;
+        end else if (lookup_ready) begin
+            ipv4_valid_d1   <= ipv4_valid_in;
+            eth_dst_d1      <= eth_dst_addr_in;
+            eth_src_d1      <= eth_src_addr_in;
+            ipv4_ttl_d1     <= ipv4_ttl_in;
+            packet_data_d1  <= packet_data_in;
+            packet_keep_d1  <= packet_keep_in;
+            packet_last_d1  <= packet_last_in;
+            lookup_valid_d1 <= lookup_valid;
+        end
+    end
+    
+    // ==========================================
     // Lookup Logic (Combinational)
     // ==========================================
     always_comb begin
@@ -98,18 +152,26 @@ module match #(
     end
     
     // ==========================================
-    // Match Logic (Registered for timing)
+    // CHANGED: Match Logic (Uses registered inputs)
     // ==========================================
     always_ff @(posedge aclk or negedge aresetn) begin
         if (!aresetn) begin
-            match_hit        <= 1'b0;
-            match_action_id  <= 3'd1;  // Default drop
+            match_hit         <= 1'b0;
+            match_action_id   <= 3'd1;  // Default drop
             match_action_data <= '0;
-            match_valid      <= 1'b0;
+            match_valid       <= 1'b0;
+            ipv4_valid_out    <= 1'b0;
         end else begin
-            match_valid <= lookup_valid;
+            match_valid     <= lookup_valid_d1;
+            ipv4_valid_out  <= ipv4_valid_d1;        // ADDED: Preserve validity
+            eth_dst_addr_out <= eth_dst_d1;          // ADDED: Preserve headers
+            eth_src_addr_out <= eth_src_d1;
+            ipv4_ttl_out     <= ipv4_ttl_d1;
+            packet_data_out  <= packet_data_d1;      // ADDED: Preserve packet
+            packet_keep_out  <= packet_keep_d1;
+            packet_last_out  <= packet_last_d1;
             
-            if (lookup_valid) begin
+            if (lookup_valid_d1) begin
                 // Default: no match
                 match_hit        <= 1'b0;
                 match_action_id  <= 3'd1;  // Drop

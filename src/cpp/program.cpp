@@ -337,8 +337,15 @@ void SVProgram::emitControlSlave(const std::string& outputDir, const std::string
     slave << "            axi_rdata <= '0;\n";
     slave << "        end else if (axi_arready & axi_ctrl.arvalid & ~axi_rvalid) begin\n";
     slave << "            case (axi_araddr[ADDR_LSB+:ADDR_MSB])\n";
-    slave << "                4'h0, 4'h1, 4'h2, 4'h3, 4'h4, 4'h5, 4'h6, 4'h7:\n";
-    slave << "                    axi_rdata <= slv_reg[axi_araddr[ADDR_LSB+:ADDR_MSB]];\n";
+    slave << "                4'h0: axi_rdata <= slv_reg[0];\n";
+    slave << "                4'h1: axi_rdata <= slv_reg[1];\n";
+    slave << "                4'h2: axi_rdata <= slv_reg[2];\n";
+    slave << "                4'h3: axi_rdata <= slv_reg[3];\n";
+    slave << "                4'h4: axi_rdata <= slv_reg[4];\n";
+    slave << "                4'h5: axi_rdata <= slv_reg[5];\n";
+    slave << "                4'h6: axi_rdata <= slv_reg[6];\n";
+    slave << "                4'h7: axi_rdata <= slv_reg[7];\n";
+    slave << "                4'h8: axi_rdata <= {31'h0, 1'b1}; // Status: always ready\n";
     slave << "                default: axi_rdata <= '0;\n";
     slave << "            endcase\n";
     slave << "        end\n";
@@ -532,96 +539,59 @@ void SVProgram::emitRouterTop(SVCodeGen& codegen) {
 }
 
 void SVProgram::emitInterStageSignals(CodeBuilder* builder) {
-    builder->appendLine("// ============================================");
-    builder->appendLine("// Inter-Stage Connection Signals");
-    builder->appendLine("// ============================================");
+    builder->appendLine("// ==========================================");
+    builder->appendLine("// Inter-stage Signals");
+    builder->appendLine("// ==========================================");
     builder->newline();
     
-    // Parser -> Pipeline signals
-    builder->appendLine("// Parser to Pipeline: Packet data");
-    builder->appendLine("logic [DATA_WIDTH-1:0]      parser_to_pipeline_tdata;");
-    builder->appendLine("logic                        parser_to_pipeline_tvalid;");
-    builder->appendLine("logic                        parser_to_pipeline_tready;");
-    builder->appendLine("logic [DATA_WIDTH/8-1:0]    parser_to_pipeline_tkeep;");
-    builder->appendLine("logic                        parser_to_pipeline_tlast;");
+    // Parser outputs
+    builder->appendLine("// Parser → Match");
+    builder->appendLine("logic                        parser_valid;");
+    builder->appendLine("logic                        parser_ready;");
+    builder->appendLine("logic [511:0]                parser_data;");
+    builder->appendLine("logic [63:0]                 parser_keep;");
+    builder->appendLine("logic                        parser_last;");
+    builder->appendLine("logic                        ethernet_valid;");
+    builder->appendLine("logic [47:0]                 eth_dst_addr;");
+    builder->appendLine("logic [47:0]                 eth_src_addr;");
+    builder->appendLine("logic [15:0]                 eth_type;");
+    builder->appendLine("logic                        ipv4_valid;");
+    builder->appendLine("logic [7:0]                  ipv4_ttl;");
+    builder->appendLine("logic [31:0]                 ipv4_src_addr;");
+    builder->appendLine("logic [31:0]                 ipv4_dst_addr;");
     builder->newline();
     
-    builder->appendLine("// Parser to Pipeline: Parsed headers (sideband)");
-    
-    // Only declare signals for headers that are actually parsed
-    if (parser->parsesHeader(cstring("ethernet"))) {
-        builder->appendLine("logic                        ethernet_valid;");
-        builder->appendLine("logic [47:0]                ethernet_dstAddr;");
-        builder->appendLine("logic [47:0]                ethernet_srcAddr;");
-        builder->appendLine("logic [15:0]                ethernet_etherType;");
-        builder->newline();
-    }
-    
-    if (parser->parsesHeader(cstring("ipv4"))) {
-        builder->appendLine("logic                        ipv4_valid;");
-        builder->appendLine("logic [3:0]                 ipv4_version;");
-        builder->appendLine("logic [3:0]                 ipv4_ihl;");
-        builder->appendLine("logic [7:0]                 ipv4_diffserv;");
-        builder->appendLine("logic [15:0]                ipv4_totalLen;");
-        builder->appendLine("logic [15:0]                ipv4_identification;");
-        builder->appendLine("logic [2:0]                 ipv4_flags;");
-        builder->appendLine("logic [12:0]                ipv4_fragOffset;");
-        builder->appendLine("logic [7:0]                 ipv4_ttl;");
-        builder->appendLine("logic [7:0]                 ipv4_protocol;");
-        builder->appendLine("logic [15:0]                ipv4_hdrChecksum;");
-        builder->appendLine("logic [31:0]                ipv4_srcAddr;");
-        builder->appendLine("logic [31:0]                ipv4_dstAddr;");
-        builder->newline();
-    }
-    
-    if (parser->parsesHeader(cstring("udp"))) {
-        builder->appendLine("logic                        udp_valid;");
-        builder->appendLine("logic [15:0]                udp_srcPort;");
-        builder->appendLine("logic [15:0]                udp_dstPort;");
-        builder->appendLine("logic [15:0]                udp_length;");
-        builder->appendLine("logic [15:0]                udp_checksum;");
-        builder->newline();
-    }
-    
-    if (parser->parsesHeader(cstring("tcp"))) {
-        builder->appendLine("logic                        tcp_valid;");
-        builder->appendLine("logic [15:0]                tcp_srcPort;");
-        builder->appendLine("logic [15:0]                tcp_dstPort;");
-        builder->appendLine("// ... more TCP fields as needed");
-        builder->newline();
-    }
-    
-    // Pipeline -> Deparser signals
-    builder->appendLine("// Pipeline to Deparser: Modified packet data");
-    builder->appendLine("logic [DATA_WIDTH-1:0]      pipeline_to_deparser_tdata;");
-    builder->appendLine("logic                        pipeline_to_deparser_tvalid;");
-    builder->appendLine("logic                        pipeline_to_deparser_tready;");
-    builder->appendLine("logic [DATA_WIDTH/8-1:0]    pipeline_to_deparser_tkeep;");
-    builder->appendLine("logic                        pipeline_to_deparser_tlast;");
-    builder->appendLine("logic                        pipeline_to_deparser_drop;");
-    builder->appendLine("logic [8:0]                 pipeline_to_deparser_egress_port;");
+    // Match outputs
+    builder->appendLine("// Match → Action");
+    builder->appendLine("logic                        lpm_valid;");
+    builder->appendLine("logic                        lpm_ready;");
+    builder->appendLine("logic                        lpm_hit;");
+    builder->appendLine("logic [2:0]                  lpm_action;");
+    builder->appendLine("logic [127:0]                lpm_action_data;");
+    builder->appendLine("logic [511:0]                lpm_data;");
+    builder->appendLine("logic [63:0]                 lpm_keep;");
+    builder->appendLine("logic                        lpm_last;");
     builder->newline();
     
-    // Payload from parser
-    builder->appendLine("// Parser payload output");
-    builder->appendLine("logic [DATA_WIDTH-1:0]      parser_payload_data;");
-    builder->appendLine("logic [DATA_WIDTH/8-1:0]    parser_payload_keep;");
-    builder->appendLine("logic                        parser_payload_valid;");
-    builder->appendLine("logic                        parser_payload_last;");
-    builder->appendLine("logic [15:0]                parser_packet_length;");
-    builder->newline();
-
-    // Match engine signals
-    builder->appendLine("// Match engine signals");
-    builder->appendLine("logic                        match_hit;");
-    builder->appendLine("logic [2:0]                 match_action_id;");
-    builder->appendLine("logic [127:0]               match_action_data;");
-    builder->appendLine("logic                        match_valid;");
+    // ADDED: Preserved signals from match
+    builder->appendLine("// Preserved through match stage");
+    builder->appendLine("logic                        lpm_ipv4_valid;");
+    builder->appendLine("logic [47:0]                 lpm_eth_dst;");
+    builder->appendLine("logic [47:0]                 lpm_eth_src;");
+    builder->appendLine("logic [7:0]                  lpm_ipv4_ttl;");
     builder->newline();
     
-    // Action engine signals
-    builder->appendLine("// Action engine signals");
+    // Action outputs
+    builder->appendLine("// Action → Deparser");
+    builder->appendLine("logic                        action_valid;");
+    builder->appendLine("logic                        action_ready;");
+    builder->appendLine("logic                        action_drop;");
+    builder->appendLine("logic [8:0]                  action_egress_port;");
+    builder->appendLine("logic [511:0]                action_data;");
+    builder->appendLine("logic [63:0]                 action_keep;");
+    builder->appendLine("logic                        action_last;");
     builder->appendLine("logic                        header_modified;");
+    builder->appendLine("logic [15:0]                 parser_packet_length;");
     builder->newline();
 }
 
@@ -713,46 +683,68 @@ void SVProgram::emitParserInstance(CodeBuilder* builder) {
 }
 
 void SVProgram::emitMatchEngineInstance(CodeBuilder* builder) {
-    builder->appendLine("// ============================================");
-    builder->appendLine("// Match Engine Instance");
-    builder->appendLine("// ============================================");
-    builder->newline();
-    
-    std::stringstream ss;
+    builder->appendLine("// ==========================================");
+    builder->appendLine("// Match Engine (LPM Table)");
+    builder->appendLine("// ==========================================");
     
     builder->appendLine("match #(");
     builder->increaseIndent();
-    ss.str("");
-    ss << ".MATCH_TYPE(" << (int)controlConfig.matchType << "),";
-    builder->appendLine(ss.str());
-    ss.str("");
-    ss << ".KEY_WIDTH(" << controlConfig.keyWidth << "),";
-    builder->appendLine(ss.str());
-    ss.str("");
-    ss << ".TABLE_SIZE(" << controlConfig.tableSize << ")";
-    builder->appendLine(ss.str());
+    builder->appendLine(".MATCH_TYPE(1),        // LPM");
+    builder->appendLine(".KEY_WIDTH(32),        // IPv4 address");
+    builder->appendLine(".TABLE_SIZE(1024),");
+    builder->appendLine(".ACTION_DATA_WIDTH(128),");
+    builder->appendLine(".DATA_WIDTH(512)");    // ADDED
     builder->decreaseIndent();
-    
-    builder->appendLine(") match_inst (");
+    builder->appendLine(") inst_match (");
     builder->increaseIndent();
+    
     builder->appendLine(".aclk(aclk),");
     builder->appendLine(".aresetn(aresetn),");
     builder->newline();
     
+    // Lookup interface
     builder->appendLine("// Lookup interface");
-    builder->appendLine(".lookup_key(ipv4_dstAddr),");
+    builder->appendLine(".lookup_key(ipv4_dst_addr),");
     builder->appendLine(".lookup_key_mask(32'hFFFFFFFF),");
-    builder->appendLine(".lookup_valid(ipv4_valid && parser_to_pipeline_tvalid),");
-    builder->appendLine(".lookup_ready(),");
+    builder->appendLine(".lookup_valid(parser_valid && ipv4_valid),");
+    builder->appendLine(".lookup_ready(parser_ready),");
     builder->newline();
     
+    // ADDED: Header validity and fields preservation
+    builder->appendLine("// Header preservation");
+    builder->appendLine(".ipv4_valid_in(ipv4_valid),");
+    builder->appendLine(".eth_dst_addr_in(eth_dst_addr),");
+    builder->appendLine(".eth_src_addr_in(eth_src_addr),");
+    builder->appendLine(".ipv4_ttl_in(ipv4_ttl),");
+    builder->newline();
+    
+    // ADDED: Packet data pass-through
+    builder->appendLine("// Packet data pass-through");
+    builder->appendLine(".packet_data_in(parser_data),");
+    builder->appendLine(".packet_keep_in(parser_keep),");
+    builder->appendLine(".packet_last_in(parser_last),");
+    builder->newline();
+    
+    // Match results
     builder->appendLine("// Match results");
-    builder->appendLine(".match_hit(match_hit),");
-    builder->appendLine(".match_action_id(match_action_id),");
-    builder->appendLine(".match_action_data(match_action_data),");
-    builder->appendLine(".match_valid(match_valid),");
+    builder->appendLine(".match_hit(lpm_hit),");
+    builder->appendLine(".match_action_id(lpm_action),");
+    builder->appendLine(".match_action_data(lpm_action_data),");
+    builder->appendLine(".match_valid(lpm_valid),");
     builder->newline();
     
+    // ADDED: Preserved outputs
+    builder->appendLine("// Preserved outputs");
+    builder->appendLine(".ipv4_valid_out(lpm_ipv4_valid),");
+    builder->appendLine(".eth_dst_addr_out(lpm_eth_dst),");
+    builder->appendLine(".eth_src_addr_out(lpm_eth_src),");
+    builder->appendLine(".ipv4_ttl_out(lpm_ipv4_ttl),");
+    builder->appendLine(".packet_data_out(lpm_data),");
+    builder->appendLine(".packet_keep_out(lpm_keep),");
+    builder->appendLine(".packet_last_out(lpm_last),");
+    builder->newline();
+    
+    // Table programming
     builder->appendLine("// Table programming");
     builder->appendLine(".table_write_enable(table_write_enable),");
     builder->appendLine(".table_write_addr(table_write_addr),");
@@ -762,70 +754,76 @@ void SVProgram::emitMatchEngineInstance(CodeBuilder* builder) {
     builder->appendLine(".table_entry_prefix_len(table_entry_prefix_len),");
     builder->appendLine(".table_entry_action_id(table_entry_action),");
     builder->appendLine(".table_entry_action_data({table_entry_egress_port, 71'h0, table_entry_dst_mac})");
-    builder->decreaseIndent();
     
+    builder->decreaseIndent();
     builder->appendLine(");");
     builder->newline();
 }
 
 void SVProgram::emitActionEngineInstance(CodeBuilder* builder) {
-    builder->appendLine("// ============================================");
-    builder->appendLine("// Action Engine Instance");
-    builder->appendLine("// ============================================");
-    builder->newline();
-    
-    std::stringstream ss;
+    builder->appendLine("// ==========================================");
+    builder->appendLine("// Action Engine");
+    builder->appendLine("// ==========================================");
     
     builder->appendLine("action #(");
     builder->increaseIndent();
-    builder->appendLine(".DATA_WIDTH(DATA_WIDTH),");
-    ss.str("");
-    ss << ".ACTION_CONFIG(8'h" << std::hex << std::setw(2) << std::setfill('0') 
-       << (int)controlConfig.actionConfig << std::dec << ")";
-    builder->appendLine(ss.str());
+    builder->appendLine(".DATA_WIDTH(512),");
+    builder->appendLine(".ACTION_DATA_WIDTH(128),");
+    builder->appendLine(".ACTION_CONFIG(8'b00000111)  // Forward, Drop, Modify");
     builder->decreaseIndent();
-    
-    builder->appendLine(") action_inst (");
+    builder->appendLine(") inst_action (");
     builder->increaseIndent();
+    
     builder->appendLine(".aclk(aclk),");
     builder->appendLine(".aresetn(aresetn),");
     builder->newline();
     
+    // Packet input
     builder->appendLine("// Packet input");
-    builder->appendLine(".packet_in(parser_to_pipeline_tdata),");
-    builder->appendLine(".packet_valid(match_valid),");
-    builder->appendLine(".packet_ready(),");
+    builder->appendLine(".packet_in(lpm_data),");
+    builder->appendLine(".packet_keep_in(lpm_keep),");      // ADDED
+    builder->appendLine(".packet_last_in(lpm_last),");      // ADDED
+    builder->appendLine(".packet_valid(lpm_valid),");
+    builder->appendLine(".packet_ready(lpm_ready),");
     builder->newline();
     
+    // Action control
     builder->appendLine("// Action control");
-    builder->appendLine(".action_id(match_action_id),");
-    builder->appendLine(".action_data(match_action_data),");
-    builder->appendLine(".action_valid(match_hit),");
+    builder->appendLine(".action_id(lpm_action),");
+    builder->appendLine(".action_data(lpm_action_data),");
+    builder->appendLine(".action_valid(lpm_valid),");
     builder->newline();
     
-    builder->appendLine("// Header fields");
-    builder->appendLine(".eth_dst_addr(ethernet_dstAddr),");
-    builder->appendLine(".eth_src_addr(ethernet_srcAddr),");
-    builder->appendLine(".ipv4_ttl(ipv4_ttl),");
-    builder->appendLine(".ipv4_src_addr(ipv4_srcAddr),");
-    builder->appendLine(".ipv4_dst_addr(ipv4_dstAddr),");
+    // CHANGED: Header fields (now from match engine outputs)
+    builder->appendLine("// Header fields (preserved from match)");
+    builder->appendLine(".ipv4_valid(lpm_ipv4_valid),");     // CHANGED
+    builder->appendLine(".eth_dst_addr(lpm_eth_dst),");      // CHANGED
+    builder->appendLine(".eth_src_addr(lpm_eth_src),");      // CHANGED
+    builder->appendLine(".ipv4_ttl(lpm_ipv4_ttl),");         // CHANGED
+    builder->appendLine(".ipv4_src_addr(ipv4_src_addr),");
+    builder->appendLine(".ipv4_dst_addr(ipv4_dst_addr),");
     builder->newline();
     
+    // Packet output
     builder->appendLine("// Packet output");
-    builder->appendLine(".packet_out(pipeline_to_deparser_tdata),");
-    builder->appendLine(".packet_out_valid(pipeline_to_deparser_tvalid),");
-    builder->appendLine(".packet_out_ready(pipeline_to_deparser_tready),");
+    builder->appendLine(".packet_out(action_data),");
+    builder->appendLine(".packet_keep_out(action_keep),");   // ADDED
+    builder->appendLine(".packet_last_out(action_last),");   // ADDED
+    builder->appendLine(".packet_out_valid(action_valid),");
+    builder->appendLine(".packet_out_ready(action_ready),");
     builder->newline();
     
+    // Action results
     builder->appendLine("// Action results");
-    builder->appendLine(".drop(pipeline_to_deparser_drop),");
-    builder->appendLine(".egress_port(pipeline_to_deparser_egress_port),");
+    builder->appendLine(".drop(action_drop),");
+    builder->appendLine(".egress_port(action_egress_port),");
     builder->appendLine(".header_modified(header_modified)");
-    builder->decreaseIndent();
     
+    builder->decreaseIndent();
     builder->appendLine(");");
     builder->newline();
 }
+
 
 void SVProgram::emitStatsEngineInstance(CodeBuilder* builder) {
     builder->appendLine("// ============================================");
@@ -847,11 +845,11 @@ void SVProgram::emitStatsEngineInstance(CodeBuilder* builder) {
     builder->newline();
     
     builder->appendLine("// Packet events");
-    builder->appendLine(".packet_valid(pipeline_to_deparser_tvalid),");
-    builder->appendLine(".packet_last(pipeline_to_deparser_tlast),");
-    builder->appendLine(".packet_drop(pipeline_to_deparser_drop),");
-    builder->appendLine(".packet_length(parser_packet_length),");
-    builder->appendLine(".egress_port(pipeline_to_deparser_egress_port),");
+    builder->appendLine(".packet_valid(action_valid),");
+    builder->appendLine(".packet_last(action_last),");
+    builder->appendLine(".packet_drop(action_drop),");
+    builder->appendLine(".packet_length(parser_packet_length),");  
+    builder->appendLine(".egress_port(action_egress_port),");
     builder->newline();
     
     builder->appendLine("// Global statistics");

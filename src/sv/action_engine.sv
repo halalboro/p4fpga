@@ -25,6 +25,8 @@ module action #(
     // Packet Input
     // ==========================================
     input  wire [DATA_WIDTH-1:0]          packet_in,
+    input  wire [DATA_WIDTH/8-1:0]        packet_keep_in,
+    input  wire                           packet_last_in,
     input  wire                           packet_valid,
     output reg                            packet_ready,
     
@@ -36,8 +38,9 @@ module action #(
     input  wire                           action_valid,
     
     // ==========================================
-    // Header Fields (for modification)
+    // CHANGED: Header Fields (from match engine - PRESERVED)
     // ==========================================
+    input  wire                           ipv4_valid,      // Now preserved through match!
     input  wire [47:0]                    eth_dst_addr,
     input  wire [47:0]                    eth_src_addr,
     input  wire [7:0]                     ipv4_ttl,
@@ -48,6 +51,8 @@ module action #(
     // Packet Output
     // ==========================================
     output reg  [DATA_WIDTH-1:0]          packet_out,
+    output reg  [DATA_WIDTH/8-1:0]        packet_keep_out,
+    output reg                            packet_last_out,
     output reg                            packet_out_valid,
     input  wire                           packet_out_ready,
     
@@ -97,12 +102,16 @@ module action #(
     always_ff @(posedge aclk or negedge aresetn) begin
         if (!aresetn) begin
             packet_out       <= '0;
+            packet_keep_out  <= '0;
+            packet_last_out  <= 1'b0;
             packet_out_valid <= 1'b0;
             drop             <= 1'b0;
             egress_port      <= 9'd0;
             header_modified  <= 1'b0;
         end else if (packet_ready) begin
             packet_out_valid <= packet_valid && action_valid;
+            packet_keep_out  <= packet_keep_in;
+            packet_last_out  <= packet_last_in;
             
             if (packet_valid && action_valid) begin
                 // Default: pass through
@@ -117,21 +126,26 @@ module action #(
                     // ==========================================
                     ACTION_FORWARD: begin
                         if (ENABLE_FORWARD && ENABLE_MODIFY_HEADER) begin
-                            // Modify Ethernet destination MAC
-                            modified_packet[47:0] = action_data[47:0];  // New dst MAC
-                            
-                            // Swap source MAC (old dst becomes new src)
-                            modified_packet[95:48] = eth_dst_addr;
-                            
-                            // Decrement TTL
-                            if (ipv4_ttl > 8'd0) begin
-                                modified_packet[183:176] = ipv4_ttl - 8'd1;
+                            // ADDED: Check ipv4_valid before modifying
+                            if (ipv4_valid) begin
+                                // Modify Ethernet destination MAC
+                                modified_packet[47:0] = action_data[47:0];  // New dst MAC
+                                
+                                // Swap source MAC (old dst becomes new src)
+                                modified_packet[95:48] = eth_dst_addr;
+                                
+                                // Decrement TTL
+                                if (ipv4_ttl > 8'd0) begin
+                                    modified_packet[183:176] = ipv4_ttl - 8'd1;
+                                    egress_port     = action_data[56:48];
+                                    header_modified = 1'b1;
+                                end else begin
+                                    drop = 1'b1;  // TTL expired
+                                end
                             end else begin
-                                drop = 1'b1;  // TTL expired
+                                // ADDED: No IPv4 header, cannot forward
+                                drop = 1'b1;
                             end
-                            
-                            egress_port     = action_data[56:48];
-                            header_modified = 1'b1;
                         end
                     end
                     

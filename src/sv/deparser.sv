@@ -110,12 +110,13 @@ module generic_deparser #(
     input  wire                      vxlan_valid,
     
     // ==========================================
-    // Packet Payload Input
+    // Packet Payload Input (AXI-Stream)
     // ==========================================
-    input  wire [DATA_WIDTH-1:0]     payload_data,
-    input  wire [KEEP_WIDTH-1:0]     payload_keep,
-    input  wire                      payload_valid,
-    input  wire                      payload_last,
+    input  wire [DATA_WIDTH-1:0]     s_axis_tdata,
+    input  wire [KEEP_WIDTH-1:0]     s_axis_tkeep,
+    input  wire                      s_axis_tvalid,
+    input  wire                      s_axis_tlast,
+    output reg                       s_axis_tready,  // ADDED: Backpressure
     
     // ==========================================
     // Control Signals
@@ -150,18 +151,24 @@ module generic_deparser #(
     // Internal Signals
     // ==========================================
     reg  [DATA_WIDTH-1:0]  output_buffer;
+    reg  [DATA_WIDTH-1:0]  header_buffer;
     reg  [10:0]            byte_offset;
-    reg  [2:0]             deparse_state;
+    reg  [3:0]             deparse_state;
     reg  [15:0]            calculated_checksum;
+    reg                    packet_started;
+    reg                    is_dropped;
     
     // State machine states
-    localparam STATE_IDLE       = 3'd0;
-    localparam STATE_ETHERNET   = 3'd1;
-    localparam STATE_L3         = 3'd2;
-    localparam STATE_L4         = 3'd3;
-    localparam STATE_CHECKSUM   = 3'd4;
-    localparam STATE_PAYLOAD    = 3'd5;
-    localparam STATE_OUTPUT     = 3'd6;
+    localparam STATE_IDLE           = 4'd0;
+    localparam STATE_DROP_CONSUME   = 4'd1;  // ADDED: Consume dropped packets
+    localparam STATE_BUILD_HEADER   = 4'd2;  // ADDED: Build headers
+    localparam STATE_ETHERNET       = 4'd3;
+    localparam STATE_L3             = 4'd4;
+    localparam STATE_L4             = 4'd5;
+    localparam STATE_CHECKSUM       = 4'd6;
+    localparam STATE_OUTPUT_HEADER  = 4'd7;  // ADDED: Output header
+    localparam STATE_PAYLOAD        = 4'd8;
+    localparam STATE_OUTPUT         = 4'd9;
     
     // ==========================================
     // IPv4 Checksum Calculation Function
@@ -172,95 +179,139 @@ module generic_deparser #(
         integer i;
         begin
             sum = 32'd0;
+            // Sum all 16-bit words except checksum field (word 5)
             for (i = 0; i < 10; i = i + 1) begin
                 if (i != 5) begin
                     sum = sum + ipv4_header[i*16 +: 16];
                 end
             end
+            // Fold 32-bit sum to 16 bits
             while (sum[31:16] != 0) begin
                 sum = sum[15:0] + sum[31:16];
             end
+            // One's complement
             calculate_ipv4_checksum = ~sum[15:0];
         end
     endfunction
     
     // ==========================================
-    // Main Deparser State Machine
+    // Deparser State Machine
     // ==========================================
     always_ff @(posedge aclk or negedge aresetn) begin
         if (!aresetn) begin
-            m_axis_tvalid   <= 1'b0;
-            m_axis_tlast    <= 1'b0;
             m_axis_tdata    <= {DATA_WIDTH{1'b0}};
             m_axis_tkeep    <= {KEEP_WIDTH{1'b0}};
+            m_axis_tvalid   <= 1'b0;
+            m_axis_tlast    <= 1'b0;
+            s_axis_tready   <= 1'b1;  // ADDED: Ready by default
             deparse_state   <= STATE_IDLE;
             byte_offset     <= 11'd0;
             output_buffer   <= {DATA_WIDTH{1'b0}};
+            header_buffer   <= {DATA_WIDTH{1'b0}};
+            packet_started  <= 1'b0;
+            is_dropped      <= 1'b0;
             
         end else begin
             case (deparse_state)
                 
                 // ==========================================
+                // STATE_IDLE: Wait for new packet
+                // ==========================================
                 STATE_IDLE: begin
-                    if (payload_valid && !drop_packet) begin
-                        output_buffer <= {DATA_WIDTH{1'b0}};
-                        byte_offset   <= 11'd0;
-                        m_axis_tvalid <= 1'b0;
-                        deparse_state <= STATE_ETHERNET;
+                    s_axis_tready <= 1'b1;
+                    m_axis_tvalid <= 1'b0;
+                    packet_started <= 1'b0;
+                    
+                    if (s_axis_tvalid) begin
+                        is_dropped <= drop_packet;
+                        
+                        if (drop_packet) begin
+                            // FIXED: Consume dropped packets
+                            s_axis_tready <= 1'b1;
+                            deparse_state <= STATE_DROP_CONSUME;
+                        end else begin
+                            // Start building headers
+                            header_buffer <= {DATA_WIDTH{1'b0}};
+                            byte_offset   <= 11'd0;
+                            s_axis_tready <= 1'b0;  // Stop accepting input while building headers
+                            deparse_state <= STATE_BUILD_HEADER;
+                        end
                     end
                 end
                 
                 // ==========================================
-                STATE_ETHERNET: begin
-                    if (EMIT_ETHERNET && eth_valid) begin
-                        output_buffer[47:0]   <= eth_dst_addr;
-                        output_buffer[95:48]  <= eth_src_addr;
-                        
-                        if (EMIT_VLAN && vlan_valid) begin
-                            output_buffer[111:96]  <= 16'h8100;
-                            output_buffer[114:112] <= vlan_pcp;
-                            output_buffer[115]     <= vlan_dei;
-                            output_buffer[127:116] <= vlan_vid;
-                            output_buffer[143:128] <= vlan_ether_type;
-                            byte_offset <= 11'd18;
-                        end else begin
-                            output_buffer[111:96] <= eth_ether_type;
-                            byte_offset <= 11'd14;
-                        end
-                        
-                        deparse_state <= STATE_L3;
-                    end else begin
-                        deparse_state <= STATE_L3;
+                // STATE_DROP_CONSUME: Consume dropped packet beats
+                // ==========================================
+                STATE_DROP_CONSUME: begin
+                    s_axis_tready <= 1'b1;
+                    m_axis_tvalid <= 1'b0;
+                    
+                    if (s_axis_tvalid && s_axis_tlast) begin
+                        // Finished consuming dropped packet
+                        deparse_state <= STATE_IDLE;
                     end
+                    // Stay in this state until entire packet consumed
                 end
                 
+                // ==========================================
+                // STATE_BUILD_HEADER: Build all headers combinationally
+                // ==========================================
+                STATE_BUILD_HEADER: begin
+                    s_axis_tready <= 1'b0;
+                    byte_offset <= 11'd0;
+                    
+                    // Build Ethernet header
+                    if (EMIT_ETHERNET && eth_valid) begin
+                        header_buffer[47:0]   <= eth_dst_addr;
+                        header_buffer[95:48]  <= eth_src_addr;
+                        
+                        if (EMIT_VLAN && vlan_valid) begin
+                            header_buffer[111:96]  <= 16'h8100;
+                            header_buffer[114:112] <= vlan_pcp;
+                            header_buffer[115]     <= vlan_dei;
+                            header_buffer[127:116] <= vlan_vid;
+                            header_buffer[143:128] <= vlan_ether_type;
+                            byte_offset <= 11'd18;
+                        end else begin
+                            header_buffer[111:96] <= eth_ether_type;
+                            byte_offset <= 11'd14;
+                        end
+                    end
+                    
+                    deparse_state <= STATE_L3;
+                end
+                
+                // ==========================================
+                // STATE_L3: Add Layer 3 headers
                 // ==========================================
                 STATE_L3: begin
                     if (EMIT_IPV4 && ipv4_valid) begin
-                        output_buffer[byte_offset*8 +: 4]     <= ipv4_version;
-                        output_buffer[byte_offset*8+4 +: 4]   <= ipv4_ihl;
-                        output_buffer[byte_offset*8+8 +: 8]   <= ipv4_tos;
-                        output_buffer[byte_offset*8+16 +: 16] <= ipv4_total_len;
-                        output_buffer[byte_offset*8+32 +: 16] <= ipv4_identification;
-                        output_buffer[byte_offset*8+48 +: 3]  <= ipv4_flags;
-                        output_buffer[byte_offset*8+51 +: 13] <= ipv4_frag_offset;
-                        output_buffer[byte_offset*8+64 +: 8]  <= ipv4_ttl;
-                        output_buffer[byte_offset*8+72 +: 8]  <= ipv4_protocol;
-                        output_buffer[byte_offset*8+96 +: 32] <= ipv4_src_addr;
-                        output_buffer[byte_offset*8+128 +: 32] <= ipv4_dst_addr;
+                        // Build IPv4 header at current byte_offset
+                        header_buffer[byte_offset*8 +: 4]     <= ipv4_version;
+                        header_buffer[byte_offset*8+4 +: 4]   <= ipv4_ihl;
+                        header_buffer[byte_offset*8+8 +: 8]   <= ipv4_tos;
+                        header_buffer[byte_offset*8+16 +: 16] <= ipv4_total_len;
+                        header_buffer[byte_offset*8+32 +: 16] <= ipv4_identification;
+                        header_buffer[byte_offset*8+48 +: 3]  <= ipv4_flags;
+                        header_buffer[byte_offset*8+51 +: 13] <= ipv4_frag_offset;
+                        header_buffer[byte_offset*8+64 +: 8]  <= ipv4_ttl;
+                        header_buffer[byte_offset*8+72 +: 8]  <= ipv4_protocol;
+                        header_buffer[byte_offset*8+80 +: 16] <= 16'h0000;  // Checksum placeholder
+                        header_buffer[byte_offset*8+96 +: 32] <= ipv4_src_addr;
+                        header_buffer[byte_offset*8+128 +: 32] <= ipv4_dst_addr;
                         
                         byte_offset <= byte_offset + 11'd20;
                         deparse_state <= UPDATE_IPV4_CHECKSUM ? STATE_CHECKSUM : STATE_L4;
                         
                     end else if (EMIT_IPV6 && ipv6_valid) begin
-                        output_buffer[byte_offset*8 +: 4]     <= ipv6_version;
-                        output_buffer[byte_offset*8+4 +: 8]   <= ipv6_traffic_class;
-                        output_buffer[byte_offset*8+12 +: 20] <= ipv6_flow_label;
-                        output_buffer[byte_offset*8+32 +: 16] <= ipv6_payload_len;
-                        output_buffer[byte_offset*8+48 +: 8]  <= ipv6_next_hdr;
-                        output_buffer[byte_offset*8+56 +: 8]  <= ipv6_hop_limit;
-                        output_buffer[byte_offset*8+64 +: 128] <= ipv6_src_addr;
-                        output_buffer[byte_offset*8+192 +: 128] <= ipv6_dst_addr;
+                        header_buffer[byte_offset*8 +: 4]     <= ipv6_version;
+                        header_buffer[byte_offset*8+4 +: 8]   <= ipv6_traffic_class;
+                        header_buffer[byte_offset*8+12 +: 20] <= ipv6_flow_label;
+                        header_buffer[byte_offset*8+32 +: 16] <= ipv6_payload_len;
+                        header_buffer[byte_offset*8+48 +: 8]  <= ipv6_next_hdr;
+                        header_buffer[byte_offset*8+56 +: 8]  <= ipv6_hop_limit;
+                        header_buffer[byte_offset*8+64 +: 128] <= ipv6_src_addr;
+                        header_buffer[byte_offset*8+192 +: 128] <= ipv6_dst_addr;
                         
                         byte_offset <= byte_offset + 11'd40;
                         deparse_state <= STATE_L4;
@@ -271,76 +322,109 @@ module generic_deparser #(
                 end
                 
                 // ==========================================
+                // STATE_CHECKSUM: Calculate and insert checksums
+                // ==========================================
                 STATE_CHECKSUM: begin
                     if (UPDATE_IPV4_CHECKSUM && ipv4_valid) begin
+                        // Calculate checksum for IPv4 header
                         calculated_checksum <= calculate_ipv4_checksum(
-                            output_buffer[(byte_offset-20)*8 +: 160]
+                            header_buffer[(byte_offset-20)*8 +: 160]
                         );
-                        output_buffer[(byte_offset-20)*8+80 +: 16] <= calculated_checksum;
+                        // Insert checksum at correct position
+                        header_buffer[(byte_offset-20)*8+80 +: 16] <= calculated_checksum;
                     end
                     deparse_state <= STATE_L4;
                 end
                 
                 // ==========================================
+                // STATE_L4: Add Layer 4 headers
+                // ==========================================
                 STATE_L4: begin
                     if (EMIT_TCP && tcp_valid) begin
-                        output_buffer[byte_offset*8 +: 16]    <= tcp_src_port;
-                        output_buffer[byte_offset*8+16 +: 16] <= tcp_dst_port;
-                        output_buffer[byte_offset*8+32 +: 32] <= tcp_seq_no;
-                        output_buffer[byte_offset*8+64 +: 32] <= tcp_ack_no;
-                        output_buffer[byte_offset*8+96 +: 4]  <= tcp_data_offset;
-                        output_buffer[byte_offset*8+100 +: 3] <= tcp_reserved;
-                        output_buffer[byte_offset*8+103 +: 9] <= tcp_flags;
-                        output_buffer[byte_offset*8+112 +: 16] <= tcp_window;
-                        output_buffer[byte_offset*8+128 +: 16] <= tcp_checksum;
-                        output_buffer[byte_offset*8+144 +: 16] <= tcp_urgent_ptr;
+                        header_buffer[byte_offset*8 +: 16]    <= tcp_src_port;
+                        header_buffer[byte_offset*8+16 +: 16] <= tcp_dst_port;
+                        header_buffer[byte_offset*8+32 +: 32] <= tcp_seq_no;
+                        header_buffer[byte_offset*8+64 +: 32] <= tcp_ack_no;
+                        header_buffer[byte_offset*8+96 +: 4]  <= tcp_data_offset;
+                        header_buffer[byte_offset*8+100 +: 3] <= tcp_reserved;
+                        header_buffer[byte_offset*8+103 +: 9] <= tcp_flags;
+                        header_buffer[byte_offset*8+112 +: 16] <= tcp_window;
+                        header_buffer[byte_offset*8+128 +: 16] <= tcp_checksum;
+                        header_buffer[byte_offset*8+144 +: 16] <= tcp_urgent_ptr;
                         
                         byte_offset <= byte_offset + 11'd20;
-                        deparse_state <= STATE_PAYLOAD;
                         
                     end else if (EMIT_UDP && udp_valid) begin
-                        output_buffer[byte_offset*8 +: 16]   <= udp_src_port;
-                        output_buffer[byte_offset*8+16 +: 16] <= udp_dst_port;
-                        output_buffer[byte_offset*8+32 +: 16] <= udp_length;
-                        output_buffer[byte_offset*8+48 +: 16] <= udp_checksum;
+                        header_buffer[byte_offset*8 +: 16]    <= udp_src_port;
+                        header_buffer[byte_offset*8+16 +: 16] <= udp_dst_port;
+                        header_buffer[byte_offset*8+32 +: 16] <= udp_length;
+                        header_buffer[byte_offset*8+48 +: 16] <= udp_checksum;
                         
                         byte_offset <= byte_offset + 11'd8;
-                        
-                        if (EMIT_VXLAN && vxlan_valid) begin
-                            output_buffer[byte_offset*8+64 +: 8]   <= vxlan_flags;
-                            output_buffer[byte_offset*8+72 +: 24]  <= vxlan_reserved;
-                            output_buffer[byte_offset*8+96 +: 24]  <= vxlan_vni;
-                            output_buffer[byte_offset*8+120 +: 8]  <= vxlan_reserved2;
-                            byte_offset <= byte_offset + 11'd8;
-                        end
-                        
+                    end
+                    
+                    deparse_state <= STATE_OUTPUT_HEADER;
+                end
+                
+                // ==========================================
+                // STATE_OUTPUT_HEADER: Output header if it fits in first beat
+                // ==========================================
+                STATE_OUTPUT_HEADER: begin
+                    packet_started <= 1'b1;
+                    s_axis_tready <= 1'b0;
+                    
+                    if (byte_offset <= (DATA_WIDTH/8)) begin
+                        // Header fits in one beat - merge with first payload beat
                         deparse_state <= STATE_PAYLOAD;
-                        
                     end else begin
-                        deparse_state <= STATE_PAYLOAD;
+                        // Header needs multiple beats (not typical for 512-bit width)
+                        m_axis_tdata <= header_buffer;
+                        m_axis_tkeep <= {KEEP_WIDTH{1'b1}};
+                        m_axis_tvalid <= 1'b1;
+                        m_axis_tlast <= 1'b0;
+                        
+                        if (m_axis_tready) begin
+                            deparse_state <= STATE_PAYLOAD;
+                        end
                     end
                 end
                 
+                // ==========================================
+                // STATE_PAYLOAD: Forward payload with prepended headers
                 // ==========================================
                 STATE_PAYLOAD: begin
-                    output_buffer[byte_offset*8 +: (DATA_WIDTH - byte_offset*8)] <= 
-                        payload_data[0 +: (DATA_WIDTH - byte_offset*8)];
+                    s_axis_tready <= m_axis_tready;  // Flow control
                     
-                    deparse_state <= STATE_OUTPUT;
+                    if (s_axis_tvalid && m_axis_tready) begin
+                        if (!packet_started) begin
+                            // First beat: merge headers and payload
+                            // Shift payload right by header size
+                            m_axis_tdata <= (header_buffer & (({DATA_WIDTH{1'b1}} << (byte_offset*8)) ^ {DATA_WIDTH{1'b1}})) |
+                                          (s_axis_tdata >> (byte_offset*8));
+                            m_axis_tkeep <= s_axis_tkeep;  // Simplified - assumes no split
+                            m_axis_tlast <= s_axis_tlast;
+                            m_axis_tvalid <= 1'b1;
+                            packet_started <= 1'b1;
+                            
+                        end else begin
+                            // Subsequent beats: pass through
+                            m_axis_tdata <= s_axis_tdata;
+                            m_axis_tkeep <= s_axis_tkeep;
+                            m_axis_tlast <= s_axis_tlast;
+                            m_axis_tvalid <= 1'b1;
+                        end
+                        
+                        if (s_axis_tlast) begin
+                            deparse_state <= STATE_IDLE;
+                        end
+                    end else begin
+                        m_axis_tvalid <= 1'b0;
+                    end
                 end
                 
                 // ==========================================
-                STATE_OUTPUT: begin
-                    if (m_axis_tready || !m_axis_tvalid) begin
-                        m_axis_tdata  <= output_buffer;
-                        m_axis_tkeep  <= {KEEP_WIDTH{1'b1}};
-                        m_axis_tvalid <= 1'b1;
-                        m_axis_tlast  <= payload_last;
-                        
-                        if (payload_last) begin
-                            deparse_state <= STATE_IDLE;
-                        end
-                    end
+                default: begin
+                    deparse_state <= STATE_IDLE;
                 end
                 
             endcase
