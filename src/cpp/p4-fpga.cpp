@@ -17,11 +17,11 @@
 #include "frontends/p4/evaluator/evaluator.h"
 #include "lib/cstring.h"
 
-// Helper function to recursively scan for if-statements
-void scanForIfStatements(const P4::IR::Node* node, const P4::cstring& controlName, int& count) {
+// Helper function to recursively scan for if-statements and store them
+void scanForIfStatements(const IR::Node* node, const P4::cstring& controlName, int& count) {
     if (!node) return;
     
-    if (auto ifStmt = node->to<P4::IR::IfStatement>()) {
+    if (auto ifStmt = node->to<IR::IfStatement>()) {
         count++;
         
         std::cerr << "╔═══════════════════════════════════════════╗" << std::endl;
@@ -29,15 +29,19 @@ void scanForIfStatements(const P4::IR::Node* node, const P4::cstring& controlNam
         std::cerr << "╚═══════════════════════════════════════════╝" << std::endl;
         std::cerr << "  Condition: " << ifStmt->condition << std::endl;
         
+        P4::cstring trueActionName;
+        P4::cstring falseActionName;
+        
         if (ifStmt->ifTrue) {
             std::cerr << "  True:  " << ifStmt->ifTrue->node_type_name();
             
             // Try to get action name if it's a method call
-            if (auto block = ifStmt->ifTrue->to<P4::IR::BlockStatement>()) {
+            if (auto block = ifStmt->ifTrue->to<IR::BlockStatement>()) {
                 if (block->components.size() > 0) {
-                    if (auto methodCall = block->components[0]->to<P4::IR::MethodCallStatement>()) {
-                        if (auto path = methodCall->methodCall->method->to<P4::IR::PathExpression>()) {
-                            std::cerr << " → " << path->path->name;
+                    if (auto methodCall = block->components[0]->to<IR::MethodCallStatement>()) {
+                        if (auto path = methodCall->methodCall->method->to<IR::PathExpression>()) {
+                            trueActionName = path->path->name;
+                            std::cerr << " → " << trueActionName;
                         }
                     }
                 }
@@ -49,11 +53,12 @@ void scanForIfStatements(const P4::IR::Node* node, const P4::cstring& controlNam
             std::cerr << "  False: " << ifStmt->ifFalse->node_type_name();
             
             // Try to get action name
-            if (auto block = ifStmt->ifFalse->to<P4::IR::BlockStatement>()) {
+            if (auto block = ifStmt->ifFalse->to<IR::BlockStatement>()) {
                 if (block->components.size() > 0) {
-                    if (auto methodCall = block->components[0]->to<P4::IR::MethodCallStatement>()) {
-                        if (auto path = methodCall->methodCall->method->to<P4::IR::PathExpression>()) {
-                            std::cerr << " → " << path->path->name;
+                    if (auto methodCall = block->components[0]->to<IR::MethodCallStatement>()) {
+                        if (auto path = methodCall->methodCall->method->to<IR::PathExpression>()) {
+                            falseActionName = path->path->name;
+                            std::cerr << " → " << falseActionName;
                         }
                     }
                 }
@@ -63,13 +68,33 @@ void scanForIfStatements(const P4::IR::Node* node, const P4::cstring& controlNam
         
         std::cerr << "───────────────────────────────────────────" << std::endl;
         
+        // ==========================================
+        // Store if-else info for backend (Phase 3b)
+        // ==========================================
+        // Only store simple if-else with both branches being action calls
+        if (!trueActionName.isNullOrEmpty()) {
+            // Check if this is a simple comparison we can handle
+            if (auto equ = ifStmt->condition->to<IR::Equ>()) {
+                SV::g_detectedIfElse.emplace_back(
+                    controlName, 
+                    ifStmt->condition, 
+                    trueActionName, 
+                    falseActionName
+                );
+                
+                if (SV::g_verbose) {
+                    std::cerr << "  [Stored for hardware generation]" << std::endl;
+                }
+            }
+        }
+        
         // Recursively scan branches for nested if-statements
         scanForIfStatements(ifStmt->ifTrue, controlName, count);
         scanForIfStatements(ifStmt->ifFalse, controlName, count);
     }
     
     // Scan block statements
-    if (auto block = node->to<P4::IR::BlockStatement>()) {
+    if (auto block = node->to<IR::BlockStatement>()) {
         for (auto component : block->components) {
             scanForIfStatements(component, controlName, count);
         }

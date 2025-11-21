@@ -86,6 +86,23 @@ namespace SV {
     extern std::map<P4::cstring, std::vector<ExtractedParserState>> g_extractedParserStates;
     extern bool g_verbose;
 
+    /**
+     * Represents a simple if-else statement for hardware generation
+     */
+    struct IfElseInfo {
+        P4::cstring controlName;           // Which control block (e.g., "MyIngress")
+        const IR::Expression* condition;    // The condition (e.g., protocol == 6)
+        P4::cstring trueAction;            // Action to call if true
+        P4::cstring falseAction;           // Action to call if false (empty if none)
+        
+        IfElseInfo(P4::cstring ctrl, const IR::Expression* cond, 
+                P4::cstring trueAct, P4::cstring falseAct = P4::cstring())
+            : controlName(ctrl), condition(cond), trueAction(trueAct), falseAction(falseAct) {}
+    };
+
+    // Global storage for if-else statements  
+    extern std::vector<IfElseInfo> g_detectedIfElse;
+
     // Forward declarations for SV backend classes
     class SVProgram;
     class SVCodeGen;

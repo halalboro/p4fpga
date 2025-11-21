@@ -128,6 +128,8 @@ module match_action #(
     // Custom Header Pass-Through (Parser → Action → Deparser)
     // ==========================================
     {{CUSTOM_HEADER_PASSTHROUGH}}
+
+    {{CONDITIONAL_LOGIC}}
     
     // ==========================================
     // Stage 1: Match Engine

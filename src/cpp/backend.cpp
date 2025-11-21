@@ -61,6 +61,157 @@ std::string replaceAll(std::string str, const std::string& from, const std::stri
 }
 
 // ======================================
+// Generate Conditional Logic
+// ======================================
+
+std::string generateConditionalLogic(SVProgram* program) {
+    if (g_detectedIfElse.empty()) {
+        return "";
+    }
+    
+    BACKEND_DEBUG("Generating conditional logic for " << g_detectedIfElse.size() << " if-else statement(s)");
+    
+    std::stringstream ss;
+    
+    ss << "\n    // ==========================================\n";
+    ss << "    // Phase 3b: Conditional Action Selection\n";
+    ss << "    // ==========================================\n";
+    ss << "    // Overrides table action when conditions match\n\n";
+    
+    // Get action list to map names to IDs
+    const auto& actions = program->getIngress()->getActions();
+    std::map<std::string, int> actionNameToId;
+    
+    int actionIdx = 0;
+    for (const auto& action : actions) {
+        actionNameToId[action.first.string()] = actionIdx;
+        actionIdx++;
+    }
+    
+    // Generate conditional logic
+    bool hasConditional = false;
+    int condId = 0;
+    
+    for (const auto& ifElse : g_detectedIfElse) {
+        // Only generate for ingress control
+        if (ifElse.controlName != "MyIngress") {
+            continue;
+        }
+        
+        // Parse the condition
+        if (auto equ = ifElse.condition->to<IR::Equ>()) {
+            auto left = equ->left;
+            auto right = equ->right;
+            
+            // Extract field name and value
+            std::string fieldName;
+            std::string compareValue;
+            int bitWidth = 8;
+            
+            // Left side: field access (e.g., hdr.ipv4.protocol)
+            if (auto member = left->to<IR::Member>()) {
+                fieldName = member->member.string();
+                
+                // Determine bit width
+                if (fieldName == "protocol") bitWidth = 8;
+                else if (fieldName == "dstAddr" || fieldName == "srcAddr") bitWidth = 32;
+                else if (fieldName == "diffserv") bitWidth = 6;
+                else bitWidth = 8;
+            }
+            
+            // Right side: constant value
+            if (auto constant = right->to<IR::Constant>()) {
+                compareValue = std::to_string(constant->asInt());
+            } else if (auto path = right->to<IR::PathExpression>()) {
+                // Named constant (e.g., IP_PROTOCOLS_UDP)
+                std::string constName = path->path->name.string();
+                
+                if (constName == "IP_PROTOCOLS_UDP") compareValue = "17";
+                else if (constName == "IP_PROTOCOLS_TCP") compareValue = "6";
+                else if (constName == "IP_PROTOCOLS_ICMP") compareValue = "1";
+                else if (constName == "IP_PROTOCOLS_IGMP") compareValue = "2";
+                else compareValue = "0";
+            }
+            
+            if (!fieldName.empty() && !compareValue.empty()) {
+                hasConditional = true;
+                condId++;
+                
+                // Map field to hardware signal
+                std::string hwSignal = "ipv4_" + fieldName;
+                
+                // Look up action IDs
+                int trueActionId = 0;  // NoAction
+                int falseActionId = 0;
+                
+                auto trueIt = actionNameToId.find(ifElse.trueAction.string());
+                if (trueIt != actionNameToId.end()) {
+                    trueActionId = trueIt->second;
+                }
+                
+                if (!ifElse.falseAction.isNullOrEmpty()) {
+                    auto falseIt = actionNameToId.find(ifElse.falseAction.string());
+                    if (falseIt != actionNameToId.end()) {
+                        falseActionId = falseIt->second;
+                    }
+                }
+                
+                ss << "    // Conditional #" << condId << ": " << fieldName << " == " << compareValue << "\n";
+                ss << "    wire cond_" << condId << "_match;\n";
+                ss << "    wire [2:0] cond_" << condId << "_action;\n";
+                ss << "    assign cond_" << condId << "_match = (" << hwSignal 
+                   << " == " << bitWidth << "'d" << compareValue << ");\n";
+                ss << "    assign cond_" << condId << "_action = cond_" << condId << "_match ? 3'd" 
+                   << trueActionId << " : 3'd" << falseActionId << ";\n\n";
+                
+                BACKEND_DEBUG("  Cond " << condId << ": " << fieldName << " == " << compareValue 
+                            << " → true=" << ifElse.trueAction << " (id=" << trueActionId << ")"
+                            << " false=" << ifElse.falseAction << " (id=" << falseActionId << ")");
+            }
+        }
+    }
+    
+    if (!hasConditional) {
+        return "";
+    }
+    
+    // Generate action override logic
+    ss << "    // Action Override Logic\n";
+    ss << "    // When conditional matches, override table action\n";
+    ss << "    wire conditional_override;\n";
+    ss << "    wire [2:0] conditional_action_id;\n\n";
+    
+    if (condId == 1) {
+        // Single condition
+        ss << "    assign conditional_override = cond_1_match;\n";
+        ss << "    assign conditional_action_id = cond_1_action;\n\n";
+    } else {
+        // Multiple conditions - OR them together
+        ss << "    assign conditional_override = ";
+        for (int i = 1; i <= condId; i++) {
+            if (i > 1) ss << " || ";
+            ss << "cond_" << i << "_match";
+        }
+        ss << ";\n\n";
+        
+        // Priority encoder for action selection (first match wins)
+        ss << "    assign conditional_action_id = \n";
+        for (int i = 1; i <= condId; i++) {
+            ss << "        cond_" << i << "_match ? cond_" << i << "_action :\n";
+        }
+        ss << "        3'd0;  // NoAction if no match\n\n";
+    }
+    
+    ss << "    // Final action selection: conditional overrides table\n";
+    ss << "    wire [2:0] final_action_id;\n";
+    ss << "    assign final_action_id = conditional_override ? conditional_action_id : match_action_id;\n\n";
+    
+    BACKEND_DEBUG("Generated conditional override logic with " << condId << " condition(s)");
+    
+    return ss.str();
+}
+
+// ======================================
 // Copy Static Module Templates
 // ======================================
 
@@ -212,6 +363,11 @@ bool Backend::processMatchActionTemplate(SVProgram* program, const std::string& 
     }
     
     // ==========================================
+    // Generate Conditional Logic
+    // ==========================================
+    std::string conditionalLogic = generateConditionalLogic(program);
+    
+    // ==========================================
     // Replace Template Placeholders
     // ==========================================
     matchActionTemplate = replaceAll(matchActionTemplate, 
@@ -229,6 +385,15 @@ bool Backend::processMatchActionTemplate(SVProgram* program, const std::string& 
     matchActionTemplate = replaceAll(matchActionTemplate, 
                                      "{{CUSTOM_HEADER_PASSTHROUGH}}", 
                                      customPassthrough.str());
+    
+    if (!g_detectedIfElse.empty()) {
+        // Replace match_action_id with final_action_id in action instantiation
+        matchActionTemplate = replaceAll(matchActionTemplate,
+                                        ".action_id(match_action_id),",
+                                        ".action_id(final_action_id),");
+        
+        BACKEND_DEBUG("Patched action_id connection to use conditional override");
+    }
     
     // ==========================================
     // Write Output File
@@ -341,7 +506,7 @@ bool Backend::run(const SVOptions& options,
     }
     BACKEND_SUCCESS("Copied static modules");
 
-    // Process match_action.sv template with custom headers
+    // Process match_action.sv template with custom headers AND conditional logic
     if (!processMatchActionTemplate(&svprog, options.outputDir.string())) {
         return false;
     }
@@ -558,6 +723,14 @@ bool Backend::run(const SVOptions& options,
         std::cerr << "Hash";
         first = false;
     }
+    
+    // Show conditional logic
+    if (!g_detectedIfElse.empty()) {
+        if (!first) std::cerr << ", ";
+        std::cerr << "Conditional";
+        first = false;
+    }
+    
     if (first) {
         std::cerr << "None";
     }
