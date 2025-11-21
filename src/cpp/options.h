@@ -12,22 +12,28 @@ class SVOptions : public CompilerOptions {
 public:
     // Output directory for generated SystemVerilog files
     cstring outputDir;
+    
     // Generate testbench
     bool generateTestbench = false;
+    
     // Target FPGA platform
     cstring targetPlatform;
+    
     // Clock frequency (for timing annotations)
     unsigned clockFrequency = 250;
     
+    // Verbose debug output
+    bool verbose = false;
+
     SVOptions() : outputDir("."), targetPlatform("xilinx") {
-        registerOption("--output-dir", "dir",
+        registerOption("--out", "dir",
                       [this](const char* arg) {
                           outputDir = cstring(arg);
                           return true;
                       },
                       "Directory for SystemVerilog output files");
         
-        registerOption("--testbench", nullptr,
+        registerOption("--tb", nullptr,
                       [this](const char*) {
                           generateTestbench = true;
                           return true;
@@ -41,18 +47,24 @@ public:
                       },
                       "Target FPGA platform (generic, xilinx, intel)");
         
-        registerOption("--clock-freq", "mhz",
+        registerOption("--clk", "mhz",
                       [this](const char* arg) {
                           clockFrequency = std::stoi(arg);
                           return true;
                       },
                       "Clock frequency in MHz (default: 250)");
+        
+        registerOption("--verb", nullptr,
+                      [this](const char*) {
+                          verbose = true;
+                          return true;
+                      },
+                      "Enable verbose debug output");
     }
 };
 
 // Use the provided template for context
 using SVContext = P4::P4CContextWithOptions<SVOptions>;
-
 using FPGAOptions = SVOptions;
 
 } // namespace SV

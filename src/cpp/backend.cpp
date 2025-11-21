@@ -6,6 +6,8 @@
 #include <fstream>
 #include <map>
 #include <string>
+#include <sstream>
+#include <chrono>
 #include "ir/ir.h"
 #include "lib/error.h"
 #include "lib/nullstream.h"
@@ -17,70 +19,53 @@
 #include "type.h"
 #include "options.h"
 #include "bsvprogram.h"
+#include "parser.h"       
+#include "deparser.h"      
+#include "control.h" 
 
 namespace SV {
 
-bool Backend::copyTemplates(const std::string& outputDir) {
-    LOG1("Copying  parser/deparser templates from src/sv/");
-    
-    // Ensure hdl directory exists
-    boost::filesystem::path hdlDir = boost::filesystem::path(outputDir) / "hdl";
-    if (!boost::filesystem::exists(hdlDir)) {
-        boost::filesystem::create_directories(hdlDir);
+// ==========================================
+// Debug Control
+// ==========================================
+#define BACKEND_INFO(msg)    std::cerr << "[INFO] " << msg << std::endl
+#define BACKEND_SUCCESS(msg) std::cerr << "[✓] " << msg << std::endl
+#define BACKEND_ERROR(msg)   std::cerr << "[ERROR] " << msg << std::endl
+
+#define BACKEND_DEBUG(msg) if (SV::g_verbose) std::cerr << "  " << msg << std::endl
+
+// ======================================
+// Template Engine Helper Functions
+// ======================================
+
+std::string loadTemplate(const std::string& templatePath) {
+    std::ifstream file(templatePath);
+    if (!file.is_open()) {
+        P4::error("Failed to load template: %s", templatePath.c_str());
+        return "";
     }
     
-    // Source paths (relative to build directory)
-    boost::filesystem::path srcDir = "../src/sv";
-    boost::filesystem::path srcParserPath = srcDir / "parser.sv";
-    boost::filesystem::path srcDeparserPath = srcDir / "deparser.sv";
-    
-    // Destination paths
-    boost::filesystem::path dstParserPath = hdlDir / "parser.sv";
-    boost::filesystem::path dstDeparserPath = hdlDir / "deparser.sv";
-    
-    // Check if source files exist
-    if (!boost::filesystem::exists(srcParserPath)) {
-        P4::error(" parser template not found: %s", srcParserPath.string().c_str());
-        std::cerr << "ERROR: Cannot find parser.sv at: " << srcParserPath.string() << std::endl;
-        std::cerr << "       Please ensure the template exists in src/sv/" << std::endl;
-        return false;
-    }
-    
-    if (!boost::filesystem::exists(srcDeparserPath)) {
-        P4::error(" deparser template not found: %s", srcDeparserPath.string().c_str());
-        std::cerr << "ERROR: Cannot find _deparser.sv at: " << srcDeparserPath.string() << std::endl;
-        std::cerr << "       Please ensure the template exists in src/sv/" << std::endl;
-        return false;
-    }
-    
-    try {
-        // Copy parser.sv
-        boost::filesystem::copy_file(
-            srcParserPath,
-            dstParserPath,
-            boost::filesystem::copy_option::overwrite_if_exists
-        );
-        LOG1("Copied parser.sv to " << dstParserPath.string());
-        
-        // Copy _deparser.sv
-        boost::filesystem::copy_file(
-            srcDeparserPath,
-            dstDeparserPath,
-            boost::filesystem::copy_option::overwrite_if_exists
-        );
-        LOG1("Copied deparser.sv to " << dstDeparserPath.string());
-        
-    } catch (const boost::filesystem::filesystem_error& e) {
-        P4::error("Failed to copy templates: %s", e.what());
-        std::cerr << "ERROR: Failed to copy templates: " << e.what() << std::endl;
-        return false;
-    }
-    
-    return true;
+    std::string content((std::istreambuf_iterator<char>(file)),
+                        std::istreambuf_iterator<char>());
+    file.close();
+    return content;
 }
 
-bool Backend::copySubmodules(const std::string& outputDir) {
-    LOG1("Copying submodules from src/sv/");
+std::string replaceAll(std::string str, const std::string& from, const std::string& to) {
+    size_t pos = 0;
+    while ((pos = str.find(from, pos)) != std::string::npos) {
+        str.replace(pos, from.length(), to);
+        pos += to.length();
+    }
+    return str;
+}
+
+// ======================================
+// Copy Static Module Templates
+// ======================================
+
+bool Backend::copyStaticTemplates(const std::string& outputDir) {
+    BACKEND_DEBUG("Copying static modules");
     
     // Ensure hdl directory exists
     boost::filesystem::path hdlDir = boost::filesystem::path(outputDir) / "hdl";
@@ -89,41 +74,35 @@ bool Backend::copySubmodules(const std::string& outputDir) {
     }
     
     // Source directory
-    boost::filesystem::path srcDir = "../src/sv";
+    boost::filesystem::path srcDir = "../src/sv/hdl";
     
-    // Define source -> destination mapping
-    // Source files have "_engine" suffix, destination files don't
-    std::map<std::string, std::string> submodules = {
-        {"match_engine.sv", "match.sv"},
-        {"action_engine.sv", "action.sv"},
-        {"stats_engine.sv", "stats.sv"}
+    // Define static modules
+    std::map<std::string, std::string> staticModules = {
+        {"match.sv.in", "match.sv"},
+        {"action.sv.in", "action.sv"},
+        {"stats.sv.in", "stats.sv"}
     };
     
-    // Copy each submodule
-    for (const auto& pair : submodules) {
+    // Copy each module
+    for (const auto& pair : staticModules) {
         boost::filesystem::path srcPath = srcDir / pair.first;
         boost::filesystem::path dstPath = hdlDir / pair.second;
         
-        // Check if source exists
         if (!boost::filesystem::exists(srcPath)) {
-            P4::error("Submodule not found: %s", srcPath.string().c_str());
-            std::cerr << "ERROR: Cannot find " << pair.first << " at: " << srcPath.string() << std::endl;
-            std::cerr << "       Please ensure the submodule exists in src/sv/" << std::endl;
+            BACKEND_ERROR("Template not found: " << srcPath.string());
             return false;
         }
         
         try {
-            // Copy file
             boost::filesystem::copy_file(
                 srcPath,
                 dstPath,
                 boost::filesystem::copy_option::overwrite_if_exists
             );
-            LOG1("Copied " << pair.first << " to " << dstPath.string());
+            BACKEND_DEBUG("Copied " << pair.second);
             
         } catch (const boost::filesystem::filesystem_error& e) {
-            P4::error("Failed to copy %s: %s", pair.first.c_str(), e.what());
-            std::cerr << "ERROR: Failed to copy " << pair.first << ": " << e.what() << std::endl;
+            BACKEND_ERROR("Failed to copy " << pair.first << ": " << e.what());
             return false;
         }
     }
@@ -131,36 +110,161 @@ bool Backend::copySubmodules(const std::string& outputDir) {
     return true;
 }
 
+bool Backend::processMatchActionTemplate(SVProgram* program, const std::string& outputDir) {
+    BACKEND_DEBUG("Generating match_action.sv with custom header support");
+    
+    // Load template
+    std::string templatePath = "../src/sv/hdl/match_action.sv.in";
+    std::string matchActionTemplate = loadTemplate(templatePath);
+    if (matchActionTemplate.empty()) {
+        BACKEND_ERROR("Failed to load match_action.sv template");
+        return false;
+    }
+    
+    // Get custom headers
+    const auto& customHeaders = program->getParser()->getCustomHeaders();
+    
+    // ==========================================
+    // Generate Custom Header INPUTS
+    // ==========================================
+    std::stringstream customInputs;
+
+    if (!customHeaders.empty()) {
+        for (const auto& headerPair : customHeaders) {
+            const std::string headerName = headerPair.first.string();
+            const SVParser::CustomHeaderInfo& headerInfo = headerPair.second;
+            
+            // Iterate over fields map
+            for (const auto& fieldPair : headerInfo.fields) {
+                const std::string fieldName = fieldPair.first.string();
+                const SVParser::CustomHeaderField& field = fieldPair.second;
+                
+                customInputs << "    input  wire [" << (field.width - 1) << ":0] "
+                           << headerName << "_" << fieldName << ",\n";
+            }
+            customInputs << "    input  wire " << headerName << "_valid,\n";
+        }
+    }
+    
+    // ==========================================
+    // Generate Custom Header OUTPUTS
+    // ==========================================
+    std::stringstream customOutputs;
+
+    if (!customHeaders.empty()) {
+        for (const auto& headerPair : customHeaders) {
+            const std::string headerName = headerPair.first.string();
+            const SVParser::CustomHeaderInfo& headerInfo = headerPair.second;
+            
+            for (const auto& fieldPair : headerInfo.fields) {
+                const std::string fieldName = fieldPair.first.string();
+                const SVParser::CustomHeaderField& field = fieldPair.second;
+                
+                customOutputs << "    output wire [" << (field.width - 1) << ":0] "
+                            << "out_" << headerName << "_" << fieldName << ",\n";
+            }
+            customOutputs << "    output wire " << "out_" << headerName << "_valid,\n";
+        }
+    }
+    
+    // ==========================================
+    // Generate Custom Header WIRES
+    // ==========================================
+    std::stringstream customWires;
+
+    if (!customHeaders.empty()) {
+        customWires << "    // Custom header pass-through wires\n";
+        for (const auto& headerPair : customHeaders) {
+            const std::string headerName = headerPair.first.string();
+            const SVParser::CustomHeaderInfo& headerInfo = headerPair.second;
+            
+            for (const auto& fieldPair : headerInfo.fields) {
+                const std::string fieldName = fieldPair.first.string();
+                const SVParser::CustomHeaderField& field = fieldPair.second;
+                
+                customWires << "    wire [" << (field.width - 1) << ":0] "
+                          << "pipeline_" << headerName << "_" << fieldName << ";\n";
+            }
+            customWires << "    wire pipeline_" << headerName << "_valid;\n";
+        }
+    }
+    
+    // ==========================================
+    // Generate Custom Header PASSTHROUGH
+    // ==========================================
+    std::stringstream customPassthrough;
+
+    if (!customHeaders.empty()) {
+        customPassthrough << "    // Custom headers: direct pass-through (no modification)\n";
+        for (const auto& headerPair : customHeaders) {
+            const std::string headerName = headerPair.first.string();
+            const SVParser::CustomHeaderInfo& headerInfo = headerPair.second;
+            
+            for (const auto& fieldPair : headerInfo.fields) {
+                const std::string fieldName = fieldPair.first.string();
+                
+                customPassthrough << "    assign out_" << headerName << "_" << fieldName
+                                << " = " << headerName << "_" << fieldName << ";\n";
+            }
+            customPassthrough << "    assign out_" << headerName << "_valid"
+                            << " = " << headerName << "_valid;\n";
+        }
+    }
+    
+    // ==========================================
+    // Replace Template Placeholders
+    // ==========================================
+    matchActionTemplate = replaceAll(matchActionTemplate, 
+                                     "{{CUSTOM_HEADER_INPUTS}}", 
+                                     customInputs.str());
+    
+    matchActionTemplate = replaceAll(matchActionTemplate, 
+                                     "{{CUSTOM_HEADER_OUTPUTS}}", 
+                                     customOutputs.str());
+    
+    matchActionTemplate = replaceAll(matchActionTemplate, 
+                                     "{{CUSTOM_HEADER_WIRES}}", 
+                                     customWires.str());
+    
+    matchActionTemplate = replaceAll(matchActionTemplate, 
+                                     "{{CUSTOM_HEADER_PASSTHROUGH}}", 
+                                     customPassthrough.str());
+    
+    // ==========================================
+    // Write Output File
+    // ==========================================
+    boost::filesystem::path outputPath = 
+        boost::filesystem::path(outputDir) / "hdl" / "match_action.sv";
+    
+    std::ofstream outFile(outputPath.string());
+    if (!outFile) {
+        BACKEND_ERROR("Failed to create match_action.sv");
+        return false;
+    }
+    
+    outFile << matchActionTemplate;
+    outFile.close();
+    
+    BACKEND_DEBUG("Generated match_action.sv");
+    return true;
+}
+
+// ======================================
+// Main Compilation Entry Point
+// ======================================
 
 bool Backend::run(const SVOptions& options,
                   const IR::ToplevelBlock* toplevel,
                   P4::ReferenceMap* refMap,
                   P4::TypeMap* typeMap) {
     
-    LOG1("Starting P4-to-SystemVerilog compilation");
+    SV::g_verbose = options.verbose;
+    auto startTime = std::chrono::high_resolution_clock::now();
     
-    // Create type factory
-    FPGATypeFactory::createFactory(typeMap);
-    
-    // Build the program representation
-    LOG1("Building program representation");
-    SVProgram svprog(toplevel, refMap, typeMap);
-    if (!svprog.build()) {
-        P4::error("SVProgram build failed");
-        std::cerr << "ERROR: SVProgram build failed" << std::endl;
-        return false;
-    }
-    
-    if (options.outputDir.isNullOrEmpty()) {
-        P4::error("Must specify output directory with --output-dir");
-        return false;
-    }
-    
-    // Extract base name from input P4 file
+    // Extract base name from input file
     std::string p4FileName = options.file.string();
-    std::string baseName = "router";  // Default fallback
+    std::string baseName = "router";
     
-    // Extract filename without path and extension
     size_t lastSlash = p4FileName.find_last_of("/\\");
     if (lastSlash != std::string::npos) {
         p4FileName = p4FileName.substr(lastSlash + 1);
@@ -173,10 +277,26 @@ bool Backend::run(const SVOptions& options,
         baseName = p4FileName;
     }
     
-    LOG1("Base name for generated modules: " << baseName);
+    BACKEND_INFO("Compiling " << p4FileName);
     
-    // Create directory structure
-    LOG1("Creating output directory structure");
+    // Create type factory
+    FPGATypeFactory::createFactory(typeMap);
+    
+    // Build the program representation
+    BACKEND_DEBUG("Building program");
+    SVProgram svprog(toplevel, refMap, typeMap);
+    if (!svprog.build()) {
+        BACKEND_ERROR("Program build failed");
+        return false;
+    }
+    
+    // Validate output directory
+    if (options.outputDir.isNullOrEmpty()) {
+        BACKEND_ERROR("Must specify output directory with --out");
+        return false;
+    }
+    
+    // Create output directory structure
     boost::filesystem::path outputDir(options.outputDir.c_str());
     boost::filesystem::path hdlDir = outputDir / "hdl";
     
@@ -187,205 +307,268 @@ bool Backend::run(const SVOptions& options,
         boost::filesystem::create_directories(hdlDir);
     }
     
-    if (!copyTemplates(options.outputDir.string())) {
-        P4::error("Failed to copy templates");
-        std::cerr << "ERROR: Failed to copy templates" << std::endl;
-        return false;
-    }
+    // ======================================
+    // Generate SystemVerilog Modules
+    // ======================================
     
-    if (!copySubmodules(options.outputDir.string())) {
-        P4::error("Failed to copy submodules");
-        std::cerr << "ERROR: Failed to copy submodules" << std::endl;
-        return false;
-    }
-
-    // Create SystemVerilog code generator
-    LOG1("Generating SystemVerilog code");
     SVCodeGen codegen;
-    svprog.emit(codegen);
     
-    // Generate control slave module with dynamic name
-    LOG1("Generating control slave module");
-    svprog.emitControlSlave(options.outputDir.string(), baseName);
+    // Generate parser
+    BACKEND_DEBUG("Generating parser.sv");
+    std::string parserPath = (hdlDir / "parser.sv").string();
+    codegen.processParserTemplate(svprog.getParser(), parserPath);
     
-    // Define output files with dynamic names
-    std::map<std::string, std::string> hdlFiles = {
-        {baseName + ".sv", codegen.getTopModule()}  // Top-level → <name>.sv
-    };
+    if (!boost::filesystem::exists(parserPath)) {
+        BACKEND_ERROR("Failed to generate parser.sv");
+        return false;
+    }
+    BACKEND_SUCCESS("Generated parser.sv");
     
-    // Track if any file write fails
-    bool allFilesWritten = true;
+    // Generate deparser
+    BACKEND_DEBUG("Generating deparser.sv");
+    std::string deparserPath = (hdlDir / "deparser.sv").string();
+    codegen.processDeparserTemplate(svprog.getParser(), deparserPath);
     
-    // Write all HDL files to hdl/ subdirectory
-    for (auto it = hdlFiles.begin(); it != hdlFiles.end(); ++it) {
-        const std::string& filename = it->first;
-        const std::string& content = it->second;
-        boost::filesystem::path filepath = hdlDir / filename;
+    if (!boost::filesystem::exists(deparserPath)) {
+        BACKEND_ERROR("Failed to generate deparser.sv");
+        return false;
+    }
+    BACKEND_SUCCESS("Generated deparser.sv");
+    
+    // Copy static modules
+    if (!copyStaticTemplates(options.outputDir.string())) {
+        return false;
+    }
+    BACKEND_SUCCESS("Copied static modules");
+
+    // Process match_action.sv template with custom headers
+    if (!processMatchActionTemplate(&svprog, options.outputDir.string())) {
+        return false;
+    }
+    BACKEND_SUCCESS("Generated match_action.sv");
+    
+    // Generate control slave
+    BACKEND_DEBUG("Generating control slave");
+    std::string slaveTemplate = loadTemplate("../src/sv/hdl/slave.sv.in");
+    if (slaveTemplate.empty()) {
+        BACKEND_ERROR("Failed to load slave template");
+        return false;
+    }
+    
+    slaveTemplate = replaceAll(slaveTemplate, "{{MODULE_NAME}}", baseName);
+    
+    boost::filesystem::path slavePath = hdlDir / (baseName + "_slave.sv");
+    std::ofstream slaveFile(slavePath.string());
+    if (!slaveFile) {
+        BACKEND_ERROR("Failed to create slave file");
+        return false;
+    }
+    slaveFile << slaveTemplate;
+    slaveFile.close();
+    
+    // Generate vfpga_top.svh
+    BACKEND_DEBUG("Generating vfpga_top.svh");
+    std::string vfpgaTemplate = loadTemplate("../src/sv/vfpga_top.svh.in");
+    if (vfpgaTemplate.empty()) {
+        BACKEND_ERROR("Failed to load vfpga_top template");
+        return false;
+    }
+    
+    // Basic replacements
+    vfpgaTemplate = replaceAll(vfpgaTemplate, "{{MODULE_NAME}}", baseName);
+    vfpgaTemplate = replaceAll(vfpgaTemplate, "{{PARSER_CONFIG}}", 
+                                svprog.getParser()->getParserConfigString());
+    vfpgaTemplate = replaceAll(vfpgaTemplate, "{{DEPARSER_CONFIG}}", 
+                                svprog.getDeparser()->getDeparserConfigString());
+    
+    // Custom header replacements
+    vfpgaTemplate = replaceAll(vfpgaTemplate, "{{CUSTOM_HEADER_SIGNALS}}", 
+                                codegen.generateCustomHeaderSignals(svprog.getParser()));
+    vfpgaTemplate = replaceAll(vfpgaTemplate, "{{CUSTOM_HEADER_PIPELINE_SIGNALS}}", 
+                                codegen.generateCustomHeaderPipelineSignals(svprog.getParser()));
+    vfpgaTemplate = replaceAll(vfpgaTemplate, "{{PARSER_CUSTOM_HEADER_PORTS}}", 
+                                codegen.generateParserCustomHeaderPorts(svprog.getParser()));
+    vfpgaTemplate = replaceAll(vfpgaTemplate, "{{PIPELINE_CUSTOM_HEADER_INPUTS}}", 
+                                codegen.generatePipelineCustomHeaderInputs(svprog.getParser()));
+    vfpgaTemplate = replaceAll(vfpgaTemplate, "{{PIPELINE_CUSTOM_HEADER_OUTPUTS}}", 
+                                codegen.generatePipelineCustomHeaderOutputs(svprog.getParser()));
+    vfpgaTemplate = replaceAll(vfpgaTemplate, "{{DEPARSER_CUSTOM_HEADER_PORTS}}", 
+                                codegen.generateDeparserCustomHeaderPorts(svprog.getParser()));
+    
+    // Handle egress configuration
+    ControlConfig controlConfig = svprog.getControlConfig();
+    bool hasEgress = (controlConfig.egressConfig != 0);
+    bool hasStateful = (controlConfig.egressConfig & 0x04) != 0;
+    bool hasHash = (controlConfig.actionConfig & 0x20) != 0;
+    
+    std::stringstream ss;
+    
+    if (hasEgress) {
+        vfpgaTemplate = replaceAll(vfpgaTemplate, "{{EGRESS_SIGNALS}}",
+            "logic [1:0]                  ipv4_ecn;");
         
-        std::ofstream out(filepath.string());
-        if (!out) {
-            P4::error("Failed to open file %1%", filepath.string());
-            std::cerr << "ERROR: Failed to open file: " << filepath.string() << std::endl;
-            allFilesWritten = false;
-            continue;
+        vfpgaTemplate = replaceAll(vfpgaTemplate, "{{EGRESS_PIPELINE_SIGNALS}}",
+            "logic                        pipeline_ecn_marked;");
+        
+        vfpgaTemplate = replaceAll(vfpgaTemplate, "{{ECN_EXTRACT}}",
+            "// Extract ECN bits from IPv4 ToS field\n"
+            "assign ipv4_ecn = ipv4_diffserv[7:6];");
+        
+        vfpgaTemplate = replaceAll(vfpgaTemplate, "{{PIPELINE_ECN_INPUT}}",
+            "    .ipv4_ecn(ipv4_ecn),");
+        
+        vfpgaTemplate = replaceAll(vfpgaTemplate, "{{PIPELINE_EGRESS_INPUT}}",
+            "    // Egress control\n"
+            "    .enq_qdepth(19'd15),  // TODO: Connect to actual queue depth");
+        
+        vfpgaTemplate = replaceAll(vfpgaTemplate, "{{PIPELINE_ECN_OUTPUT}}",
+            "    .ecn_marked(pipeline_ecn_marked),");
+        
+        ss << "8'b";
+        for (int i = 7; i >= 0; i--) {
+            ss << ((controlConfig.egressConfig >> i) & 1);
+        }
+        vfpgaTemplate = replaceAll(vfpgaTemplate, "{{EGRESS_CONFIG}}", ss.str());
+        
+        ss.str("");
+        ss << "19'd" << svprog.getECNThreshold();
+        vfpgaTemplate = replaceAll(vfpgaTemplate, "{{ECN_THRESHOLD}}", ss.str());
+        
+    } else {
+        vfpgaTemplate = replaceAll(vfpgaTemplate, "{{EGRESS_SIGNALS}}", "");
+        vfpgaTemplate = replaceAll(vfpgaTemplate, "{{EGRESS_PIPELINE_SIGNALS}}", "");
+        vfpgaTemplate = replaceAll(vfpgaTemplate, "{{ECN_EXTRACT}}", "");
+        vfpgaTemplate = replaceAll(vfpgaTemplate, "{{PIPELINE_ECN_INPUT}}", "");
+        vfpgaTemplate = replaceAll(vfpgaTemplate, "{{PIPELINE_EGRESS_INPUT}}", "");
+        vfpgaTemplate = replaceAll(vfpgaTemplate, "{{PIPELINE_ECN_OUTPUT}}", "");
+        vfpgaTemplate = replaceAll(vfpgaTemplate, "{{EGRESS_CONFIG}}", "8'b00000000");
+        vfpgaTemplate = replaceAll(vfpgaTemplate, "{{ECN_THRESHOLD}}", "19'd10");
+    }
+    
+    // Write vfpga_top.svh
+    boost::filesystem::path vfpgaPath = outputDir / "vfpga_top.svh";
+    std::ofstream vfpgaFile(vfpgaPath.string());
+    if (!vfpgaFile) {
+        BACKEND_ERROR("Failed to create vfpga_top.svh");
+        return false;
+    }
+    vfpgaFile << vfpgaTemplate;
+    vfpgaFile.close();
+    BACKEND_SUCCESS("Generated vfpga_top.svh");
+    
+    // Generate init_ip.tcl
+    BACKEND_DEBUG("Generating init_ip.tcl");
+    std::string tclTemplate = loadTemplate("../src/sv/init_ip.tcl.in");
+    if (tclTemplate.empty()) {
+        BACKEND_ERROR("Failed to load init_ip.tcl template");
+        return false;
+    }
+    
+    tclTemplate = replaceAll(tclTemplate, "{{MODULE_NAME}}", baseName);
+    
+    boost::filesystem::path tclPath = outputDir / "init_ip.tcl";
+    std::ofstream tclFile(tclPath.string());
+    if (!tclFile) {
+        BACKEND_ERROR("Failed to create init_ip.tcl");
+        return false;
+    }
+    tclFile << tclTemplate;
+    tclFile.close();
+    
+    // ======================================
+    // Print Beautiful Summary
+    // ======================================
+    
+    auto endTime = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime);
+    
+    const auto& customHeaders = svprog.getParser()->getCustomHeaders();
+    uint8_t parserConfig = svprog.getParser()->getParserConfig();
+    
+    std::cerr << "\nCompilation Summary:" << std::endl;
+    std::cerr << "  Module:          " << baseName << std::endl;
+    
+    // Show enabled protocols
+    std::cerr << "  Protocols:       ";
+    bool first = true;
+    if (parserConfig & 0x01) { if (!first) std::cerr << ", "; std::cerr << "Ethernet"; first = false; }
+    if (parserConfig & 0x02) { if (!first) std::cerr << ", "; std::cerr << "VLAN"; first = false; }
+    if (parserConfig & 0x04) { if (!first) std::cerr << ", "; std::cerr << "IPv4"; first = false; }
+    if (parserConfig & 0x08) { if (!first) std::cerr << ", "; std::cerr << "IPv6"; first = false; }
+    if (parserConfig & 0x10) { if (!first) std::cerr << ", "; std::cerr << "TCP"; first = false; }
+    if (parserConfig & 0x20) { if (!first) std::cerr << ", "; std::cerr << "UDP"; first = false; }
+    if (parserConfig & 0x40) { if (!first) std::cerr << ", "; std::cerr << "VXLAN"; first = false; }
+    std::cerr << std::endl;
+    
+    // Show custom headers
+    if (!customHeaders.empty()) {
+        std::cerr << "  Custom Headers:  ";
+        first = true;
+        for (const auto& ch : customHeaders) {
+            if (!first) std::cerr << ", ";
+            std::cerr << ch.first << " (" << ch.second.totalWidth << " bits)";
+            first = false;
+        }
+        std::cerr << std::endl;
+    }
+    
+    // Show tables and actions from ingress control
+    if (svprog.getIngress()) {
+        const auto& tables = svprog.getIngress()->getTables();
+        const auto& actions = svprog.getIngress()->getActions();
+        
+        if (!tables.empty()) {
+            std::cerr << "  Tables:          ";
+            first = true;
+            for (const auto& t : tables) {
+                if (!first) std::cerr << ", ";
+                std::cerr << t.first;
+                first = false;
+            }
+            std::cerr << " (" << tables.size() << ")" << std::endl;
         }
         
-        out << content;
-        out.close();
-        LOG1("Generated " << filepath.string());
+        if (!actions.empty()) {
+            std::cerr << "  Actions:         ";
+            first = true;
+            for (const auto& a : actions) {
+                if (!first) std::cerr << ", ";
+                std::cerr << a.first;
+                first = false;
+            }
+            std::cerr << " (" << actions.size() << ")" << std::endl;
+        }
     }
     
-    // Generate vfpga_top.svh template in root output directory
-    boost::filesystem::path vfpgaTemplate = outputDir / "vfpga_top.svh";
-    std::ofstream vfpga(vfpgaTemplate.string());
-    if (vfpga) {
-        emitVFPGATemplate(vfpga, baseName);  // Pass baseName
-        vfpga.close();
-        LOG1("Generated " << vfpgaTemplate.string());
-    } else {
-        P4::error("Failed to create vfpga_top.svh");
-        std::cerr << "ERROR: Failed to create vfpga_top.svh" << std::endl;
-        allFilesWritten = false;
+    // Show features
+    std::cerr << "  Features:        ";
+    first = true;
+    if (hasEgress) {
+        if (!first) std::cerr << ", ";
+        std::cerr << "ECN";
+        first = false;
     }
-    
-    // Generate init_ip.tcl in root output directory
-    boost::filesystem::path tclScript = outputDir / "init_ip.tcl";
-    std::ofstream tcl(tclScript.string());
-    if (tcl) {
-        emitVivadoTCL(tcl);  // Pass baseName
-        tcl.close();
-        LOG1("Generated " << tclScript.string());
-    } else {
-        P4::error("Failed to create init_ip.tcl");
-        std::cerr << "ERROR: Failed to create init_ip.tcl" << std::endl;
-        allFilesWritten = false;
+    if (hasStateful) {
+        if (!first) std::cerr << ", ";
+        std::cerr << "Stateful";
+        first = false;
     }
+    if (hasHash) {
+        if (!first) std::cerr << ", ";
+        std::cerr << "Hash";
+        first = false;
+    }
+    if (first) {
+        std::cerr << "None";
+    }
+    std::cerr << std::endl;
     
-    return allFilesWritten;
-}
-
-void Backend::emitVFPGATemplate(std::ofstream& vfpga, const std::string& baseName) {
-    vfpga << "/**\n";
-    vfpga << " * VFPGA TOP Template\n";
-    vfpga << " * Generated by POS Compiler\n";
-    vfpga << " *\n";
-    vfpga << " * Module: " << baseName << "\n";
-    vfpga << " *\n";
+    std::cerr << "  Output:          " << outputDir.string() << "/" << std::endl;
     
-    vfpga << "import lynxTypes::*;\n\n";
+    std::cerr << "\n[SUCCESS] Compilation complete in " 
+              << (duration.count() / 1000.0) << "s" << std::endl;
     
-    vfpga << "// Internal router interfaces\n";
-    vfpga << "AXI4S #(.AXI4S_DATA_BITS(AXI_DATA_BITS)) axis_router_in ();\n";
-    vfpga << "AXI4S #(.AXI4S_DATA_BITS(AXI_DATA_BITS)) axis_router_out ();\n\n";
-    
-    vfpga << "// Control signals\n";
-    vfpga << "logic axi_ctrl_write_enable;\n";
-    vfpga << "logic [9:0] axi_ctrl_write_addr;\n";
-    vfpga << "logic axi_ctrl_entry_valid;\n";
-    vfpga << "logic [31:0] axi_ctrl_entry_prefix;\n";
-    vfpga << "logic [5:0] axi_ctrl_entry_prefix_len;\n";
-    vfpga << "logic [2:0] axi_ctrl_entry_action;\n";
-    vfpga << "logic [47:0] axi_ctrl_entry_dst_mac;\n";
-    vfpga << "logic [8:0] axi_ctrl_entry_egress_port;\n";
-    vfpga << "logic [31:0] packet_count;\n";
-    vfpga << "logic [31:0] dropped_count;\n";
-    vfpga << "logic [31:0] forwarded_count;\n\n";
-    
-    vfpga << "// ============================================\n";
-    vfpga << "// Connect incoming RDMA to router input\n";
-    vfpga << "// ============================================\n";
-    vfpga << "assign axis_router_in.tvalid = axis_rrsp_recv[0].tvalid;\n";
-    vfpga << "assign axis_router_in.tdata = axis_rrsp_recv[0].tdata;\n";
-    vfpga << "assign axis_router_in.tkeep = axis_rrsp_recv[0].tkeep;\n";
-    vfpga << "assign axis_router_in.tlast = axis_rrsp_recv[0].tlast;\n";
-    vfpga << "assign axis_rrsp_recv[0].tready = axis_router_in.tready;\n\n";
-    
-    vfpga << "// ============================================\n";
-    vfpga << "// " << baseName << " Instance\n";
-    vfpga << "// ============================================\n";
-    vfpga << baseName << " #(\n";
-    vfpga << "    .DATA_WIDTH(AXI_DATA_BITS),\n";
-    vfpga << "    .TABLE_SIZE(1024)\n";
-    vfpga << ") inst_" << baseName << " (\n";
-    vfpga << "    .aclk(aclk),\n";
-    vfpga << "    .aresetn(aresetn),\n\n";
-    
-    vfpga << "    // Packet I/O\n";
-    vfpga << "    .s_axis_tdata(axis_router_in.tdata),\n";
-    vfpga << "    .s_axis_tvalid(axis_router_in.tvalid),\n";
-    vfpga << "    .s_axis_tready(axis_router_in.tready),\n";
-    vfpga << "    .s_axis_tkeep(axis_router_in.tkeep),\n";
-    vfpga << "    .s_axis_tlast(axis_router_in.tlast),\n\n";
-    
-    vfpga << "    .m_axis_tdata(axis_router_out.tdata),\n";
-    vfpga << "    .m_axis_tvalid(axis_router_out.tvalid),\n";
-    vfpga << "    .m_axis_tready(axis_router_out.tready),\n";
-    vfpga << "    .m_axis_tkeep(axis_router_out.tkeep),\n";
-    vfpga << "    .m_axis_tlast(axis_router_out.tlast),\n";
-    vfpga << "    .m_axis_tdest(),\n\n";
-    
-    vfpga << "    // Control interface\n";
-    vfpga << "    .table_write_enable(axi_ctrl_write_enable),\n";
-    vfpga << "    .table_write_addr(axi_ctrl_write_addr),\n";
-    vfpga << "    .table_entry_valid(axi_ctrl_entry_valid),\n";
-    vfpga << "    .table_entry_prefix(axi_ctrl_entry_prefix),\n";
-    vfpga << "    .table_entry_prefix_len(axi_ctrl_entry_prefix_len),\n";
-    vfpga << "    .table_entry_action(axi_ctrl_entry_action),\n";
-    vfpga << "    .table_entry_dst_mac(axi_ctrl_entry_dst_mac),\n";
-    vfpga << "    .table_entry_egress_port(axi_ctrl_entry_egress_port),\n\n";
-    
-    vfpga << "    // Statistics\n";
-    vfpga << "    .packet_count(packet_count),\n";
-    vfpga << "    .dropped_count(dropped_count),\n";
-    vfpga << "    .forwarded_count(forwarded_count)\n";
-    vfpga << ");\n\n";
-    
-    vfpga << "// ============================================\n";
-    vfpga << "// Control Slave\n";
-    vfpga << "// ============================================\n";
-    vfpga << baseName << "_slave inst_ctrl_slave (\n";
-    vfpga << "    .aclk(aclk),\n";
-    vfpga << "    .aresetn(aresetn),\n";
-    vfpga << "    .axi_ctrl(axi_ctrl),\n";
-    vfpga << "    .table_write_enable(axi_ctrl_write_enable),\n";
-    vfpga << "    .table_write_addr(axi_ctrl_write_addr),\n";
-    vfpga << "    .table_entry_valid(axi_ctrl_entry_valid),\n";
-    vfpga << "    .table_entry_prefix(axi_ctrl_entry_prefix),\n";
-    vfpga << "    .table_entry_prefix_len(axi_ctrl_entry_prefix_len),\n";
-    vfpga << "    .table_entry_action(axi_ctrl_entry_action),\n";
-    vfpga << "    .table_entry_dst_mac(axi_ctrl_entry_dst_mac),\n";
-    vfpga << "    .table_entry_egress_port(axi_ctrl_entry_egress_port)\n";
-    vfpga << ");\n\n";
-    
-    vfpga << "// ============================================\n";
-    vfpga << "// Connect router output to RDMA send\n";
-    vfpga << "// ============================================\n";
-    vfpga << "assign axis_rrsp_send[0].tvalid = axis_router_out.tvalid;\n";
-    vfpga << "assign axis_rrsp_send[0].tdata = axis_router_out.tdata;\n";
-    vfpga << "assign axis_rrsp_send[0].tkeep = axis_router_out.tkeep;\n";
-    vfpga << "assign axis_rrsp_send[0].tlast = axis_router_out.tlast;\n";
-    vfpga << "assign axis_router_out.tready = axis_rrsp_send[0].tready;\n\n";
-    
-    vfpga << "// ============================================\n";
-    vfpga << "// Tie-off Unused Interfaces\n";
-    vfpga << "// ============================================\n";
-    vfpga << "always_comb begin\n";
-    vfpga << "    notify.tie_off_m();\n";
-    vfpga << "    sq_rd.tie_off_m();\n";
-    vfpga << "    sq_wr.tie_off_m();\n";
-    vfpga << "    cq_rd.tie_off_s();\n";
-    vfpga << "    cq_wr.tie_off_s();\n";
-    vfpga << "    rq_rd.tie_off_s();\n";
-    vfpga << "    rq_wr.tie_off_s();\n";
-    vfpga << "    axis_card_recv[0].tie_off_s();\n";
-    vfpga << "    axis_card_send[0].tie_off_m();\n";
-    vfpga << "    axis_rreq_recv[0].tie_off_s();\n";
-    vfpga << "    axis_rreq_send[0].tie_off_m();\n";
-    vfpga << "end\n";
-}
-
-void Backend::emitVivadoTCL(std::ofstream& out) {
-
+    return true;
 }
 
 }  // namespace SV

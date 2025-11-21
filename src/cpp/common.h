@@ -84,6 +84,7 @@ namespace SV {
     };
     
     extern std::map<P4::cstring, std::vector<ExtractedParserState>> g_extractedParserStates;
+    extern bool g_verbose;
 
     // Forward declarations for SV backend classes
     class SVProgram;

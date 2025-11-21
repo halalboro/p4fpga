@@ -1,0 +1,270 @@
+module match_action #(
+    parameter DATA_WIDTH = 512,
+    parameter TABLE_SIZE = 1024,
+    parameter ACTION_DATA_WIDTH = 128,
+    parameter [7:0] ACTION_CONFIG = 8'b00000111,
+    parameter [7:0] EGRESS_CONFIG = 8'b00000000,
+    parameter [18:0] ECN_THRESHOLD = 19'd10,
+    parameter NUM_REGISTERS = 1024           // For stateful processing
+) (
+    input  wire                           aclk,
+    input  wire                           aresetn,
+    
+    // ==========================================
+    // Packet Input (from Parser)
+    // ==========================================
+    input  wire [DATA_WIDTH-1:0]          packet_in,
+    input  wire [DATA_WIDTH/8-1:0]        packet_keep_in,
+    input  wire                           packet_last_in,
+    input  wire                           packet_valid_in,
+    output wire                           packet_ready_out,
+    
+    // Header fields from parser
+    input  wire                           ipv4_valid,
+    input  wire [47:0]                    eth_dst_addr,
+    input  wire [47:0]                    eth_src_addr,
+    input  wire [7:0]                     ipv4_ttl,
+    input  wire [31:0]                    ipv4_src_addr,
+    input  wire [31:0]                    ipv4_dst_addr,
+    input  wire [15:0]                    ipv4_src_port,    
+    input  wire [15:0]                    ipv4_dst_port,   
+    input  wire [7:0]                     ipv4_protocol,   
+    input  wire [5:0]                     ipv4_diffserv,
+    input  wire [1:0]                     ipv4_ecn,
+    input  wire [15:0]                    packet_length,
+    
+    // ==========================================
+    // Custom Header Inputs (from Parser)
+    // ==========================================
+    {{CUSTOM_HEADER_INPUTS}}
+    
+    // ==========================================
+    // Egress Control (for ECN)
+    // ==========================================
+    input  wire [18:0]                    enq_qdepth,
+    
+    // ==========================================
+    // Packet Output (to Deparser)
+    // ==========================================
+    output wire [DATA_WIDTH-1:0]          packet_out,
+    output wire [DATA_WIDTH/8-1:0]        packet_keep_out,
+    output wire                           packet_last_out,
+    output wire                           packet_valid_out,
+    input  wire                           packet_ready_in,
+    
+    // ==========================================
+    // Custom Header Outputs (to Deparser)
+    // ==========================================
+    {{CUSTOM_HEADER_OUTPUTS}}
+    
+    // ==========================================
+    // Modified Header Outputs (to Deparser)
+    // ==========================================
+    output wire [5:0]                     out_ipv4_diffserv,
+    output wire [1:0]                     out_ipv4_ecn,
+    output wire [7:0]                     out_ipv4_ttl,
+    
+    // ==========================================
+    // Control Outputs
+    // ==========================================
+    output wire                           drop,
+    output wire [8:0]                     egress_port,
+    output wire                           header_modified,
+    output wire                           ecn_marked,
+    
+    // ==========================================
+    // Table Programming (AXI-Lite Control)
+    // ==========================================
+    input  wire                           table_write_enable,
+    input  wire [9:0]                     table_write_addr,
+    input  wire                           table_entry_valid,
+    input  wire [31:0]                    table_entry_prefix,
+    input  wire [5:0]                     table_entry_prefix_len,
+    input  wire [2:0]                     table_entry_action,
+    input  wire [ACTION_DATA_WIDTH-1:0]   table_entry_action_data,
+    
+    // ==========================================
+    // Statistics Outputs
+    // ==========================================
+    output wire [31:0]                    packet_count,
+    output wire [31:0]                    dropped_count,
+    output wire [31:0]                    forwarded_count
+);
+
+    // ==========================================
+    // Flow Hash Computation (for stateful)
+    // ==========================================
+    wire [31:0] flow_hash;
+    
+    // Simple 5-tuple hash: XOR of all fields
+    assign flow_hash = ipv4_src_addr ^ ipv4_dst_addr ^ 
+                       {16'h0, ipv4_src_port} ^ {16'h0, ipv4_dst_port} ^ 
+                       {24'h0, ipv4_protocol};
+
+    // ==========================================
+    // Custom Header Pass-Through Signals
+    // ==========================================
+    {{CUSTOM_HEADER_WIRES}}
+
+    // ==========================================
+    // Internal signals between stages
+    // ==========================================
+    wire                           match_valid;
+    wire                           match_ready;
+    wire                           match_hit;
+    wire [2:0]                     match_action_id;
+    wire [ACTION_DATA_WIDTH-1:0]   match_action_data;
+    wire [DATA_WIDTH-1:0]          match_packet_out;
+    wire [DATA_WIDTH/8-1:0]        match_keep_out;
+    wire                           match_last_out;
+    wire                           match_ipv4_valid;
+    wire [47:0]                    match_eth_dst;
+    wire [47:0]                    match_eth_src;
+    wire [7:0]                     match_ipv4_ttl;
+    wire [5:0]                     match_ipv4_diffserv;
+    wire [1:0]                     match_ipv4_ecn;
+    
+    // ==========================================
+    // Custom Header Pass-Through (Parser → Action → Deparser)
+    // ==========================================
+    {{CUSTOM_HEADER_PASSTHROUGH}}
+    
+    // ==========================================
+    // Stage 1: Match Engine
+    // ==========================================
+    match #(
+        .MATCH_TYPE(1),
+        .KEY_WIDTH(32),
+        .TABLE_SIZE(TABLE_SIZE),
+        .ACTION_DATA_WIDTH(ACTION_DATA_WIDTH),
+        .DATA_WIDTH(DATA_WIDTH)
+    ) match_inst (
+        .aclk(aclk),
+        .aresetn(aresetn),
+        
+        .lookup_key(ipv4_dst_addr),
+        .lookup_key_mask(32'hFFFFFFFF),
+        .lookup_valid(packet_valid_in && ipv4_valid),
+        .lookup_ready(packet_ready_out),
+        
+        .ipv4_valid_in(ipv4_valid),
+        .eth_dst_addr_in(eth_dst_addr),
+        .eth_src_addr_in(eth_src_addr),
+        .ipv4_ttl_in(ipv4_ttl),
+        .ipv4_diffserv_in(ipv4_diffserv),
+        .ipv4_ecn_in(ipv4_ecn),
+        
+        .packet_data_in(packet_in),
+        .packet_keep_in(packet_keep_in),
+        .packet_last_in(packet_last_in),
+        
+        .match_hit(match_hit),
+        .match_action_id(match_action_id),
+        .match_action_data(match_action_data),
+        .match_valid(match_valid),
+        
+        .ipv4_valid_out(match_ipv4_valid),
+        .eth_dst_addr_out(match_eth_dst),
+        .eth_src_addr_out(match_eth_src),
+        .ipv4_ttl_out(match_ipv4_ttl),
+        .ipv4_diffserv_out(match_ipv4_diffserv),
+        .ipv4_ecn_out(match_ipv4_ecn),
+        .packet_data_out(match_packet_out),
+        .packet_keep_out(match_keep_out),
+        .packet_last_out(match_last_out),
+        
+        .table_write_enable(table_write_enable),
+        .table_write_addr(table_write_addr),
+        .table_entry_valid(table_entry_valid),
+        .table_entry_key(table_entry_prefix),
+        .table_entry_mask(32'h0),
+        .table_entry_prefix_len(table_entry_prefix_len),
+        .table_entry_action_id(table_entry_action),
+        .table_entry_action_data(table_entry_action_data)
+    );
+    
+    // ==========================================
+    // Stage 2: Action Engine
+    // ==========================================
+    action #(
+        .DATA_WIDTH(DATA_WIDTH),
+        .ACTION_DATA_WIDTH(ACTION_DATA_WIDTH),
+        .ACTION_CONFIG(ACTION_CONFIG),
+        .EGRESS_CONFIG(EGRESS_CONFIG),
+        .ECN_THRESHOLD(ECN_THRESHOLD),
+        .NUM_REGISTERS(NUM_REGISTERS)        
+    ) action_inst (
+        .aclk(aclk),
+        .aresetn(aresetn),
+        
+        .packet_in(match_packet_out),
+        .packet_keep_in(match_keep_out),
+        .packet_last_in(match_last_out),
+        .packet_valid(match_valid),
+        .packet_ready(match_ready),
+        
+        .action_id(match_action_id),
+        .action_data(match_action_data),
+        .action_valid(match_valid),
+        
+        .ipv4_valid(match_ipv4_valid),
+        .eth_dst_addr(match_eth_dst),
+        .eth_src_addr(match_eth_src),
+        .ipv4_ttl(match_ipv4_ttl),
+        .ipv4_src_addr(ipv4_src_addr),
+        .ipv4_dst_addr(ipv4_dst_addr),
+        .ipv4_src_port(ipv4_src_port),
+        .ipv4_dst_port(ipv4_dst_port),
+        .ipv4_protocol(ipv4_protocol),
+        .ipv4_diffserv_in(match_ipv4_diffserv),
+        .ipv4_ecn_in(match_ipv4_ecn),
+        .flow_hash(flow_hash),
+        .enq_qdepth(enq_qdepth),
+        
+        .packet_out(packet_out),
+        .packet_keep_out(packet_keep_out),
+        .packet_last_out(packet_last_out),
+        .packet_out_valid(packet_valid_out),
+        .packet_out_ready(packet_ready_in),
+        
+        .drop(drop),
+        .egress_port(egress_port),
+        .header_modified(header_modified),
+        .ecn_marked(ecn_marked),
+        .ipv4_diffserv_out(out_ipv4_diffserv),
+        .ipv4_ecn_out(out_ipv4_ecn),
+        .ipv4_ttl_out(out_ipv4_ttl)
+    );
+    
+    // ==========================================
+    // Stage 3: Stats Engine (Sidecar)
+    // ==========================================
+    stats #(
+        .NUM_PORTS(16),
+        .NUM_REGISTERS(8),
+        .COUNTER_WIDTH(32)
+    ) stats_inst (
+        .aclk(aclk),
+        .aresetn(aresetn),
+        
+        .packet_valid(packet_valid_out),
+        .packet_last(packet_last_out),
+        .packet_drop(drop),
+        .packet_length(packet_length),
+        .egress_port(egress_port),
+        
+        .packet_count(packet_count),
+        .dropped_count(dropped_count),
+        .forwarded_count(forwarded_count),
+        .byte_count(),
+        
+        .port_packet_count(),
+        .port_byte_count(),
+        
+        .reg_write_enable(1'b0),
+        .reg_write_addr(3'h0),
+        .reg_write_data(32'h0),
+        .user_registers()
+    );
+
+endmodule

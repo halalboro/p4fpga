@@ -18,7 +18,7 @@ public:
         TERNARY,
         RANGE
     };
-    
+
 private:
     SVControl* control;
     const IR::P4Table* p4table;
@@ -38,11 +38,7 @@ private:
     void extractKeys();
     void extractActions();
     void determineMatchType();
-    
-    void emitExactMatchTable(CodeBuilder* builder);
-    void emitLPMTable(CodeBuilder* builder);
-    void emitTernaryTable(CodeBuilder* builder);
-    
+
 public:
     SVTable(SVControl* ctrl, const IR::P4Table* tbl) :
         control(ctrl), 
@@ -64,6 +60,16 @@ public:
     int getTableSize() const { return tableSize; }
     MatchType getMatchType() const { return matchType; }
     const IR::ActionList* getActionList() const { return p4table->getActionList(); }
+    
+    /** Get match type as string */
+    std::string getMatchTypeString() const {
+        switch (matchType) {
+            case MatchType::LPM:     return "lpm";
+            case MatchType::TERNARY: return "ternary";
+            case MatchType::RANGE:   return "range";
+            default:                 return "exact";
+        }
+    }
 };
 
 }  // namespace SV

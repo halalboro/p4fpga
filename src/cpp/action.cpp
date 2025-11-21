@@ -5,29 +5,206 @@
 
 namespace SV {
 
+// ==========================================
+// Debug Control
+// ==========================================
+#define ACTION_DEBUG(msg) if (SV::g_verbose) std::cerr << "  " << msg << std::endl
+#define ACTION_TRACE(msg) if (SV::g_verbose) std::cerr << "    " << msg << std::endl
+
+// ==========================================
+// Build Action
+// ==========================================
+
 bool SVAction::build() {
-    LOG2("Building action: " << actionName);
+    ACTION_TRACE("Building action: " << actionName);
     extractParameters();
-    LOG2("Action " << actionName << " has " << parameters.size() << " parameters");
-    for (auto p : parameters) {
-        LOG2("  Parameter: " << p->name << " width: " << p->type->width_bits());
+    ACTION_TRACE("Action " << actionName << " has " << parameters.size() << " parameters");
+    
+    if (SV::g_verbose) {
+        for (auto p : parameters) {
+            // Resolve typedef to get actual width
+            auto paramType = p->type;
+            
+            // If it's a typedef, resolve it
+            if (auto typeRef = paramType->to<IR::Type_Name>()) {
+                if (typeMap) {
+                    auto resolvedType = typeMap->getType(typeRef, true);
+                    if (resolvedType) {
+                        paramType = resolvedType;
+                        
+                        // Unwrap Type_Type if needed
+                        if (auto typeType = paramType->to<IR::Type_Type>()) {
+                            paramType = typeType->type;
+                        }
+                    }
+                }
+            }
+            
+            // Now get the width safely
+            int width = 0;
+            if (auto bits = paramType->to<IR::Type_Bits>()) {
+                width = bits->size;
+            }
+            
+            std::cerr << "    Parameter: " << p->name << " width: " << width << std::endl;
+        }
     }
+    
     analyzeBody();
     return true;
 }
 
+// ======================================
+// Stateful Operation Detection
+// ======================================
+
+bool SVAction::usesRegisters() const {
+    if (!p4action->body) return false;
+    
+    ACTION_TRACE("Checking if action " << actionName << " uses registers");
+    
+    for (auto stmt : p4action->body->components) {
+        // Check for method calls
+        if (auto methodCall = stmt->to<IR::MethodCallStatement>()) {
+            auto method = methodCall->methodCall;
+            if (!method || !method->method) continue;
+            
+            std::string methodStr = method->method->toString().string();
+            ACTION_TRACE("Found method call: " << methodStr);
+            
+            // Check for register operations (multiple patterns)
+            if (methodStr.find(".read") != std::string::npos ||
+                methodStr.find(".write") != std::string::npos ||
+                methodStr.find("register") != std::string::npos ||
+                methodStr.find("Register") != std::string::npos ||
+                methodStr.find("table.read") != std::string::npos ||
+                methodStr.find("table.write") != std::string::npos ||
+                methodStr.find("counter") != std::string::npos ||
+                methodStr.find("Counter") != std::string::npos) {
+                ACTION_DEBUG("Action " << actionName << " uses registers: " << methodStr);
+                return true;
+            }
+        }
+        
+        // Check for assignments that might involve registers
+        if (auto assign = stmt->to<IR::AssignmentStatement>()) {
+            if (auto methodCall = assign->right->to<IR::MethodCallExpression>()) {
+                std::string methodStr = methodCall->method->toString().string();
+                ACTION_TRACE("Found assignment method: " << methodStr);
+                
+                if (methodStr.find(".read") != std::string::npos ||
+                    methodStr.find("register") != std::string::npos ||
+                    methodStr.find("Register") != std::string::npos ||
+                    methodStr.find("table") != std::string::npos) {
+                    ACTION_DEBUG("Action " << actionName << " reads from register: " << methodStr);
+                    return true;
+                }
+            }
+        }
+        
+        // Check for extern references
+        if (auto declStmt = stmt->to<IR::Declaration_Instance>()) {
+            std::string typeName = declStmt->type->toString().string();
+            ACTION_TRACE("Found declaration: " << typeName);
+            
+            if (typeName.find("Register") != std::string::npos ||
+                typeName.find("Counter") != std::string::npos ||
+                typeName.find("Meter") != std::string::npos) {
+                ACTION_DEBUG("Action " << actionName << " declares stateful extern: " << typeName);
+                return true;
+            }
+        }
+    }
+    
+    ACTION_TRACE("No register usage found in action " << actionName);
+    return false;
+}
+
+bool SVAction::usesHash() const {
+    if (!p4action->body) return false;
+    
+    ACTION_TRACE("Checking if action " << actionName << " uses hash");
+    
+    for (auto stmt : p4action->body->components) {
+        // Check for method calls
+        if (auto methodCall = stmt->to<IR::MethodCallStatement>()) {
+            auto method = methodCall->methodCall;
+            if (!method || !method->method) continue;
+            
+            std::string methodStr = method->method->toString().string();
+            
+            // Check for hash operations
+            if (methodStr.find("hash") != std::string::npos ||
+                methodStr.find(".get(") != std::string::npos) {
+                ACTION_DEBUG("Action " << actionName << " uses hash: " << methodStr);
+                return true;
+            }
+        }
+        
+        // Check for assignments involving hash
+        if (auto assign = stmt->to<IR::AssignmentStatement>()) {
+            if (auto methodCall = assign->right->to<IR::MethodCallExpression>()) {
+                std::string methodStr = methodCall->method->toString().string();
+                if (methodStr.find("hash") != std::string::npos) {
+                    ACTION_DEBUG("Action " << actionName << " computes hash: " << methodStr);
+                    return true;
+                }
+            }
+        }
+    }
+    
+    return false;
+}
+
+bool SVAction::usesCounters() const {
+    if (!p4action->body) return false;
+    
+    ACTION_TRACE("Checking if action " << actionName << " uses counters");
+    
+    for (auto stmt : p4action->body->components) {
+        if (auto methodCall = stmt->to<IR::MethodCallStatement>()) {
+            auto method = methodCall->methodCall;
+            if (!method || !method->method) continue;
+            
+            std::string methodStr = method->method->toString().string();
+            
+            // Check for counter operations
+            if (methodStr.find("count") != std::string::npos ||
+                methodStr.find("counter") != std::string::npos) {
+                ACTION_DEBUG("Action " << actionName << " uses counters: " << methodStr);
+                return true;
+            }
+        }
+    }
+    
+    return false;
+}
+
+// ==========================================
+// Extract Parameters
+// ==========================================
+
 void SVAction::extractParameters() {
-    std::cerr << "Extracting parameters for action " << actionName << std::endl;
+    if (SV::g_verbose) {
+        std::cerr << "Extracting parameters for action " << actionName << std::endl;
+    }
     
     if (!p4action->parameters) {
-        std::cerr << "  p4action has no parameters" << std::endl;
+        if (SV::g_verbose) {
+            std::cerr << "  p4action has no parameters" << std::endl;
+        }
         return;
     }
     
-    std::cerr << "  p4action has " << p4action->parameters->parameters.size() << " params" << std::endl;
+    if (SV::g_verbose) {
+        std::cerr << "  p4action has " << p4action->parameters->parameters.size() << " params" << std::endl;
+    }
     
     for (auto param : p4action->parameters->parameters) {
-        std::cerr << "  Found parameter: " << param->name;
+        if (SV::g_verbose) {
+            std::cerr << "  Found parameter: " << param->name;
+        }
+        
         parameters.push_back(param);
         
         // Get the actual type, resolving typedefs
@@ -35,20 +212,28 @@ void SVAction::extractParameters() {
         
         // If it's a typedef, resolve it to the underlying type
         if (auto typeRef = paramType->to<IR::Type_Name>()) {
-            std::cerr << " (typedef: " << typeRef->path->name << ")";
+            if (SV::g_verbose) {
+                std::cerr << " (typedef: " << typeRef->path->name << ")";
+            }
             
             // Try to resolve the typedef using the type map
             if (typeMap) {
                 auto resolvedType = typeMap->getType(typeRef, true);
                 if (resolvedType) {
-                    std::cerr << " -> resolved to " << resolvedType->node_type_name();
+                    if (SV::g_verbose) {
+                        std::cerr << " -> resolved to " << resolvedType->node_type_name();
+                    }
                     paramType = resolvedType;
                     
                     // If it's a Type_Type, unwrap it to get the actual type
                     if (auto typeType = paramType->to<IR::Type_Type>()) {
-                        std::cerr << " -> unwrapping Type_Type";
+                        if (SV::g_verbose) {
+                            std::cerr << " -> unwrapping Type_Type";
+                        }
                         paramType = typeType->type;
-                        std::cerr << " -> " << paramType->node_type_name();
+                        if (SV::g_verbose) {
+                            std::cerr << " -> " << paramType->node_type_name();
+                        }
                     }
                 }
             }
@@ -57,17 +242,29 @@ void SVAction::extractParameters() {
         // Now get the width - use ->size directly for Type_Bits
         if (auto bits = paramType->to<IR::Type_Bits>()) {
             parameterWidth += bits->size;
-            std::cerr << " (bit<" << bits->size << ">)";
+            if (SV::g_verbose) {
+                std::cerr << " (bit<" << bits->size << ">)";
+            }
         } else {
             // For other types, log error
-            std::cerr << " (ERROR: not a Type_Bits, got " << paramType->node_type_name() << ")";
+            if (SV::g_verbose) {
+                std::cerr << " (ERROR: not a Type_Bits, got " << paramType->node_type_name() << ")";
+            }
         }
         
-        std::cerr << std::endl;
+        if (SV::g_verbose) {
+            std::cerr << std::endl;
+        }
     }
     
-    std::cerr << "  Total parameter width: " << parameterWidth << " bits" << std::endl;
+    if (SV::g_verbose) {
+        std::cerr << "  Total parameter width: " << parameterWidth << " bits" << std::endl;
+    }
 }
+
+// ==========================================
+// Analyze Body
+// ==========================================
 
 void SVAction::analyzeBody() {
     if (!p4action->body) {
@@ -81,14 +278,18 @@ void SVAction::analyzeBody() {
                 auto fieldName = lhs->member;
                 // Store the assignment for code generation
                 fieldModifications[fieldName] = cstring::literal("modified");
-                LOG3("Action " << actionName << " modifies field: " << fieldName);
+                ACTION_TRACE("Action " << actionName << " modifies field: " << fieldName);
             }
         } else if (auto methodCall = stmt->to<IR::MethodCallStatement>()) {
             auto method = methodCall->methodCall->method->toString();
-            LOG3("Action " << actionName << " calls method: " << method);
+            ACTION_TRACE("Action " << actionName << " calls method: " << method);
         }
     }
 }
+
+// ==========================================
+// Helper Methods (unchanged)
+// ==========================================
 
 std::string SVAction::getMemberString(const IR::Expression* expr,
                                       const std::string& prefix,
@@ -310,10 +511,12 @@ void SVAction::emitAssignment(CodeBuilder* builder,
                << (paramOffset + paramWidth - 1) << ":" << paramOffset << "]";
             rhs_str = ss.str();
             
-            std::cerr << "  Parameter " << paramName << " mapped to bits ["
-                     << (paramOffset + paramWidth - 1) << ":" << paramOffset << "]" << std::endl;
+            ACTION_TRACE("Parameter " << paramName << " mapped to bits ["
+                        << (paramOffset + paramWidth - 1) << ":" << paramOffset << "]");
         } else {
-            std::cerr << "  ERROR: Parameter " << paramName << " not found or has invalid width" << std::endl;
+            if (SV::g_verbose) {
+                std::cerr << "  ERROR: Parameter " << paramName << " not found or has invalid width" << std::endl;
+            }
             builder->appendLine("// ERROR: Parameter " + paramName.string() + " not found");
             rhs_str = "0";
         }

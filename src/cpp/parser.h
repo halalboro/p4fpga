@@ -13,7 +13,108 @@ class SVProgram;
 class SVCodeGen;
 
 class SVParser {
+public:
+    
+    // ==========================================
+    // Custom Header Field Structure
+    // ==========================================
+    struct CustomHeaderField {
+        cstring name;
+        int width;      // Width in bits
+        int offset;     // Bit offset within header
+        
+        CustomHeaderField() : width(0), offset(0) {}
+        CustomHeaderField(cstring n, int w, int o = 0) 
+            : name(n), width(w), offset(o) {}
+    };
+
+    // ==========================================
+    // Custom Header Information
+    // Stores metadata for user-defined P4 headers
+    // ==========================================
+    struct CustomHeaderInfo {
+        cstring name;                                   // Header name (e.g., "myTunnel")
+        std::map<cstring, CustomHeaderField> fields;    // Field name → field info
+        int totalWidth;                                 // Total header width in bits
+        int parserBit;                                  // Parser config bit position
+        
+        CustomHeaderInfo() : totalWidth(0), parserBit(-1) {}
+    };
+    
+    // ==========================================
+    // Header Information for Extraction
+    // ==========================================
+    struct HeaderInfo {
+        cstring name;
+        int startBit;
+        int width;
+        std::vector<std::pair<cstring, int>> fields;   // field name, width
+    };
+    
+    // ==========================================
+    // Conditional Parsing Information
+    // ==========================================
+    struct ConditionalParse {
+        cstring headerName;
+        cstring conditionField;
+        cstring conditionValue;
+    };
+    
+    // ==========================================
+    // Parser Configuration Bit Positions
+    // ==========================================
+    enum ParserConfigBits {
+        PARSE_ETHERNET = 0,
+        PARSE_VLAN     = 1,
+        PARSE_IPV4     = 2,
+        PARSE_IPV6     = 3,
+        PARSE_TCP      = 4,
+        PARSE_UDP      = 5,
+        PARSE_VXLAN    = 6,
+        PARSE_CUSTOM   = 7
+    };
+    
+    // ==========================================
+    // Constructor & Destructor
+    // ==========================================
+    SVParser(SVProgram* program,
+             const IR::ParserBlock* block,
+             const TypeMap* typeMap,
+             const ReferenceMap* refMap);
+    ~SVParser() {}
+    
+    // ==========================================
+    // Public Interface
+    // ==========================================
+    
+    /** Build the parser representation from P4 AST */
+    bool build();
+
+    /** Get parser configuration bitmask */
+    uint8_t getParserConfig() const { return parserConfig; }
+    
+    /** Get configuration as binary string for SystemVerilog */
+    std::string getParserConfigString() const;
+    
+    void printSummary() const;
+    
+    /** Get header parsing sequence */
+    const std::vector<HeaderInfo>& getHeaderSequence() const { 
+        return headerSequence; 
+    }
+    
+    /** Check if specific header is parsed */
+    bool parsesHeader(const cstring& headerName) const;
+    
+    /** Get custom headers map */
+    const std::map<cstring, CustomHeaderInfo>& getCustomHeaders() const {
+        return customHeaders;
+    }
+
 private:
+    // ==========================================
+    // Private Members
+    // ==========================================
     SVProgram* program;
     const IR::ParserBlock* parserBlock;
     const TypeMap* typeMap;
@@ -25,71 +126,27 @@ private:
     const IR::Parameter* userMetadata;
     const IR::Parameter* stdMetadata;
     
-    // Header information for extraction
-    struct HeaderInfo {
-        cstring name;
-        int startBit;
-        int width;
-        std::vector<std::pair<cstring, int>> fields; // field name, width
-    };
-    
+    // Data structures
     std::vector<HeaderInfo> headerSequence;
     std::map<cstring, const IR::Type_Header*> headerTypes;
-    
-    // Conditional parsing info
-    struct ConditionalParse {
-        cstring headerName;
-        cstring conditionField;
-        cstring conditionValue;
-    };
-    
+    std::map<cstring, CustomHeaderInfo> customHeaders; 
     std::vector<ConditionalParse> conditionalHeaders;
     
-    // NEW: Parser configuration (8-bit value)
+    // Configuration
     uint8_t parserConfig;
+    int nextCustomBit;
     
-    // Private helper methods
+    // ==========================================
+    // Private Helper Methods
+    // ==========================================
     void analyzeHeaderTypes();
     void analyzeParserFlow();
     void calculateHeaderOffsets();
-    void extractParserConfiguration();  // NEW
-    
-    // Configuration bit positions
-    enum ParserConfigBits {
-        PARSE_ETHERNET = 0,
-        PARSE_VLAN     = 1,
-        PARSE_IPV4     = 2,
-        PARSE_IPV6     = 3,
-        PARSE_TCP      = 4,
-        PARSE_UDP      = 5,
-        PARSE_VXLAN    = 6
-    };
-    
-public:
-    SVParser(SVProgram* program,
-             const IR::ParserBlock* block,
-             const TypeMap* typeMap,
-             const ReferenceMap* refMap);
-    
-    ~SVParser() {}
-    
-    bool build();
-    void emit(SVCodeGen& codegen);
-    
-    // NEW: Get parser configuration
-    uint8_t getParserConfig() const { return parserConfig; }
-    
-    // NEW: Get configuration as binary string for SystemVerilog
-    std::string getParserConfigString() const;
-    
-    const std::vector<HeaderInfo>& getHeaderSequence() const { 
-        return headerSequence; 
-    }
-    
-    // NEW: Check if specific header is parsed
-    bool parsesHeader(const cstring& headerName) const;
+    void extractParserConfiguration();  
+    void extractCustomHeaders();
+    bool isStandardHeader(const cstring& name) const;
 };
 
 } // namespace SV
 
-#endif
+#endif  // EXTENSIONS_CPP_LIBP4FPGA_INCLUDE_PARSER_H_

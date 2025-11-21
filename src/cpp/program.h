@@ -1,10 +1,9 @@
-// program.h
 #ifndef P4FPGA_PROGRAM_H
 #define P4FPGA_PROGRAM_H
 
 #include "common.h"
 #include "bsvprogram.h"
-#include "control.h"  // NEW: Include for ControlConfig
+#include "control.h"
 #include <map>
 #include <vector>
 #include <set>
@@ -22,6 +21,7 @@ class SVProgram : public FPGAObject {
 public:
     const IR::ToplevelBlock* toplevel;
     const IR::P4Program* program;
+    
     ReferenceMap* refMap;
     TypeMap* typeMap;
     
@@ -39,14 +39,11 @@ public:
         int stageCount = 0;
     } pipelineConfig;
     
-    // Parser/Deparser configurations
     uint8_t parserConfig;
     uint16_t deparserConfig;
-    
-    // NEW: Control configuration for submodules
     ControlConfig controlConfig;
+    uint32_t ecnThreshold;  // Extracted from P4 constants
     
-    // Constructor
     SVProgram(const IR::ToplevelBlock* toplevel,
               ReferenceMap* refMap,
               TypeMap* typeMap) :
@@ -59,48 +56,35 @@ public:
         egress(nullptr),
         deparser(nullptr),
         parserConfig(0),
-        deparserConfig(0) {}
+        deparserConfig(0),
+        ecnThreshold(10) {}  // Default threshold
     
-    // Destructor
     ~SVProgram();
     
     bool build();
     void emit(SVCodeGen& codegen);
-    
-    // Copy parser/deparser templates
     bool copyTemplates(const std::string& outputDir);
     
-    // Get configurations
+    // ==========================================
+    // PUBLIC GETTER METHODS
+    // ==========================================
+    
+    // Component getters
+    SVParser* getParser() const { return parser; }
+    SVDeparser* getDeparser() const { return deparser; }
+    SVControl* getIngress() const { return ingress; }
+    SVControl* getEgress() const { return egress; }
+    
+    // Configuration getters
     uint8_t getParserConfig() const { return parserConfig; }
     uint16_t getDeparserConfig() const { return deparserConfig; }
     ControlConfig getControlConfig() const { return controlConfig; }
-    
-    // Generate control slave module
-    void emitControlSlave(const std::string& outputDir, const std::string& baseName);
+    unsigned getECNThreshold() const { return ecnThreshold; }
 
 private:
-    void emitRouterTop(SVCodeGen& codegen);
-    void emitInterStageSignals(CodeBuilder* builder);
-    void emitParserInstance(CodeBuilder* builder);
-    
-    // NEW: Emit submodule instances instead of control wrapper
-    void emitMatchEngineInstance(CodeBuilder* builder);
-    void emitActionEngineInstance(CodeBuilder* builder);
-    void emitStatsEngineInstance(CodeBuilder* builder);
-    
-    void emitDeparserInstance(CodeBuilder* builder);
-    
-    // LEGACY: Old-style type definitions (not used by new pipeline)
-    void emitTypeDefinitions(CodeBuilder* builder);
-    void emitHeaders(CodeBuilder* builder);
-    void emitMetadata(CodeBuilder* builder);
-    void emitStandardMetadata(CodeBuilder* builder);
-    void emitInterfaces(CodeBuilder* builder);
-    
-    // DEPRECATED: Old pipeline instance (replaced by submodules)
-    void emitPipelineInstance(CodeBuilder* builder);
+    void extractConstants();  // Extract P4 constants
 };
 
-} // namespace SV
+}  // namespace SV
 
-#endif // P4FPGA_PROGRAM_H
+#endif  // P4FPGA_PROGRAM_H

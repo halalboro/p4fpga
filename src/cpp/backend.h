@@ -13,16 +13,10 @@ private:
     P4::ReferenceMap* refMap;
     P4::TypeMap* typeMap;
     
-    // Helper methods for integration file generation
-    void emitVFPGATemplate(std::ofstream& out, const std::string& baseName);
-    void emitVivadoTCL(std::ofstream& out);
+    bool copyStaticTemplates(const std::string& outputDir);
     
-    // Copy parser/deparser templates
-    bool copyTemplates(const std::string& outputDir);
+    bool processMatchActionTemplate(SVProgram* program, const std::string& outputDir);
     
-    // Copy submodules (match, action, stats)
-    bool copySubmodules(const std::string& outputDir);
-
 public:
     Backend(P4::ReferenceMap* rm, P4::TypeMap* tm) :
         refMap(rm), typeMap(tm) {}
@@ -33,6 +27,6 @@ public:
              P4::TypeMap* typeMap);
 };
 
-} // namespace SV
+}  // namespace SV
 
-#endif // BACKENDS_SV_BACKEND_H_
+#endif  // BACKENDS_SV_BACKEND_H_

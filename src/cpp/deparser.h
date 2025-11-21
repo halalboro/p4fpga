@@ -27,20 +27,20 @@ public:
     void emit(SVCodeGen& codegen);
     bool build();
     
-    // NEW: Get deparser configuration
+    // Get deparser configuration
     uint16_t getDeparserConfig() const { return deparserConfig; }
     
-    // NEW: Get configuration as hex string for SystemVerilog
+    // Get configuration as hex string for SystemVerilog
     std::string getDeparserConfigString() const;
     
-    // NEW: Check if specific header is emitted
+    // Check if specific header is emitted
     bool emitsHeader(const cstring& headerName) const;
 
 private:
-    // NEW: Deparser configuration (16-bit value)
+    // Deparser configuration (16-bit value)
     uint16_t deparserConfig;
     
-    // NEW: Track which headers are emitted
+    // Track which headers are emitted
     std::vector<cstring> emittedHeaders;
     
     // Configuration bit positions
@@ -56,13 +56,8 @@ private:
         UPDATE_TCP_CHECKSUM    = 8,
         UPDATE_UDP_CHECKSUM    = 9
     };
-    
-    // Private methods
-    void emitModuleHeader(CodeBuilder* builder);
-    void emitPortDeclarations(CodeBuilder* builder);
-    void emitDropFilter(CodeBuilder* builder);
-    
-    // NEW: Extract deparser configuration from P4 IR
+        
+    // Extract deparser configuration from P4 IR
     void extractDeparserConfiguration();
     void analyzeEmitStatements();
 };

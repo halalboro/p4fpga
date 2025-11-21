@@ -1,0 +1,444 @@
+// action.sv
+// Generic action execution engine
+// Supports multiple action types via configuration
+// Added stateful register support for connection tracking
+
+module action #(
+    // ==========================================
+    // Configuration Parameters
+    // ==========================================
+    parameter DATA_WIDTH = 512,
+    parameter ACTION_DATA_WIDTH = 128,
+    
+    // Action configuration bitmask
+    // [0] = FORWARD
+    // [1] = DROP
+    // [2] = MODIFY_HEADER
+    // [3] = ENCAP
+    // [4] = DECAP
+    // [5] = HASH
+    // [6] = SET_FIELD
+    parameter [7:0] ACTION_CONFIG = 8'b00000111,  // Forward, Drop, Modify
+    
+    // Egress processing configuration
+    // [0] = ENABLE_EGRESS
+    // [1] = ENABLE_ECN_MARKING
+    // [2] = ENABLE_STATEFUL (registers/counters)
+    // [3] = ENABLE_MIRRORING
+    parameter [7:0] EGRESS_CONFIG = 8'b00000000,  // Disabled by default
+    
+    // Stateful configuration
+    parameter NUM_REGISTERS = 1024,               // Number of stateful registers
+    parameter REGISTER_WIDTH = 32,                // Width of each register
+    
+    // ECN threshold (queue depth)
+    parameter [18:0] ECN_THRESHOLD = 19'd10
+) (
+    input  wire                           aclk,
+    input  wire                           aresetn,
+    
+    // ==========================================
+    // Packet Input
+    // ==========================================
+    input  wire [DATA_WIDTH-1:0]          packet_in,
+    input  wire [DATA_WIDTH/8-1:0]        packet_keep_in,
+    input  wire                           packet_last_in,
+    input  wire                           packet_valid,
+    output reg                            packet_ready,
+    
+    // ==========================================
+    // Action Control
+    // ==========================================
+    input  wire [2:0]                     action_id,
+    input  wire [ACTION_DATA_WIDTH-1:0]   action_data,
+    input  wire                           action_valid,
+    
+    // ==========================================
+    // Ingress Header Fields (from match engine - PRESERVED)
+    // ==========================================
+    input  wire                           ipv4_valid,
+    input  wire [47:0]                    eth_dst_addr,
+    input  wire [47:0]                    eth_src_addr,
+    input  wire [7:0]                     ipv4_ttl,
+    input  wire [31:0]                    ipv4_src_addr,
+    input  wire [31:0]                    ipv4_dst_addr,
+    input  wire [15:0]                    ipv4_src_port,    // TCP/UDP src port
+    input  wire [15:0]                    ipv4_dst_port,    // TCP/UDP dst port
+    input  wire [7:0]                     ipv4_protocol,    // Protocol (TCP/UDP)
+    input  wire [5:0]                     ipv4_diffserv_in,
+    input  wire [1:0]                     ipv4_ecn_in,
+    
+    // ==========================================
+    // Hash Input (for stateful indexing)
+    // ==========================================
+    input  wire [31:0]                    flow_hash,        // 5-tuple hash
+    
+    // ==========================================
+    // Egress Control Inputs (for egress processing)
+    // ==========================================
+    input  wire [18:0]                    enq_qdepth,       // Queue depth
+    
+    // ==========================================
+    // Packet Output
+    // ==========================================
+    output reg  [DATA_WIDTH-1:0]          packet_out,
+    output reg  [DATA_WIDTH/8-1:0]        packet_keep_out,
+    output reg                            packet_last_out,
+    output reg                            packet_out_valid,
+    input  wire                           packet_out_ready,
+    
+    // ==========================================
+    // Action Results
+    // ==========================================
+    output reg                            drop,
+    output reg  [8:0]                     egress_port,
+    output reg                            header_modified,
+    output reg                            ecn_marked,
+    output reg  [5:0]                     ipv4_diffserv_out,
+    output reg  [1:0]                     ipv4_ecn_out,
+    output reg  [7:0]                     ipv4_ttl_out
+);
+
+    // ==========================================
+    // Action ID Definitions
+    // ==========================================
+    localparam ACTION_FORWARD       = 3'd0;
+    localparam ACTION_DROP          = 3'd1;
+    localparam ACTION_NOACTION      = 3'd2;
+    localparam ACTION_ENCAP         = 3'd3;
+    localparam ACTION_DECAP         = 3'd4;
+    localparam ACTION_HASH_SELECT   = 3'd5;
+    localparam ACTION_CHECK_STATE   = 3'd6;
+    localparam ACTION_UPDATE_STATE  = 3'd7;
+    localparam ACTION_SET_FIELD     = 3'd8;
+    
+    // ==========================================
+    // Configuration Bits
+    // ==========================================
+    localparam ENABLE_FORWARD       = ACTION_CONFIG[0];
+    localparam ENABLE_DROP          = ACTION_CONFIG[1];
+    localparam ENABLE_MODIFY_HEADER = ACTION_CONFIG[2];
+    localparam ENABLE_ENCAP         = ACTION_CONFIG[3];
+    localparam ENABLE_DECAP         = ACTION_CONFIG[4];
+    localparam ENABLE_HASH          = ACTION_CONFIG[5];
+    localparam ENABLE_SET_FIELD     = ACTION_CONFIG[6];
+    
+    // Egress configuration bits
+    localparam ENABLE_EGRESS        = EGRESS_CONFIG[0];
+    localparam ENABLE_ECN_MARKING   = EGRESS_CONFIG[1];
+    localparam ENABLE_STATEFUL      = EGRESS_CONFIG[2];
+    localparam ENABLE_MIRRORING     = EGRESS_CONFIG[3];
+    
+    // ==========================================
+    // Internal Signals
+    // ==========================================
+    reg [DATA_WIDTH-1:0] ingress_packet;  // After ingress processing
+    reg [DATA_WIDTH-1:0] egress_packet;   // After egress processing
+    reg [1:0]            ecn_bits;        // ECN field working copy
+    
+    // ==========================================
+    // Stateful Register Array
+    // ==========================================
+    generate
+        if (ENABLE_STATEFUL) begin : gen_stateful
+            // Register array for connection state
+            reg [REGISTER_WIDTH-1:0] state_registers [0:NUM_REGISTERS-1];
+            
+            // Register access signals
+            reg  [$clog2(NUM_REGISTERS)-1:0] reg_addr;
+            reg  [REGISTER_WIDTH-1:0]        reg_read_data;
+            reg  [REGISTER_WIDTH-1:0]        reg_write_data;
+            reg                              reg_write_enable;
+            
+            // Initialize registers to 0
+            integer i;
+            initial begin
+                for (i = 0; i < NUM_REGISTERS; i = i + 1) begin
+                    state_registers[i] = {REGISTER_WIDTH{1'b0}};
+                end
+            end
+            
+            // Register read/write logic
+            always_ff @(posedge aclk) begin
+                if (!aresetn) begin
+                    reg_read_data <= '0;
+                end else begin
+                    // Read
+                    reg_read_data <= state_registers[reg_addr];
+                    
+                    // Write
+                    if (reg_write_enable) begin
+                        state_registers[reg_addr] <= reg_write_data;
+                    end
+                end
+            end
+        end else begin : gen_no_stateful
+            // Dummy signals when stateful is disabled
+            wire [$clog2(NUM_REGISTERS)-1:0] reg_addr = '0;
+            wire [REGISTER_WIDTH-1:0]        reg_read_data = '0;
+            wire [REGISTER_WIDTH-1:0]        reg_write_data = '0;
+            wire                             reg_write_enable = 1'b0;
+        end
+    endgenerate
+    
+    // ==========================================
+    // Backpressure
+    // ==========================================
+    always_comb begin
+        packet_ready = packet_out_ready;
+    end
+    
+    // ==========================================
+    // Action Execution (Unified Pipeline)
+    // ==========================================
+    always_ff @(posedge aclk or negedge aresetn) begin
+        if (!aresetn) begin
+            packet_out        <= '0;
+            packet_keep_out   <= '0;
+            packet_last_out   <= 1'b0;
+            packet_out_valid  <= 1'b0;
+            drop              <= 1'b0;
+            egress_port       <= 9'd0;
+            header_modified   <= 1'b0;
+            ecn_marked        <= 1'b0;
+            ipv4_diffserv_out <= 6'b0;
+            ipv4_ecn_out      <= 2'b0;
+            ipv4_ttl_out      <= 8'b0;
+            
+            if (ENABLE_STATEFUL) begin
+                gen_stateful.reg_addr         <= '0;
+                gen_stateful.reg_write_data   <= '0;
+                gen_stateful.reg_write_enable <= 1'b0;
+            end
+        end else if (packet_ready) begin
+            packet_out_valid  <= packet_valid && action_valid;
+            packet_keep_out   <= packet_keep_in;
+            packet_last_out   <= packet_last_in;
+            
+            // Default: pass through header fields
+            ipv4_diffserv_out <= ipv4_diffserv_in;
+            ipv4_ecn_out      <= ipv4_ecn_in;
+            ipv4_ttl_out      <= ipv4_ttl;
+            
+            // Default: no register write
+            if (ENABLE_STATEFUL) begin
+                gen_stateful.reg_write_enable <= 1'b0;
+            end
+            
+            if (packet_valid && action_valid) begin
+                // ============================================
+                // STAGE 1: INGRESS PROCESSING
+                // ============================================
+                
+                // Default: pass through
+                ingress_packet  = packet_in;
+                drop            = 1'b0;
+                egress_port     = 9'd0;
+                header_modified = 1'b0;
+                
+                case (action_id)
+                    // ==========================================
+                    // FORWARD Action
+                    // ==========================================
+                    ACTION_FORWARD: begin
+                        if (ENABLE_FORWARD && ENABLE_MODIFY_HEADER) begin
+                            // Check ipv4_valid before modifying
+                            if (ipv4_valid) begin
+                                // Modify Ethernet destination MAC
+                                ingress_packet[47:0] = action_data[47:0];  // New dst MAC
+                                
+                                // Swap source MAC (old dst becomes new src)
+                                ingress_packet[95:48] = eth_dst_addr;
+                                
+                                // Decrement TTL
+                                if (ipv4_ttl > 8'd0) begin
+                                    ingress_packet[183:176] = ipv4_ttl - 8'd1;
+                                    ipv4_ttl_out    = ipv4_ttl - 8'd1;
+                                    egress_port     = action_data[56:48];
+                                    header_modified = 1'b1;
+                                end else begin
+                                    drop = 1'b1;  // TTL expired
+                                end
+                            end else begin
+                                // No IPv4 header, cannot forward
+                                drop = 1'b1;
+                            end
+                        end
+                    end
+                    
+                    // ==========================================
+                    // DROP Action
+                    // ==========================================
+                    ACTION_DROP: begin
+                        if (ENABLE_DROP) begin
+                            drop = 1'b1;
+                        end
+                    end
+                    
+                    // ==========================================
+                    // NOACTION
+                    // ==========================================
+                    ACTION_NOACTION: begin
+                        // Pass through unchanged
+                        drop            = 1'b0;
+                        header_modified = 1'b0;
+                    end
+                    
+                    // ==========================================
+                    // CHECK_STATE Action (for firewall)
+                    // ==========================================
+                    ACTION_CHECK_STATE: begin
+                        if (ENABLE_STATEFUL) begin
+                            // Use flow hash to index into register array
+                            gen_stateful.reg_addr = flow_hash[$clog2(NUM_REGISTERS)-1:0];
+                            
+                            // Read register value (available next cycle due to FF)
+                            if (gen_stateful.reg_read_data == 32'd0) begin
+                                drop = 1'b1;  // No connection found
+                            end else begin
+                                drop = 1'b0;  // Connection exists
+                            end
+                        end
+                    end
+                    
+                    // ==========================================
+                    // UPDATE_STATE Action (for firewall)
+                    // ==========================================
+                    ACTION_UPDATE_STATE: begin
+                        if (ENABLE_STATEFUL) begin
+                            // Use flow hash to index into register array
+                            gen_stateful.reg_addr = flow_hash[$clog2(NUM_REGISTERS)-1:0];
+                            
+                            // Write connection state (e.g., timestamp)
+                            gen_stateful.reg_write_data   = 32'd1;  // Mark as active
+                            gen_stateful.reg_write_enable = 1'b1;
+                            
+                            drop            = 1'b0;
+                            header_modified = 1'b0;
+                        end
+                    end
+                    
+                    // ==========================================
+                    // ENCAP Action (for tunneling)
+                    // ==========================================
+                    ACTION_ENCAP: begin
+                        if (ENABLE_ENCAP) begin
+                            // Shift packet and prepend tunnel header
+                            // Implementation depends on tunnel type
+                            header_modified = 1'b1;
+                        end
+                    end
+                    
+                    // ==========================================
+                    // DECAP Action (for tunneling)
+                    // ==========================================
+                    ACTION_DECAP: begin
+                        if (ENABLE_DECAP) begin
+                            // Remove outer header
+                            // Implementation depends on tunnel type
+                            header_modified = 1'b1;
+                        end
+                    end
+                    
+                    // ==========================================
+                    // HASH_SELECT Action (for load balancing)
+                    // ==========================================
+                    ACTION_HASH_SELECT: begin
+                        if (ENABLE_HASH) begin
+                            // Use hash to select egress port
+                            automatic logic [31:0] hash_val;
+                            hash_val = ipv4_src_addr ^ ipv4_dst_addr;
+                            egress_port = hash_val[8:0];
+                            header_modified = 1'b0;
+                        end
+                    end
+                    
+                    // ==========================================
+                    // SET_FIELD Action (for QoS)
+                    // ==========================================
+                    ACTION_SET_FIELD: begin
+                        if (ENABLE_SET_FIELD) begin
+                            // action_data layout for SET_FIELD:
+                            // [7:0]   = field_id (which field to modify)
+                            // [15:8]  = field_value (value to set)
+                            
+                            automatic logic [7:0] field_id;
+                            automatic logic [7:0] field_value;
+                            
+                            field_id = action_data[7:0];
+                            field_value = action_data[15:8];
+                            
+                            case (field_id)
+                                8'd0: begin  // FIELD_DIFFSERV
+                                    ipv4_diffserv_out = field_value[5:0];
+                                    header_modified = 1'b1;
+                                end
+                                8'd1: begin  // FIELD_ECN
+                                    ipv4_ecn_out = field_value[1:0];
+                                    header_modified = 1'b1;
+                                end
+                                8'd2: begin  // FIELD_TTL
+                                    ipv4_ttl_out = field_value;
+                                    header_modified = 1'b1;
+                                end
+                                default: begin
+                                    // Unknown field, pass through
+                                    header_modified = 1'b0;
+                                end
+                            endcase
+                            
+                            drop = 1'b0;
+                            egress_port = 9'd0;  // No egress port change
+                        end
+                    end
+                    
+                    default: begin
+                        // Unknown action: drop for safety
+                        drop = 1'b1;
+                    end
+                endcase
+                
+                // ============================================
+                // STAGE 2: EGRESS PROCESSING
+                // ============================================
+                
+                egress_packet = ingress_packet;  // Default: pass through
+                ecn_marked    = 1'b0;
+                
+                // Only process if egress is enabled and packet not dropped
+                if (ENABLE_EGRESS && !drop && ipv4_valid) begin
+                    
+                    // ------------------------------------------
+                    // ECN MARKING LOGIC
+                    // ------------------------------------------
+                    if (ENABLE_ECN_MARKING) begin
+                        // Use input ECN bits
+                        ecn_bits = ipv4_ecn_in;
+                        
+                        // Check if ECN-capable transport (ECT)
+                        if (ecn_bits == 2'b01 || ecn_bits == 2'b10) begin
+                            // Check if queue is experiencing congestion
+                            if (enq_qdepth >= ECN_THRESHOLD) begin
+                                // Mark Congestion Experienced (CE)
+                                ipv4_ecn_out    = 2'b11;
+                                header_modified = 1'b1;
+                                ecn_marked      = 1'b1;
+                            end
+                        end
+                    end
+                    
+                    // ------------------------------------------
+                    // MIRRORING LOGIC (placeholder)
+                    // ------------------------------------------
+                    if (ENABLE_MIRRORING) begin
+                        // Future: Clone packet to mirror port
+                    end
+                end
+                
+                // Output final packet
+                packet_out = egress_packet;
+            end
+        end
+    end
+
+endmodule

@@ -1,23 +1,21 @@
 set(P4SV_BACKEND_SRCS
     cpp/action.cpp
-    cpp/analyzer.cpp
     cpp/backend.cpp
     cpp/bsvprogram.cpp
+    cpp/common.cpp
     cpp/control.cpp
     cpp/deparser.cpp
     cpp/midend.cpp
     cpp/parser.cpp
-    cpp/profile.cpp
     cpp/program.cpp
     cpp/string_utils.cpp
-    cpp/struct.cpp
     cpp/table.cpp
     cpp/type.cpp
+    cpp/controlflow.cpp
 )
 
 set(P4SV_BACKEND_HDRS
     cpp/action.h
-    cpp/analyzer.h
     cpp/backend.h
     cpp/bsvprogram.h
     cpp/common.h 
@@ -26,12 +24,11 @@ set(P4SV_BACKEND_HDRS
     cpp/midend.h
     cpp/options.h
     cpp/parser.h
-    cpp/profile.h
     cpp/program.h
     cpp/string_utils.h
-    cpp/struct.h
     cpp/table.h 
     cpp/type.h
+    cpp/controlflow.h
 )
 
 
