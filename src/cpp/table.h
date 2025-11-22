@@ -10,6 +10,12 @@ namespace SV {
 class SVControl;
 class SVAction;
 
+struct ConstTableEntry {
+    std::vector<cstring> keyValues;
+    cstring actionName;
+    std::vector<cstring> actionArgs;
+};
+
 class SVTable {
 public:
     enum class MatchType {
@@ -29,9 +35,12 @@ private:
     int keyWidth;
     int actionDataWidth;
     int tableSize;
+    bool hasConstEntries_;
+    std::vector<ConstTableEntry> constEntries_;
+    void extractConstEntries(const IR::Property* prop);
     
-    // Key and action info
-    std::vector<std::pair<const IR::StructField*, int>> keyFields;
+    // Key and action info 
+    std::vector<std::pair<cstring, int>> keyFields; 
     std::vector<cstring> actionNames;
     cstring defaultAction;
     
@@ -47,10 +56,25 @@ public:
         matchType(MatchType::EXACT),
         keyWidth(0),
         actionDataWidth(0),
-        tableSize(1024) {}
+        tableSize(1024),
+        hasConstEntries_(false) {}
     
     bool build();
     void emit(CodeBuilder* builder);
+    
+    bool hasConstEntries() const { return hasConstEntries_; }
+    const std::vector<ConstTableEntry>& getConstEntries() const { 
+        return constEntries_; 
+    }
+    
+    // Get key field names 
+    std::vector<cstring> getKeyFieldNames() const {
+        std::vector<cstring> names;
+        for (const auto& keyField : keyFields) {
+            names.push_back(keyField.first);  
+        }
+        return names;
+    }
     
     // Getters
     cstring getName() const { return tableName; }
@@ -61,7 +85,7 @@ public:
     MatchType getMatchType() const { return matchType; }
     const IR::ActionList* getActionList() const { return p4table->getActionList(); }
     
-    /** Get match type as string */
+    // Get match type as string
     std::string getMatchTypeString() const {
         switch (matchType) {
             case MatchType::LPM:     return "lpm";
@@ -74,4 +98,4 @@ public:
 
 }  // namespace SV
 
-#endif
+#endif  // P4FPGA_TABLE_H

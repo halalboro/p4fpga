@@ -1,5 +1,3 @@
-// control.cpp
-
 #include "common.h"
 #include "control.h"
 #include "table.h"
@@ -72,6 +70,7 @@ bool SVControl::build() {
     
     extractTables();
     extractActions();
+    detectHashCalls();
     
     // Detect egress actions
     if (isEgress) {
@@ -111,7 +110,7 @@ void SVControl::extractTables() {
             CONTROL_TRACE("Found table: " << table->name);
             
             auto svTable = new SVTable(this, table);
-            svTable->build();
+            svTable->build();  // ← build() will handle const entries!
             svTables[table->name] = svTable;
         }
     }
@@ -314,12 +313,227 @@ bool SVControl::hasStatefulOperations() const {
                             CONTROL_TRACE("Found register operation: " << methodStr);
                             return true;
                         }
+                        if (methodStr == "hash") {
+                            HashInfo hashInfo;
+                            
+                            // Parse hash() call arguments
+                            auto args = methodCall->methodCall->arguments;
+                            if (args->size() >= 2) {
+                                // Argument 0: output field (meta.flow_hash)
+                                if (auto argPath = args->at(0)->to<IR::PathExpression>()) {
+                                    hashInfo.outputField = argPath->path->name;
+                                }
+                                
+                                // Argument 1: algorithm (HashAlgorithm.crc16)
+                                if (auto argMember = args->at(1)->to<IR::Member>()) {
+                                    hashInfo.algorithm = argMember->member;
+                                }
+                                
+                                // Argument 2 (optional): input fields tuple
+                                if (args->size() >= 3) {
+                                    if (auto tuple = args->at(2)->to<IR::ListExpression>()) {
+                                        for (auto comp : tuple->components) {
+                                            if (auto member = comp->to<IR::Member>()) {
+                                                hashInfo.inputFields.push_back(member->member);
+                                            }
+                                        }
+                                    }
+                                }
+                                
+                                CONTROL_TRACE("Found hash() call: output=" << hashInfo.outputField 
+                                            << ", algo=" << hashInfo.algorithm 
+                                            << ", inputs=" << hashInfo.inputFields.size());
+                            }
+                            
+                            return true;  // Hash detected
+                        }
                     }
                 }
             }
         }
     }
     
+    return false;
+}
+
+bool SVControl::detectHashCalls() {
+    // Safety checks first
+    if (!p4control) {
+        CONTROL_TRACE("No p4control, skipping hash detection");
+        return false;
+    }
+    
+    if (!p4control->body) {
+        CONTROL_TRACE("No control body, skipping hash detection");
+        return false;
+    }
+    
+    CONTROL_TRACE("Detecting hash() calls");
+    
+    // Manually iterate through body statements instead of using visitor
+    std::vector<HashInfo> foundHashes;
+    
+    // p4control->body is a BlockStatement with components
+    for (auto stmt : p4control->body->components) {
+        if (!stmt) continue;
+        
+        // Check if it's a method call statement
+        if (auto methodCallStmt = stmt->to<IR::MethodCallStatement>()) {
+            if (!methodCallStmt->methodCall) continue;
+            if (!methodCallStmt->methodCall->method) continue;
+            
+            auto method = methodCallStmt->methodCall->method;
+            
+            // Check if method is "hash"
+            if (auto pathExpr = method->to<IR::PathExpression>()) {
+                if (!pathExpr->path) continue;
+                
+                if (pathExpr->path->name == "hash") {
+                    std::cerr << "    Found hash() call in control body" << std::endl;
+                    
+                    HashInfo hashInfo;
+                    hashInfo.algorithm = cstring("crc16");  // Default
+                    hashInfo.outputWidth = 32;
+                    hashInfo.outputField = cstring("ecmp_select");  // Default
+                    
+                    // Parse arguments safely
+                    auto args = methodCallStmt->methodCall->arguments;
+                    if (args && args->size() >= 2) {
+                        // Argument 0: output field
+                        auto arg0 = args->at(0);
+                        if (arg0) {
+                            if (auto member = arg0->to<IR::Member>()) {
+                                hashInfo.outputField = member->member;
+                                std::cerr << "      Output: " << hashInfo.outputField << std::endl;
+                            } else if (auto path = arg0->to<IR::PathExpression>()) {
+                                if (path->path) {
+                                    hashInfo.outputField = path->path->name;
+                                    std::cerr << "      Output: " << hashInfo.outputField << std::endl;
+                                }
+                            }
+                        }
+                        
+                        // Argument 1: algorithm
+                        auto arg1 = args->at(1);
+                        if (arg1) {
+                            if (auto member = arg1->to<IR::Member>()) {
+                                hashInfo.algorithm = member->member;
+                                std::cerr << "      Algorithm: " << hashInfo.algorithm << std::endl;
+                            }
+                        }
+                        
+                        // Argument 3: input fields (arg 2 is base value)
+                        if (args->size() >= 4) {
+                            auto arg3 = args->at(3);
+                            if (arg3) {
+                                if (auto listExpr = arg3->to<IR::ListExpression>()) {
+                                    for (auto comp : listExpr->components) {
+                                        if (comp) {
+                                            if (auto member = comp->to<IR::Member>()) {
+                                                hashInfo.inputFields.push_back(member->member);
+                                                std::cerr << "      Input: " << member->member << std::endl;
+                                            }
+                                        }
+                                    }
+                                } else if (auto structExpr = arg3->to<IR::StructExpression>()) {
+                                    for (auto field : structExpr->components) {
+                                        if (field && field->expression) {
+                                            if (auto member = field->expression->to<IR::Member>()) {
+                                                hashInfo.inputFields.push_back(member->member);
+                                                std::cerr << "      Input: " << member->member << std::endl;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    
+                    foundHashes.push_back(hashInfo);
+                    std::cerr << "    Hash detection complete: " 
+                             << foundHashes.size() << " total" << std::endl;
+                }
+            }
+        }
+        
+        // Also check inside BlockStatements (nested blocks)
+        if (auto blockStmt = stmt->to<IR::BlockStatement>()) {
+            for (auto innerStmt : blockStmt->components) {
+                if (!innerStmt) continue;
+                
+                if (auto methodCallStmt = innerStmt->to<IR::MethodCallStatement>()) {
+                    if (!methodCallStmt->methodCall) continue;
+                    if (!methodCallStmt->methodCall->method) continue;
+                    
+                    auto method = methodCallStmt->methodCall->method;
+                    
+                    if (auto pathExpr = method->to<IR::PathExpression>()) {
+                        if (!pathExpr->path) continue;
+                        
+                        if (pathExpr->path->name == "hash") {
+                            std::cerr << "    Found hash() call in nested block" << std::endl;
+                            
+                            HashInfo hashInfo;
+                            hashInfo.algorithm = cstring("crc16");
+                            hashInfo.outputWidth = 32;
+                            hashInfo.outputField = cstring("ecmp_select");
+                            
+                            // Parse arguments (same as above)
+                            auto args = methodCallStmt->methodCall->arguments;
+                            if (args && args->size() >= 2) {
+                                auto arg0 = args->at(0);
+                                if (arg0) {
+                                    if (auto member = arg0->to<IR::Member>()) {
+                                        hashInfo.outputField = member->member;
+                                        std::cerr << "      Output: " << hashInfo.outputField << std::endl;
+                                    } else if (auto path = arg0->to<IR::PathExpression>()) {
+                                        if (path->path) {
+                                            hashInfo.outputField = path->path->name;
+                                            std::cerr << "      Output: " << hashInfo.outputField << std::endl;
+                                        }
+                                    }
+                                }
+                                
+                                auto arg1 = args->at(1);
+                                if (arg1) {
+                                    if (auto member = arg1->to<IR::Member>()) {
+                                        hashInfo.algorithm = member->member;
+                                        std::cerr << "      Algorithm: " << hashInfo.algorithm << std::endl;
+                                    }
+                                }
+                                
+                                if (args->size() >= 4) {
+                                    auto arg3 = args->at(3);
+                                    if (arg3) {
+                                        if (auto listExpr = arg3->to<IR::ListExpression>()) {
+                                            for (auto comp : listExpr->components) {
+                                                if (comp) {
+                                                    if (auto member = comp->to<IR::Member>()) {
+                                                        hashInfo.inputFields.push_back(member->member);
+                                                        std::cerr << "      Input: " << member->member << std::endl;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            
+                            foundHashes.push_back(hashInfo);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    if (!foundHashes.empty()) {
+        CONTROL_DEBUG("Detected " << foundHashes.size() << " hash() call(s)");
+        hashCalls = foundHashes;
+        return true;
+    }
+    
+    CONTROL_TRACE("No hash() calls found");
     return false;
 }
 

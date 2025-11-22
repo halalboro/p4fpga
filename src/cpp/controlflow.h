@@ -16,7 +16,7 @@ namespace SV {
 /**
  * Control Flow Lowering Pass
  * 
- * Phase 3: Detect and transform if-else statements
+ * Detect and transform if-else statements
  * 
  * Detects simple conditional logic:
  *   if (hdr.field == value) { action_a(); } else { action_b(); }

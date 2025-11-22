@@ -110,6 +110,8 @@ module deparser #(
     input  wire [7:0]                vxlan_reserved2,
     input  wire                      vxlan_valid,
     
+{{STACK_POINTER_INPUTS}}
+
 {{CUSTOM_HEADER_INPUTS}}
     
     // ==========================================
@@ -157,7 +159,7 @@ module deparser #(
     reg  [DATA_WIDTH-1:0]  output_buffer;
     reg  [DATA_WIDTH-1:0]  header_buffer;
     reg  [10:0]            byte_offset;
-    reg  [10:0]            custom_offset;  // NEW: Track custom header offset
+    reg  [10:0]            custom_offset;  // Track custom header offset
     reg  [3:0]             deparse_state;
     reg  [15:0]            calculated_checksum;
     reg                    packet_started;
@@ -168,7 +170,7 @@ module deparser #(
     localparam STATE_DROP_CONSUME   = 4'd1;
     localparam STATE_BUILD_HEADER   = 4'd2;
     localparam STATE_ETHERNET       = 4'd3;
-    localparam STATE_CUSTOM         = 4'd4;  // NEW: Custom header state
+    localparam STATE_CUSTOM         = 4'd4;  // Custom header state
     localparam STATE_L3             = 4'd5;
     localparam STATE_L4             = 4'd6;
     localparam STATE_CHECKSUM       = 4'd7;

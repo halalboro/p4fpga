@@ -1,6 +1,7 @@
 #include "common.h"
 #include "bsvprogram.h"
 #include "parser.h"
+#include "action.h"
 #include <cstdarg>
 #include <cstdio>
 #include <sstream>
@@ -31,7 +32,7 @@ std::string formatCustomHeaderFields(
 ) {
     std::stringstream ss;
     
-    // FIXED: Iterate over map instead of vector
+    // Iterate over map
     for (const auto& fieldPair : info.fields) {
         const std::string fieldName = fieldPair.first.string();
         const SVParser::CustomHeaderField& field = fieldPair.second;
@@ -52,36 +53,6 @@ std::string formatCustomHeaderFields(
         ss << "logic                        ";
     }
     ss << prefix << info.name << "_valid";
-    
-    return ss.str();
-}
-
-/**
- * Format custom header port connections for instantiation
- * @param info Custom header information
- * @param signalPrefix Prefix for the signal being connected (e.g., "pipeline_")
- * @param portPrefix Prefix for the port name (e.g., "out_")
- * @param indent Indentation string
- * @return Formatted port connections
- */
-std::string formatCustomHeaderPortConnections(
-    const SVParser::CustomHeaderInfo& info,
-    const std::string& signalPrefix,
-    const std::string& portPrefix,
-    const std::string& indent
-) {
-    std::stringstream ss;
-    
-    // FIXED: Iterate over map instead of vector
-    for (const auto& fieldPair : info.fields) {
-        const std::string fieldName = fieldPair.first.string();
-        
-        ss << indent << "." << portPrefix << info.name << "_" << fieldName 
-           << "(" << signalPrefix << info.name << "_" << fieldName << "),\n";
-    }
-    
-    ss << indent << "." << portPrefix << info.name << "_valid"
-       << "(" << signalPrefix << info.name << "_valid)";
     
     return ss.str();
 }
@@ -148,8 +119,52 @@ std::string SVCodeGen::generateCustomHeaderPorts(const SVParser* parser) {
     
     for (const auto& ch : customHeaders) {
         const auto& info = ch.second;
-        ss << "    // Custom header: " << info.name << "\n";
-        ss << formatCustomHeaderFields(info, "output reg", "    ") << ",\n";
+        ss << "    // Custom header: " << info.name;
+        
+        if (info.isStack) {
+            ss << " [stack, max " << info.maxStackSize << "]\n";
+            
+            // Generate array signals for each field
+            std::vector<std::pair<cstring, SVParser::CustomHeaderField>> sortedFields;
+            for (const auto& fieldPair : info.fields) {
+                sortedFields.push_back(fieldPair);
+            }
+            
+            for (const auto& fieldPair : sortedFields) {
+                const std::string fieldName = fieldPair.first.string();
+                const SVParser::CustomHeaderField& field = fieldPair.second;
+                
+                ss << "    output reg [" << (field.width - 1) << ":0]"
+                   << std::string(20 - std::to_string(field.width - 1).length(), ' ')
+                   << info.name << "_" << fieldName 
+                   << " [0:" << (info.maxStackSize - 1) << "],\n";
+            }
+            
+            // Valid array
+            ss << "    output reg                       "
+               << info.name << "_valid [0:" << (info.maxStackSize - 1) << "],\n";
+            
+        } else {
+            ss << "\n";
+            
+            std::vector<std::pair<cstring, SVParser::CustomHeaderField>> sortedFields;
+            for (const auto& fieldPair : info.fields) {
+                sortedFields.push_back(fieldPair);
+            }
+            
+            for (const auto& fieldPair : sortedFields) {
+                const std::string fieldName = fieldPair.first.string();
+                const SVParser::CustomHeaderField& field = fieldPair.second;
+                
+                ss << "    output reg [" << (field.width - 1) << ":0]";
+                int padding = 20 - std::to_string(field.width - 1).length();
+                ss << std::string(padding, ' ');
+                ss << info.name << "_" << fieldName << ",\n";
+            }
+            
+            ss << "    output reg                       ";
+            ss << info.name << "_valid,\n";
+        }
     }
     
     return ss.str();
@@ -177,7 +192,19 @@ std::string SVCodeGen::generateCustomStateDefinition(const SVParser* parser) {
     const auto& customHeaders = parser->getCustomHeaders();
     if (customHeaders.empty()) return "";
     
-    return "    localparam STATE_CUSTOM     = 4'd2;\n";
+    std::stringstream ss;
+    
+    if (parser->hasHeaderStacks()) {
+        // Need extra states for stack parsing
+        ss << "    localparam STATE_CUSTOM       = 4'd2;\n";
+        ss << "    localparam STATE_CUSTOM_LOOP  = 4'd3;\n";  
+        ss << "    localparam STATE_CUSTOM_CHECK = 4'd4;\n";  
+    } else {
+        // Just one custom state for simple headers
+        ss << "    localparam STATE_CUSTOM     = 4'd2;\n";
+    }
+    
+    return ss.str();
 }
 
 std::string SVCodeGen::generateStateValue(const SVParser* parser, const std::string& stateName) {
@@ -185,15 +212,20 @@ std::string SVCodeGen::generateStateValue(const SVParser* parser, const std::str
     
     const auto& customHeaders = parser->getCustomHeaders();
     bool hasCustom = !customHeaders.empty();
+    bool hasStacks = parser->hasHeaderStacks();
+    
+    int offset = 0;
+    if (hasCustom) offset += 1;  // STATE_CUSTOM
+    if (hasStacks) offset += 2;  // STATE_CUSTOM_LOOP, STATE_CUSTOM_CHECK
     
     if (stateName == "L3") {
-        return hasCustom ? "4'd3" : "4'd2";
+        return "4'd" + std::to_string(2 + offset);
     } else if (stateName == "L4") {
-        return hasCustom ? "4'd4" : "4'd3";
+        return "4'd" + std::to_string(3 + offset);
     } else if (stateName == "PAYLOAD") {
-        return hasCustom ? "4'd5" : "4'd4";
+        return "4'd" + std::to_string(4 + offset);
     } else if (stateName == "DONE") {
-        return hasCustom ? "4'd6" : "4'd5";
+        return "4'd" + std::to_string(5 + offset);
     }
     
     return "4'd0";
@@ -224,7 +256,16 @@ std::string SVCodeGen::generateCustomHeaderReset(const SVParser* parser) {
     
     std::stringstream ss;
     for (const auto& ch : customHeaders) {
-        ss << "            " << ch.second.name << "_valid <= 1'b0;\n";
+        const auto& info = ch.second;
+        
+        if (info.isStack) {
+            // Reset all array elements
+            ss << "            for (int i = 0; i < " << info.maxStackSize << "; i++) begin\n";
+            ss << "                " << info.name << "_valid[i] <= 1'b0;\n";
+            ss << "            end\n";
+        } else {
+            ss << "            " << info.name << "_valid <= 1'b0;\n";
+        }
     }
     
     return ss.str();
@@ -247,7 +288,6 @@ std::string SVCodeGen::generateCustomHeaderEthertypeCheck(const SVParser* parser
     for (const auto& ch : customHeaders) {
         const auto& info = ch.second;
         
-        // First custom header uses "if", rest use "else if"
         if (first) {
             ss << "                        if ((eth_ether_type == ETHERTYPE_" << info.name;
             first = false;
@@ -261,7 +301,6 @@ std::string SVCodeGen::generateCustomHeaderEthertypeCheck(const SVParser* parser
         ss << "                        end ";
     }
     
-    // Close with proper else clause
     if (!customHeaders.empty()) {
         ss << "else begin\n";
         ss << "                            parse_state <= STATE_L3;\n";
@@ -278,43 +317,219 @@ std::string SVCodeGen::generateCustomHeaderState(const SVParser* parser) {
     if (customHeaders.empty()) return "";
     
     std::stringstream ss;
-    ss << "                // ==========================================\n";
-    ss << "                // STATE_CUSTOM - Parse custom headers\n";
-    ss << "                // ==========================================\n";
-    ss << "                STATE_CUSTOM: begin\n";
+    
+    bool hasStacks = parser->hasHeaderStacks();
+    
+    if (hasStacks) {
+        // ==========================================
+        // MULTI-STATE STACK PARSING
+        // ==========================================
+        ss << "                // ==========================================\n";
+        ss << "                // STATE_CUSTOM - Initialize stack parsing\n";
+        ss << "                // ==========================================\n";
+        ss << "                STATE_CUSTOM: begin\n";
+        
+        for (const auto& ch : customHeaders) {
+            const auto& info = ch.second;
+            
+            if (info.isStack) {
+                ss << "                    if (PARSE_" << info.name << ") begin\n";
+                ss << "                        " << info.name << "_stack_idx <= 0;\n";
+                ss << "                        " << info.name << "_parsing <= 1'b1;\n";
+                ss << "                        parse_state <= STATE_CUSTOM_LOOP;\n";
+                ss << "                    end else begin\n";
+                ss << "                        parse_state <= STATE_L3;\n";
+                ss << "                    end\n";
+            } else {
+                // Simple header - parse in one cycle
+                ss << "                    if (PARSE_" << info.name << ") begin\n";
+                
+                std::vector<std::pair<cstring, SVParser::CustomHeaderField>> sortedFields;
+                for (const auto& fieldPair : info.fields) {
+                    sortedFields.push_back(fieldPair);
+                }
+                std::sort(sortedFields.begin(), sortedFields.end(),
+                    [](const auto& a, const auto& b) {
+                        return a.second.offset < b.second.offset;
+                    });
+                
+                for (const auto& fieldPair : sortedFields) {
+                    const std::string fieldName = fieldPair.first.string();
+                    const SVParser::CustomHeaderField& field = fieldPair.second;
+                    
+                    ss << "                        " << info.name << "_" << fieldName;
+                    ss << " <= packet_buffer[byte_offset*8 + " << field.offset;
+                    ss << " +: " << field.width << "];\n";
+                }
+                
+                ss << "                        " << info.name << "_valid <= 1'b1;\n";
+                ss << "                        byte_offset <= byte_offset + 11'd" 
+                   << (info.totalWidth / 8) << ";\n";
+                ss << "                        parse_state <= STATE_L3;\n";
+                ss << "                    end\n";
+            }
+        }
+        
+        ss << "                end\n\n";
+        
+        // ==========================================
+        // STATE_CUSTOM_LOOP - Extract one stack element per cycle
+        // ==========================================
+        ss << "                // ==========================================\n";
+        ss << "                // STATE_CUSTOM_LOOP - Parse stack elements\n";
+        ss << "                // ==========================================\n";
+        ss << "                STATE_CUSTOM_LOOP: begin\n";
+        
+        for (const auto& ch : customHeaders) {
+            const auto& info = ch.second;
+            if (!info.isStack) continue;
+            
+            ss << "                    if (" << info.name << "_parsing) begin\n";
+            ss << "                        // Extract element at stack_idx\n";
+            
+            std::vector<std::pair<cstring, SVParser::CustomHeaderField>> sortedFields;
+            for (const auto& fieldPair : info.fields) {
+                sortedFields.push_back(fieldPair);
+            }
+            std::sort(sortedFields.begin(), sortedFields.end(),
+                [](const auto& a, const auto& b) {
+                    return a.second.offset < b.second.offset;
+                });
+            
+            for (const auto& fieldPair : sortedFields) {
+                const std::string fieldName = fieldPair.first.string();
+                const SVParser::CustomHeaderField& field = fieldPair.second;
+                
+                ss << "                        " << info.name << "_" << fieldName 
+                   << "[" << info.name << "_stack_idx] <= packet_buffer[byte_offset*8 + " 
+                   << field.offset << " +: " << field.width << "];\n";
+            }
+            
+            ss << "                        " << info.name << "_valid[" 
+               << info.name << "_stack_idx] <= 1'b1;\n";
+            ss << "                        byte_offset <= byte_offset + 11'd" 
+               << (info.totalWidth / 8) << ";\n";
+            ss << "                        " << info.name << "_stack_idx <= " 
+               << info.name << "_stack_idx + 1;\n";
+            ss << "                        parse_state <= STATE_CUSTOM_CHECK;\n";
+            ss << "                    end\n";
+        }
+        
+        ss << "                end\n\n";
+        
+        // ==========================================
+        // STATE_CUSTOM_CHECK - Check termination
+        // ==========================================
+        ss << "                // ==========================================\n";
+        ss << "                // STATE_CUSTOM_CHECK - Check termination\n";
+        ss << "                // ==========================================\n";
+        ss << "                STATE_CUSTOM_CHECK: begin\n";
+        
+        for (const auto& ch : customHeaders) {
+            const auto& info = ch.second;
+            if (!info.isStack) continue;
+            
+            ss << "                    if (" << info.name << "_parsing) begin\n";
+            
+            if (info.hasBosField) {
+                ss << "                        // Check BOS bit\n";
+                ss << "                        if (" << info.name << "_" << info.bosFieldName 
+                   << "[" << info.name << "_stack_idx - 1] == 1'b1) begin\n";
+                ss << "                            " << info.name << "_parsing <= 1'b0;\n";
+                ss << "                            parse_state <= STATE_L3;\n";
+                ss << "                        end\n";
+            }
+            
+            ss << "                        else if (" << info.name << "_stack_idx >= " 
+               << info.maxStackSize << ") begin\n";
+            ss << "                            " << info.name << "_parsing <= 1'b0;\n";
+            ss << "                            parse_state <= STATE_L3;\n";
+            ss << "                        end\n";
+            ss << "                        else begin\n";
+            ss << "                            parse_state <= STATE_CUSTOM_LOOP;\n";
+            ss << "                        end\n";
+            ss << "                    end\n";
+        }
+        
+        ss << "                end\n";
+        
+    } else {
+        // ==========================================
+        // SIMPLE CUSTOM HEADER (no stacks)
+        // ==========================================
+        ss << "                // ==========================================\n";
+        ss << "                // STATE_CUSTOM - Parse custom headers\n";
+        ss << "                // ==========================================\n";
+        ss << "                STATE_CUSTOM: begin\n";
+        
+        for (const auto& ch : customHeaders) {
+            const auto& info = ch.second;
+            
+            ss << "                    if (PARSE_" << info.name << ") begin\n";
+            
+            std::vector<std::pair<cstring, SVParser::CustomHeaderField>> sortedFields;
+            for (const auto& fieldPair : info.fields) {
+                sortedFields.push_back(fieldPair);
+            }
+            std::sort(sortedFields.begin(), sortedFields.end(),
+                [](const auto& a, const auto& b) {
+                    return a.second.offset < b.second.offset;
+                });
+            
+            for (const auto& fieldPair : sortedFields) {
+                const std::string fieldName = fieldPair.first.string();
+                const SVParser::CustomHeaderField& field = fieldPair.second;
+                
+                ss << "                        " << info.name << "_" << fieldName;
+                ss << " <= packet_buffer[byte_offset*8 + " << field.offset;
+                ss << " +: " << field.width << "];\n";
+            }
+            
+            ss << "                        " << info.name << "_valid <= 1'b1;\n";
+            ss << "                        byte_offset <= byte_offset + 11'd" 
+               << (info.totalWidth / 8) << ";\n";
+            ss << "                    end\n\n";
+        }
+        
+        ss << "                    parse_state <= STATE_L3;\n";
+        ss << "                end\n";
+    }
+    
+    return ss.str();
+}
+
+std::string SVCodeGen::generateCustomHeaderInternalSignals(const SVParser* parser) {
+    if (!parser) return "";
+    
+    const auto& customHeaders = parser->getCustomHeaders();
+    if (!parser->hasHeaderStacks()) return "";
+    
+    std::stringstream ss;
+    ss << "    // ==========================================\n";
+    ss << "    // Stack Parsing State\n";
+    ss << "    // ==========================================\n";
     
     for (const auto& ch : customHeaders) {
         const auto& info = ch.second;
+        if (!info.isStack) continue;
         
-        ss << "                    // Parse " << info.name << " header\n";
-        ss << "                    if (PARSE_" << info.name << ") begin\n";
+        int idxBits = 1;
+        int maxIdx = info.maxStackSize;
+        while (maxIdx > (1 << idxBits)) idxBits++;
         
-        int bitOffset = 0;
-    for (const auto& fieldPair : info.fields) {
-        const std::string fieldName = fieldPair.first.string();      // Get the key
-        const SVParser::CustomHeaderField& field = fieldPair.second; // Get the value
-            
-            ss << "                        " << info.name << "_" << fieldName;
-            ss << " <= packet_buffer[byte_offset*8 + " << bitOffset;
-            ss << " +: " << field.width << "];\n";
-            
-            bitOffset += field.width;
-        }
-        
-        ss << "                        " << info.name << "_valid <= 1'b1;\n";
-        ss << "                        byte_offset <= byte_offset + 11'd" 
-           << (info.totalWidth / 8) << ";\n";
-        ss << "                    end\n\n";
+        ss << "    reg [" << (idxBits - 1) << ":0]            "
+           << info.name << "_stack_idx;\n";
+        ss << "    reg                        "
+           << info.name << "_parsing;\n";
     }
     
-    ss << "                    parse_state <= STATE_L3;\n";
-    ss << "                end\n";
+    ss << "\n";
     
     return ss.str();
 }
 
 // ==========================================
-// Deparser-Specific Generators 
+// Deparser-Specific Generators (PHASE 1.9)
 // ==========================================
 
 std::string SVCodeGen::generateCustomHeaderInputs(const SVParser* parser) {
@@ -331,8 +546,33 @@ std::string SVCodeGen::generateCustomHeaderInputs(const SVParser* parser) {
     
     for (const auto& ch : customHeaders) {
         const auto& info = ch.second;
-        ss << "    // Custom header: " << info.name << "\n";
-        ss << formatCustomHeaderFields(info, "input  wire", "    ") << ",\n";
+        ss << "    // Custom header: " << info.name;
+        
+        if (info.isStack) {
+            ss << " [stack, max " << info.maxStackSize << "]\n";
+            
+            std::vector<std::pair<cstring, SVParser::CustomHeaderField>> sortedFields;
+            for (const auto& fieldPair : info.fields) {
+                sortedFields.push_back(fieldPair);
+            }
+            
+            for (const auto& fieldPair : sortedFields) {
+                const std::string fieldName = fieldPair.first.string();
+                const SVParser::CustomHeaderField& field = fieldPair.second;
+                
+                ss << "    input  wire [" << (field.width - 1) << ":0]"
+                   << std::string(20 - std::to_string(field.width - 1).length(), ' ')
+                   << info.name << "_" << fieldName 
+                   << " [0:" << (info.maxStackSize - 1) << "],\n";
+            }
+            
+            ss << "    input  wire                      "
+               << info.name << "_valid [0:" << (info.maxStackSize - 1) << "],\n";
+            
+        } else {
+            ss << "\n";
+            ss << formatCustomHeaderFields(info, "input  wire", "    ") << ",\n";
+        }
     }
     
     return ss.str();
@@ -368,27 +608,119 @@ std::string SVCodeGen::generateCustomHeaderBuildLogic(const SVParser* parser) {
     for (const auto& ch : customHeaders) {
         const auto& info = ch.second;
         
-        ss << "                    // Build " << info.name << " header (" 
-           << (info.totalWidth / 8) << " bytes)\n";
-        ss << "                    if (EMIT_" << info.name 
-           << " && " << info.name << "_valid) begin\n";
-        
-        int bitOffset = 0;
-    for (const auto& fieldPair : info.fields) {
-        const std::string fieldName = fieldPair.first.string();      // Get the key
-        const SVParser::CustomHeaderField& field = fieldPair.second; // Get the value
+        if (info.isStack) {
+            // ==========================================
+            // POINTER-BASED STACK EMISSION
+            // ==========================================
+            ss << "                    // Build " << info.name << " stack (" 
+               << (info.totalWidth / 8) << " bytes per element)\n";
+            ss << "                    if (EMIT_" << info.name << ") begin\n";
+            ss << "                        // Loop from stack_ptr to end (skip popped elements)\n";
+            ss << "                        for (int stack_i = " << info.name << "_ptr; stack_i < " 
+               << info.maxStackSize << "; stack_i++) begin\n";
+            ss << "                            if (" << info.name << "_valid[stack_i]) begin\n";
             
-            ss << "                        header_buffer[byte_offset*8 + " << bitOffset;
-            ss << " +: " << field.width << "] <= " << info.name << "_" << fieldName << ";\n";
+            // Sort fields by offset
+            std::vector<std::pair<cstring, SVParser::CustomHeaderField>> sortedFields;
+            for (const auto& fieldPair : info.fields) {
+                sortedFields.push_back(fieldPair);
+            }
+            std::sort(sortedFields.begin(), sortedFields.end(),
+                [](const auto& a, const auto& b) {
+                    return a.second.offset < b.second.offset;
+                });
             
-            bitOffset += field.width;
+            // Emit each field from the stack element
+            for (const auto& fieldPair : sortedFields) {
+                const std::string fieldName = fieldPair.first.string();
+                const SVParser::CustomHeaderField& field = fieldPair.second;
+                
+                ss << "                                header_buffer[byte_offset*8 + " << field.offset;  
+                ss << " +: " << field.width << "] <= " << info.name << "_" << fieldName 
+                   << "[stack_i];\n";
+            }
+            
+            ss << "                                byte_offset <= byte_offset + 11'd" 
+               << (info.totalWidth / 8) << ";\n";
+            ss << "                            end\n";
+            ss << "                        end\n";
+            ss << "                    end\n\n";
+            
+        } else {
+            // ==========================================
+            // SINGLE HEADER EMISSION (unchanged)
+            // ==========================================
+            ss << "                    // Build " << info.name << " header (" 
+               << (info.totalWidth / 8) << " bytes)\n";
+            ss << "                    if (EMIT_" << info.name 
+               << " && " << info.name << "_valid) begin\n";
+            
+            std::vector<std::pair<cstring, SVParser::CustomHeaderField>> sortedFields;
+            for (const auto& fieldPair : info.fields) {
+                sortedFields.push_back(fieldPair);
+            }
+            std::sort(sortedFields.begin(), sortedFields.end(),
+                [](const auto& a, const auto& b) {
+                    return a.second.offset < b.second.offset;
+                });
+            
+            for (const auto& fieldPair : sortedFields) {
+                const std::string fieldName = fieldPair.first.string();
+                const SVParser::CustomHeaderField& field = fieldPair.second;
+                
+                ss << "                        header_buffer[byte_offset*8 + " << field.offset;  
+                ss << " +: " << field.width << "] <= " << info.name << "_" << fieldName << ";\n";
+            }
+            
+            ss << "                        byte_offset <= byte_offset + 11'd" 
+               << (info.totalWidth / 8) << ";\n";
+            ss << "                    end\n\n";
         }
-        
-        ss << "                        byte_offset <= byte_offset + 11'd" 
-           << (info.totalWidth / 8) << ";\n";
-        ss << "                    end\n\n";
     }
     
+    return ss.str();
+}
+
+// ==========================================
+// Generate Stack Pointer Inputs for Deparser
+// ==========================================
+std::string SVCodeGen::generateDeparserStackPointerInputs(const SVParser* parser) {
+    if (!parser) return "";
+    
+    const auto& customHeaders = parser->getCustomHeaders();
+    if (customHeaders.empty()) return "";
+    
+    std::stringstream ss;
+    bool hasStacks = false;
+    
+    // Check if there are any stack headers
+    for (const auto& ch : customHeaders) {
+        if (ch.second.isStack) {
+            hasStacks = true;
+            break;
+        }
+    }
+    
+    if (!hasStacks) return "";
+    
+    ss << "    // ==========================================\n";
+    ss << "    // Stack Pointers (for skipping popped elements)\n";
+    ss << "    // ==========================================\n";
+    
+    for (const auto& ch : customHeaders) {
+        const auto& info = ch.second;
+        if (!info.isStack) continue;
+        
+        // Calculate pointer width
+        int ptrBits = 1;
+        int maxIdx = info.maxStackSize;
+        while (maxIdx > (1 << ptrBits)) ptrBits++;
+        
+        ss << "    input  wire [" << (ptrBits - 1) << ":0] "
+           << info.name << "_ptr,\n";
+    }
+    
+    ss << "\n";
     return ss.str();
 }
 
@@ -409,16 +741,26 @@ std::string SVCodeGen::generateCustomHeaderSignals(const SVParser* parser) {
         const std::string headerName = headerPair.first.string();
         const SVParser::CustomHeaderInfo& headerInfo = headerPair.second;
         
-        // Iterate over fields map
-        for (const auto& fieldPair : headerInfo.fields) {
-            const std::string fieldName = fieldPair.first.string();
-            const SVParser::CustomHeaderField& field = fieldPair.second;
-            
-            ss << "logic [" << (field.width - 1) << ":0] "
-               << headerName << "_" << fieldName << ";\n";
+        if (headerInfo.isStack) {
+            for (const auto& fieldPair : headerInfo.fields) {
+                const std::string fieldName = fieldPair.first.string();
+                const SVParser::CustomHeaderField& field = fieldPair.second;
+                
+                ss << "logic [" << (field.width - 1) << ":0] "
+                   << headerName << "_" << fieldName 
+                   << " [0:" << (headerInfo.maxStackSize - 1) << "];\n";
+            }
+            ss << "logic " << headerName << "_valid [0:" << (headerInfo.maxStackSize - 1) << "];\n";
+        } else {
+            for (const auto& fieldPair : headerInfo.fields) {
+                const std::string fieldName = fieldPair.first.string();
+                const SVParser::CustomHeaderField& field = fieldPair.second;
+                
+                ss << "logic [" << (field.width - 1) << ":0] "
+                   << headerName << "_" << fieldName << ";\n";
+            }
+            ss << "logic " << headerName << "_valid;\n";
         }
-        
-        ss << "logic " << headerName << "_valid;\n";
         ss << "\n";
     }
     
@@ -438,15 +780,27 @@ std::string SVCodeGen::generateCustomHeaderPipelineSignals(const SVParser* parse
         const std::string headerName = headerPair.first.string();
         const SVParser::CustomHeaderInfo& headerInfo = headerPair.second;
         
-        for (const auto& fieldPair : headerInfo.fields) {
-            const std::string fieldName = fieldPair.first.string();
-            const SVParser::CustomHeaderField& field = fieldPair.second;
-            
-            ss << "logic [" << (field.width - 1) << ":0] "
-               << "pipeline_" << headerName << "_" << fieldName << ";\n";
+        if (headerInfo.isStack) {
+            for (const auto& fieldPair : headerInfo.fields) {
+                const std::string fieldName = fieldPair.first.string();
+                const SVParser::CustomHeaderField& field = fieldPair.second;
+                
+                ss << "logic [" << (field.width - 1) << ":0] "
+                   << "pipeline_" << headerName << "_" << fieldName 
+                   << " [0:" << (headerInfo.maxStackSize - 1) << "];\n";
+            }
+            ss << "logic pipeline_" << headerName << "_valid [0:" 
+               << (headerInfo.maxStackSize - 1) << "];\n";
+        } else {
+            for (const auto& fieldPair : headerInfo.fields) {
+                const std::string fieldName = fieldPair.first.string();
+                const SVParser::CustomHeaderField& field = fieldPair.second;
+                
+                ss << "logic [" << (field.width - 1) << ":0] "
+                   << "pipeline_" << headerName << "_" << fieldName << ";\n";
+            }
+            ss << "logic pipeline_" << headerName << "_valid;\n";
         }
-        
-        ss << "logic pipeline_" << headerName << "_valid;\n";
         ss << "\n";
     }
     
@@ -465,43 +819,30 @@ std::string SVCodeGen::generateParserCustomHeaderPorts(const SVParser* parser) {
         const std::string headerName = headerPair.first.string();
         const SVParser::CustomHeaderInfo& headerInfo = headerPair.second;
         
-        for (const auto& fieldPair : headerInfo.fields) {
-            const std::string fieldName = fieldPair.first.string();
-            const SVParser::CustomHeaderField& field = fieldPair.second;
-            
-            ss << "    ." << headerName << "_" << fieldName 
-               << "(" << headerName << "_" << fieldName << "),\n";
+        if (headerInfo.isStack) {
+            for (const auto& fieldPair : headerInfo.fields) {
+                const std::string fieldName = fieldPair.first.string();
+                
+                ss << "    ." << headerName << "_" << fieldName 
+                   << "(" << headerName << "_" << fieldName << "),\n";
+            }
+            ss << "    ." << headerName << "_valid(" << headerName << "_valid),\n";
+        } else {
+            for (const auto& fieldPair : headerInfo.fields) {
+                const std::string fieldName = fieldPair.first.string();
+                
+                ss << "    ." << headerName << "_" << fieldName 
+                   << "(" << headerName << "_" << fieldName << "),\n";
+            }
+            ss << "    ." << headerName << "_valid(" << headerName << "_valid),\n";
         }
-        
-        ss << "    ." << headerName << "_valid(" << headerName << "_valid),\n";
     }
     
     return ss.str();
 }
 
 std::string SVCodeGen::generatePipelineCustomHeaderInputs(const SVParser* parser) {
-    if (!parser) return "";
-    
-    const auto& customHeaders = parser->getCustomHeaders();
-    if (customHeaders.empty()) return "";
-    
-    std::stringstream ss;
-    
-    for (const auto& headerPair : customHeaders) {
-        const std::string headerName = headerPair.first.string();
-        const SVParser::CustomHeaderInfo& headerInfo = headerPair.second;
-        
-        for (const auto& fieldPair : headerInfo.fields) {
-            const std::string fieldName = fieldPair.first.string();
-            
-            ss << "    ." << headerName << "_" << fieldName 
-               << "(" << headerName << "_" << fieldName << "),\n";
-        }
-        
-        ss << "    ." << headerName << "_valid(" << headerName << "_valid),\n";
-    }
-    
-    return ss.str();
+    return generateParserCustomHeaderPorts(parser);
 }
 
 std::string SVCodeGen::generatePipelineCustomHeaderOutputs(const SVParser* parser) {
@@ -516,15 +857,25 @@ std::string SVCodeGen::generatePipelineCustomHeaderOutputs(const SVParser* parse
         const std::string headerName = headerPair.first.string();
         const SVParser::CustomHeaderInfo& headerInfo = headerPair.second;
         
-        for (const auto& fieldPair : headerInfo.fields) {
-            const std::string fieldName = fieldPair.first.string();
-            
-            ss << "    .out_" << headerName << "_" << fieldName 
-               << "(pipeline_" << headerName << "_" << fieldName << "),\n";
+        if (headerInfo.isStack) {
+            for (const auto& fieldPair : headerInfo.fields) {
+                const std::string fieldName = fieldPair.first.string();
+                
+                ss << "    .out_" << headerName << "_" << fieldName 
+                   << "(pipeline_" << headerName << "_" << fieldName << "),\n";
+            }
+            ss << "    .out_" << headerName << "_valid(pipeline_" 
+               << headerName << "_valid),\n";
+        } else {
+            for (const auto& fieldPair : headerInfo.fields) {
+                const std::string fieldName = fieldPair.first.string();
+                
+                ss << "    .out_" << headerName << "_" << fieldName 
+                   << "(pipeline_" << headerName << "_" << fieldName << "),\n";
+            }
+            ss << "    .out_" << headerName << "_valid(pipeline_" 
+               << headerName << "_valid),\n";
         }
-        
-        ss << "    .out_" << headerName << "_valid(pipeline_" 
-           << headerName << "_valid),\n";
     }
     
     return ss.str();
@@ -542,15 +893,25 @@ std::string SVCodeGen::generateDeparserCustomHeaderPorts(const SVParser* parser)
         const std::string headerName = headerPair.first.string();
         const SVParser::CustomHeaderInfo& headerInfo = headerPair.second;
         
-        for (const auto& fieldPair : headerInfo.fields) {
-            const std::string fieldName = fieldPair.first.string();
-            
-            ss << "    .pipeline_" << headerName << "_" << fieldName 
-               << "(pipeline_" << headerName << "_" << fieldName << "),\n";
+        if (headerInfo.isStack) {
+            for (const auto& fieldPair : headerInfo.fields) {
+                const std::string fieldName = fieldPair.first.string();
+                
+                ss << "    .pipeline_" << headerName << "_" << fieldName 
+                   << "(pipeline_" << headerName << "_" << fieldName << "),\n";
+            }
+            ss << "    .pipeline_" << headerName << "_valid(pipeline_" 
+               << headerName << "_valid),\n";
+        } else {
+            for (const auto& fieldPair : headerInfo.fields) {
+                const std::string fieldName = fieldPair.first.string();
+                
+                ss << "    .pipeline_" << headerName << "_" << fieldName 
+                   << "(pipeline_" << headerName << "_" << fieldName << "),\n";
+            }
+            ss << "    .pipeline_" << headerName << "_valid(pipeline_" 
+               << headerName << "_valid),\n";
         }
-        
-        ss << "    .pipeline_" << headerName << "_valid(pipeline_" 
-           << headerName << "_valid),\n";
     }
     
     return ss.str();
@@ -591,6 +952,8 @@ void SVCodeGen::processParserTemplate(const SVParser* parser, const std::string&
                generateCustomHeaderEthertypeCheck(parser));
     replaceAll(content, "{{CUSTOM_HEADER_STATE}}", 
                generateCustomHeaderState(parser));
+    replaceAll(content, "{{CUSTOM_HEADER_INTERNAL_SIGNALS}}", 
+               generateCustomHeaderInternalSignals(parser));
     
     writeToFile(content, outputPath);
 }
@@ -602,6 +965,8 @@ void SVCodeGen::processDeparserTemplate(const SVParser* parser, const std::strin
         return;
     }
     
+    replaceAll(content, "{{STACK_POINTER_INPUTS}}", 
+               generateDeparserStackPointerInputs(parser));  
     replaceAll(content, "{{CUSTOM_HEADER_INPUTS}}", 
                generateCustomHeaderInputs(parser));
     replaceAll(content, "{{CUSTOM_HEADER_EMIT_PARAMS}}", 
@@ -635,5 +1000,94 @@ void SVCodeGen::processTopTemplate(const SVParser* parser, const std::string& ou
     
     writeToFile(content, outputPath);
 }
+
+// ==========================================
+// Stack Pointer Generation
+// ==========================================
+
+// Generate stack pointer register declarations
+std::string SVCodeGen::generateStackPointerSignals(const SVParser* parser) {
+    if (!parser) return "";
+    
+    const auto& customHeaders = parser->getCustomHeaders();
+    if (customHeaders.empty()) return "";
+    
+    // Always generate pointers for stack headers
+    bool hasStacks = false;
+    for (const auto& ch : customHeaders) {
+        if (ch.second.isStack) {
+            hasStacks = true;
+            break;
+        }
+    }
+    
+    if (!hasStacks) return "";
+    
+    std::stringstream ss;
+    ss << "    // ==========================================\n";
+    ss << "    // Stack Pointers\n";
+    ss << "    // ==========================================\n";
+    
+    for (const auto& ch : customHeaders) {
+        const auto& info = ch.second;
+        if (!info.isStack) continue;
+        
+        // Calculate pointer width (log2 of max size)
+        int ptrBits = 1;
+        int maxIdx = info.maxStackSize;
+        while (maxIdx > (1 << ptrBits)) ptrBits++;
+        
+        ss << "    reg [" << (ptrBits - 1) << ":0] " << info.name << "_ptr;\n";
+    }
+    
+    ss << "\n";
+    return ss.str();
+}
+
+// Generate stack pointer update logic 
+std::string SVCodeGen::generateStackPointerLogic(
+    const std::map<cstring, SV::SVAction*>& actions,
+    const std::map<int, cstring>& actionIdMap
+) {
+    std::stringstream ss;
+    
+    // Generate logic for each action ID
+    for (const auto& idPair : actionIdMap) {
+        int actionId = idPair.first;
+        cstring actionName = idPair.second;
+        
+        auto it = actions.find(actionName);
+        if (it == actions.end()) continue;
+        
+        const SV::SVAction* action = it->second;
+        if (!action->usesStackOperations()) continue;
+        
+        const auto& stackOps = action->getStackOperations();
+        
+        ss << "            " << actionId << ": begin  // " << actionName << "\n";
+        
+        for (const auto& op : stackOps) {
+            const std::string stackName = op.stackName.string();
+            
+            if (op.type == SV::StackOperation::OpType::POP_FRONT) {
+                ss << "                // pop_front(" << op.count << ") on " << stackName << "\n";
+                ss << "                " << stackName << "_ptr <= " << stackName << "_ptr + " 
+                   << op.count << ";\n";
+            } else if (op.type == SV::StackOperation::OpType::PUSH_FRONT) {
+                ss << "                // push_front(" << op.count << ") on " << stackName << "\n";
+                ss << "                if (" << stackName << "_ptr >= " << op.count << ") begin\n";
+                ss << "                    " << stackName << "_ptr <= " << stackName << "_ptr - " 
+                   << op.count << ";\n";
+                ss << "                end\n";
+            }
+        }
+        
+        ss << "            end\n";
+    }
+    
+    return ss.str();
+}
+
+
 
 }  // namespace SV

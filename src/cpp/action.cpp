@@ -51,7 +51,76 @@ bool SVAction::build() {
     }
     
     analyzeBody();
+    detectStackOperations();  
     return true;
+}
+
+// ==========================================
+// Detect Stack Operations
+// ==========================================
+
+void SVAction::detectStackOperations() {
+    if (!p4action->body) return;
+    
+    ACTION_TRACE("Detecting stack operations in action " << actionName);
+    
+    for (auto stmt : p4action->body->components) {
+        if (auto methodCall = stmt->to<IR::MethodCallStatement>()) {
+            auto method = methodCall->methodCall;
+            if (!method || !method->method) continue;
+            
+            // Check if this is a member method call (e.g., hdr.srcRoutes.pop_front)
+            if (auto member = method->method->to<IR::Member>()) {
+                std::string methodName = member->member.string();
+                
+                // Detect pop_front()
+                if (methodName == "pop_front") {
+                    // Get stack name from expression (hdr.srcRoutes.pop_front → srcRoutes)
+                    if (auto stackMember = member->expr->to<IR::Member>()) {
+                        StackOperation op;
+                        op.type = StackOperation::POP_FRONT;
+                        op.stackName = stackMember->member;
+                        op.count = 1;  // Default count
+                        
+                        // Check if there's an argument for count
+                        if (method->arguments && method->arguments->size() > 0) {
+                            if (auto countArg = method->arguments->at(0)->to<IR::Constant>()) {
+                                op.count = countArg->asInt();
+                            }
+                        }
+                        
+                        stackOperations.push_back(op);
+                        ACTION_DEBUG("Found pop_front(" << op.count << ") on stack: " 
+                                    << op.stackName);
+                    }
+                }
+                // Detect push_front()
+                else if (methodName == "push_front") {
+                    if (auto stackMember = member->expr->to<IR::Member>()) {
+                        StackOperation op;
+                        op.type = StackOperation::PUSH_FRONT;
+                        op.stackName = stackMember->member;
+                        op.count = 1;
+                        
+                        if (method->arguments && method->arguments->size() > 0) {
+                            if (auto countArg = method->arguments->at(0)->to<IR::Constant>()) {
+                                op.count = countArg->asInt();
+                            }
+                        }
+                        
+                        stackOperations.push_back(op);
+                        ACTION_DEBUG("Found push_front(" << op.count << ") on stack: " 
+                                    << op.stackName);
+                    }
+                }
+            }
+        }
+    }
+    
+    if (!stackOperations.empty()) {
+        ACTION_DEBUG("Action " << actionName << " uses " << stackOperations.size() 
+                    << " stack operation(s)");
+    }
 }
 
 // ======================================
@@ -586,6 +655,11 @@ void SVAction::emitMethodCall(CodeBuilder* builder,
     } 
     else if (methodName.find("setInvalid") != std::string::npos) {
         builder->appendLine("// setInvalid - not yet implemented");
+    }
+    // PHASE 2: Stack operations handled separately in match_action.sv generation
+    else if (methodName.find("pop_front") != std::string::npos ||
+             methodName.find("push_front") != std::string::npos) {
+        builder->appendLine("// Stack operation: " + methodName + " (handled by pointer logic)");
     }
     else {
         builder->appendLine("// Unknown method call: " + methodName);

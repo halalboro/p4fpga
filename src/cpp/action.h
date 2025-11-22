@@ -1,5 +1,3 @@
-// action.h
-
 #ifndef P4FPGA_ACTION_H
 #define P4FPGA_ACTION_H
 
@@ -11,20 +9,37 @@ namespace SV {
 
 class SVControl;
 
+struct StackOperation {
+    enum OpType {
+        POP_FRONT,
+        PUSH_FRONT
+    };
+    
+    OpType type;
+    cstring stackName;     // e.g., "srcRoutes"
+    int count;             // Number of elements (default 1)
+    
+    StackOperation() : type(POP_FRONT), count(1) {}
+};
+
 class SVAction {
 private:
     SVControl* control;
     const IR::P4Action* p4action;
     const TypeMap* typeMap;
     cstring actionName;
-    
     int parameterWidth;
+    
     std::vector<const IR::Parameter*> parameters;
     std::map<cstring, cstring> fieldModifications;
     cstring associatedTable;
     
+    // Stack operations tracking
+    std::vector<StackOperation> stackOperations;
+    
     void extractParameters();
     void analyzeBody();
+    void detectStackOperations(); 
     
 public:
     SVAction(SVControl* ctrl, const IR::P4Action* act) :
@@ -35,14 +50,19 @@ public:
         parameterWidth(0) {}
     
     bool build();
-    
     void setTypeMap(const TypeMap* tm) { typeMap = tm; }
     void setAssociatedTable(cstring tableName) { associatedTable = tableName; }
     
-    // NEW: Stateful operation detection
+    // Stateful operation detection
     bool usesRegisters() const;
     bool usesHash() const;
     bool usesCounters() const;
+    
+    // PHASE 2: Stack operation queries
+    bool usesStackOperations() const { return !stackOperations.empty(); }
+    const std::vector<StackOperation>& getStackOperations() const { 
+        return stackOperations; 
+    }
     
     // Existing methods
     bool isNoAction() const { 

@@ -18,10 +18,10 @@
 #include "lib/cstring.h"
 
 // Helper function to recursively scan for if-statements and store them
-void scanForIfStatements(const IR::Node* node, const P4::cstring& controlName, int& count) {
+void scanForIfStatements(const P4::IR::Node* node, const P4::cstring& controlName, int& count) {
     if (!node) return;
     
-    if (auto ifStmt = node->to<IR::IfStatement>()) {
+    if (auto ifStmt = node->to<P4::IR::IfStatement>()) {
         count++;
         
         std::cerr << "╔═══════════════════════════════════════════╗" << std::endl;
@@ -36,10 +36,10 @@ void scanForIfStatements(const IR::Node* node, const P4::cstring& controlName, i
             std::cerr << "  True:  " << ifStmt->ifTrue->node_type_name();
             
             // Try to get action name if it's a method call
-            if (auto block = ifStmt->ifTrue->to<IR::BlockStatement>()) {
+        if (auto block = ifStmt->ifTrue->to<P4::IR::BlockStatement>()) {
                 if (block->components.size() > 0) {
-                    if (auto methodCall = block->components[0]->to<IR::MethodCallStatement>()) {
-                        if (auto path = methodCall->methodCall->method->to<IR::PathExpression>()) {
+                    if (auto methodCall = block->components[0]->to<P4::IR::MethodCallStatement>()) {
+                        if (auto path = methodCall->methodCall->method->to<P4::IR::PathExpression>()) {
                             trueActionName = path->path->name;
                             std::cerr << " → " << trueActionName;
                         }
@@ -53,10 +53,10 @@ void scanForIfStatements(const IR::Node* node, const P4::cstring& controlName, i
             std::cerr << "  False: " << ifStmt->ifFalse->node_type_name();
             
             // Try to get action name
-            if (auto block = ifStmt->ifFalse->to<IR::BlockStatement>()) {
+            if (auto block = ifStmt->ifFalse->to<P4::IR::BlockStatement>()) {
                 if (block->components.size() > 0) {
-                    if (auto methodCall = block->components[0]->to<IR::MethodCallStatement>()) {
-                        if (auto path = methodCall->methodCall->method->to<IR::PathExpression>()) {
+                    if (auto methodCall = block->components[0]->to<P4::IR::MethodCallStatement>()) {
+                        if (auto path = methodCall->methodCall->method->to<P4::IR::PathExpression>()) {
                             falseActionName = path->path->name;
                             std::cerr << " → " << falseActionName;
                         }
@@ -69,12 +69,12 @@ void scanForIfStatements(const IR::Node* node, const P4::cstring& controlName, i
         std::cerr << "───────────────────────────────────────────" << std::endl;
         
         // ==========================================
-        // Store if-else info for backend (Phase 3b)
+        // Store if-else info for backend 
         // ==========================================
         // Only store simple if-else with both branches being action calls
         if (!trueActionName.isNullOrEmpty()) {
             // Check if this is a simple comparison we can handle
-            if (auto equ = ifStmt->condition->to<IR::Equ>()) {
+            if (auto equ = ifStmt->condition->to<P4::IR::Equ>()) {
                 SV::g_detectedIfElse.emplace_back(
                     controlName, 
                     ifStmt->condition, 
@@ -94,7 +94,7 @@ void scanForIfStatements(const IR::Node* node, const P4::cstring& controlName, i
     }
     
     // Scan block statements
-    if (auto block = node->to<IR::BlockStatement>()) {
+    if (auto block = node->to<P4::IR::BlockStatement>()) {
         for (auto component : block->components) {
             scanForIfStatements(component, controlName, count);
         }
@@ -270,10 +270,10 @@ int main(int argc, char *const argv[]) {
     }
 
     // ==========================================
-    // PHASE 3a: Detect if-else statements in raw AST
+    // Detect if-else statements in raw AST
     // ==========================================
     if (SV::g_verbose) {
-        std::cerr << "\n=== Phase 3a: Scanning for control flow ===" << std::endl;
+        std::cerr << "\n=== Scanning for control flow ===" << std::endl;
     }
     
     int ifElseCount = 0;
@@ -292,15 +292,12 @@ int main(int argc, char *const argv[]) {
     }
     
     if (ifElseCount > 0) {
-        std::cerr << "\n[Phase 3a] Found " << ifElseCount << " if-else statement(s)" << std::endl;
-        std::cerr << "[Phase 3a] These will be compiled as-is (no hardware support yet)" << std::endl;
+        std::cerr << ifElseCount << " if-else statement(s)" << std::endl;
     } else {
         if (SV::g_verbose) {
-            std::cerr << "[Phase 3a] No if-else statements found (table-based logic only)" << std::endl;
+            std::cerr << "No if-else statements found (table-based logic only)" << std::endl;
         }
     }
-    
-    std::cerr << "=== Phase 3a complete ===" << std::endl << std::endl;
 
     // Run frontend
     if (SV::g_verbose) {

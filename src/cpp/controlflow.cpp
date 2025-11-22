@@ -109,9 +109,6 @@ const IR::Node* ControlFlowLowering::postorder(IR::IfStatement* stmt) {
     
     LOG1("───────────────────────────────────────────");
     
-    // Phase 3a: Just detect and log for now
-    // Phase 3b: Will generate actual table to replace this
-    // For now, keep the original if-statement
     
     return stmt;
 }

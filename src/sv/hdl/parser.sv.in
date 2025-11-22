@@ -147,6 +147,7 @@ module parser #(
     reg  [10:0]            byte_offset;
     reg  [3:0]             parse_state;
     
+{{CUSTOM_HEADER_INTERNAL_SIGNALS}}
     // State machine states
     localparam STATE_IDLE       = 4'd0;
     localparam STATE_ETHERNET   = 4'd1;

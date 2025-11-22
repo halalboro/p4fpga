@@ -1,5 +1,3 @@
-// parser.cpp
-
 #include "common.h"
 #include "parser.h"
 #include "program.h"
@@ -41,7 +39,7 @@ SVParser::SVParser(SVProgram* program,
     userMetadata(nullptr),
     stdMetadata(nullptr),
     parserConfig(0),
-    nextCustomBit(PARSE_CUSTOM) {  // Initialize nextCustomBit
+    nextCustomBit(PARSE_CUSTOM) {
 }
 
 // ==========================================
@@ -109,13 +107,33 @@ bool SVParser::build() {
     stdMetadata = pl->getParameter(3);
     
     PARSER_DEBUG("Parser parameters extracted");
+
+    // ==========================================
+    // Extract User Metadata
+    // ==========================================
+    if (userMetadata) {
+        auto metaType = typeMap->getType(userMetadata);
+        if (metaType && metaType->is<IR::Type_Struct>()) {
+            auto metaStruct = metaType->to<IR::Type_Struct>();
+            
+            SVMetadata* metadata = new SVMetadata();
+            if (metadata->build(metaStruct)) {
+                program->setMetadata(metadata);
+                PARSER_DEBUG("Metadata: " << metadata->totalWidth << " bits");
+            }
+        }
+    }
     
     // Analyze header types from P4 program
     analyzeHeaderTypes();
     
     // Extract custom headers BEFORE analyzing parser flow
+    // This includes both single headers AND stacks from P4 struct
     nextCustomBit = PARSE_CUSTOM;
     extractCustomHeaders();
+    
+    // Detect .next accessor patterns in parser states
+    detectHeaderStacksFromParser();
     
     // Analyze parser state flow
     analyzeParserFlow();
@@ -151,9 +169,21 @@ void SVParser::printSummary() const {
         PARSER_SUCCESS("Parser: " << headerSequence.size() 
                       << " headers (" << headerList.str() << ")");
     } else {
-        PARSER_SUCCESS("Parser: " << headerSequence.size() 
-                      << " headers (" << headerList.str() << "), "
-                      << customHeaders.size() << " custom");
+        int numStacks = 0;
+        for (const auto& ch : customHeaders) {
+            if (ch.second.isStack) numStacks++;
+        }
+        
+        if (numStacks > 0) {
+            PARSER_SUCCESS("Parser: " << headerSequence.size() 
+                          << " headers (" << headerList.str() << "), "
+                          << customHeaders.size() << " custom (" 
+                          << numStacks << " stacks)");
+        } else {
+            PARSER_SUCCESS("Parser: " << headerSequence.size() 
+                          << " headers (" << headerList.str() << "), "
+                          << customHeaders.size() << " custom");
+        }
     }
     
 #if DEBUG_PARSER_VERBOSE
@@ -177,7 +207,11 @@ void SVParser::printSummary() const {
         for (const auto& ch : customHeaders) {
             std::cerr << "  └─ " << ch.first 
                       << " (bit " << ch.second.parserBit 
-                      << ", " << ch.second.totalWidth << " bits)" << std::endl;
+                      << ", " << ch.second.totalWidth << " bits";
+            if (ch.second.isStack) {
+                std::cerr << ", stack[" << ch.second.maxStackSize << "]";
+            }
+            std::cerr << ")" << std::endl;
         }
     }
 #endif
@@ -214,6 +248,38 @@ void SVParser::analyzeHeaderTypes() {
     }
 }
 
+void SVParser::handleLookahead(const IR::MethodCallExpression* lookahead,
+                                const IR::ParserState* state) {
+    // Get the type being peeked at
+    auto typeArgs = lookahead->typeArguments;
+    if (typeArgs->size() != 1) {
+        error("lookahead must have exactly one type argument");
+        return;
+    }
+    
+    auto peekType = typeArgs->at(0);
+    PARSER_DEBUG("Lookahead type: " << peekType);
+    
+    // Store lookahead information for this state
+    LookaheadInfo info;
+    info.state = state->name;
+    info.type = peekType;
+    info.fields = extractLookaheadFields(lookahead);
+    
+    lookaheads.push_back(info);
+}
+
+std::vector<cstring> SVParser::extractLookaheadFields(
+    const IR::MethodCallExpression* lookahead) {
+    std::vector<cstring> fields;
+    
+    // The lookahead expression is typically followed by field access
+    // e.g., packet.lookahead<p4calc_t>().p
+    // We need to track which fields are being accessed
+    
+    return fields;
+}
+
 // ==========================================
 // Analyze Parser Flow
 // ==========================================
@@ -234,7 +300,39 @@ void SVParser::analyzeParserFlow() {
         
         for (auto& extractedState : g_extractedParserStates[p4parser->name]) {
             if (extractedState.isStart || extractedState.isAccept) continue;
+
+            // ==========================================
+            // Find the actual P4 parser state
+            // ==========================================
+            const IR::ParserState* p4state = nullptr;
             
+            for (auto state : p4parser->states) {
+                if (state && state->name == extractedState.name) {
+                    p4state = state;
+                    break;
+                }
+            }
+            
+            // ==========================================
+            // Only check lookahead if we found the state
+            // ==========================================
+            if (p4state && p4state->selectExpression) {
+                if (auto selectExpr = p4state->selectExpression->to<IR::SelectExpression>()) {
+                    if (auto listExpr = selectExpr->select->to<IR::ListExpression>()) {
+                        for (auto component : listExpr->components) {
+                            if (auto methodCall = component->to<IR::MethodCallExpression>()) {
+                                if (auto member = methodCall->method->to<IR::Member>()) {
+                                    if (member->member == "lookahead") {
+                                        PARSER_DEBUG("Found lookahead in state: " << p4state->name);
+                                        handleLookahead(methodCall, p4state);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             // Process each state's extracted headers
             for (auto& headerName : extractedState.extractedHeaders) {
                 // Parse "hdr.ethernet" → "ethernet"
@@ -323,6 +421,31 @@ void SVParser::analyzeParserFlow() {
             ipv4Cond.conditionValue = cstring("16'h0800");
             conditionalHeaders.push_back(ipv4Cond);
         }
+
+        if (headerTypes.count(cstring("tcp"))) {
+            HeaderInfo tcpInfo;
+            tcpInfo.name = cstring("tcp");
+            tcpInfo.width = headerTypes[cstring("tcp")]->width_bits();
+            
+            auto tcpType = headerTypes[cstring("tcp")];
+            for (auto field : tcpType->fields) {
+                auto fType = typeMap->getType(field);
+                if (fType && fType->is<IR::Type_Bits>()) {
+                    tcpInfo.fields.push_back({field->name, fType->to<IR::Type_Bits>()->size});
+                }
+            }
+            
+            headerSequence.push_back(tcpInfo);
+            
+            // TCP is parsed when IPv4 protocol = 6
+            ConditionalParse tcpCond;
+            tcpCond.headerName = cstring("tcp");
+            tcpCond.conditionField = cstring("ipv4.protocol");
+            tcpCond.conditionValue = cstring("6");
+            conditionalHeaders.push_back(tcpCond);
+            
+            PARSER_TRACE("Added TCP header (conditional on protocol=6)");
+        }
     }
 }
 
@@ -381,60 +504,281 @@ void SVParser::extractParserConfiguration() {
 }
 
 // ==========================================
-// Extract Custom Headers
+// Extract Custom Headers (PHASE 1.7 - COMPLETE)
+// Detects both single headers AND header stacks from P4 struct
 // ==========================================
 
 void SVParser::extractCustomHeaders() {
-    PARSER_DEBUG("Scanning for custom headers");
+    if (!parserBlock || !parserBlock->container) return;
     
-    if (!headers) return;
+    auto p4parser = parserBlock->container->to<IR::P4Parser>();
+    if (!p4parser) return;
     
-    auto headersType = typeMap->getType(headers);
-    if (!headersType || !headersType->is<IR::Type_Struct>()) {
+    if (g_verbose) {
+        std::cerr << "  Scanning for custom headers" << std::endl;
+    }
+    
+    // Get parser parameters from type
+    auto parserType = p4parser->type;
+    if (!parserType || !parserType->applyParams || 
+        parserType->applyParams->size() < 2) {
         return;
     }
     
-    auto structType = headersType->to<IR::Type_Struct>();
-    nextCustomBit = PARSE_CUSTOM;
+    // Second parameter is "out headers hdr"
+    auto headersParam = parserType->applyParams->getParameter(1);
+    if (!headersParam) return;
     
-    for (auto field : structType->fields) {
-        auto fieldType = typeMap->getType(field);
-        if (!fieldType || !fieldType->is<IR::Type_Header>()) continue;
+    // Get the type of the headers parameter
+    auto headersTypeFromParam = typeMap->getType(headersParam);
+    if (!headersTypeFromParam) return;
+    
+    auto headersType = headersTypeFromParam->to<IR::Type_Struct>();
+    
+    if (!headersType) {
+        if (g_verbose) {
+            std::cerr << "    No headers struct found" << std::endl;
+        }
+        return;
+    }
+    
+    if (g_verbose) {
+        std::cerr << "    Found headers struct with " 
+                  << headersType->fields.size() << " fields" << std::endl;
+    }
+    
+    // ==========================================
+    // Iterate through header struct fields
+    // ==========================================
+    for (auto field : headersType->fields) {
+        auto fieldType = field->type;
         
-        auto headerType = fieldType->to<IR::Type_Header>();
-        cstring headerName = field->name;
-        
-        // Skip standard headers
-        if (isStandardHeader(headerName)) {
-            continue;
+        // DEBUG OUTPUT: Show what types we're seeing
+        if (g_verbose) {
+            std::cerr << "    Field: " << field->name 
+                      << " Type: " << fieldType->node_type_name() << std::endl;
         }
         
-        // Found a custom header!
-        PARSER_TRACE("Found custom header: " << headerName);
-        
-        CustomHeaderInfo customInfo;
-        customInfo.name = headerName;
-        customInfo.totalWidth = 0;
-        customInfo.parserBit = nextCustomBit++;
-        
-        // Extract fields into the NEW map-based structure
-        int currentOffset = 0;
-        for (auto hdrField : headerType->fields) {
-            auto fType = typeMap->getType(hdrField);
-            if (fType && fType->is<IR::Type_Bits>()) {
-                int fWidth = fType->to<IR::Type_Bits>()->size;
+        // ==========================================
+        // CASE 1: Single Header
+        // ==========================================
+        if (fieldType->is<IR::Type_Header>()) {
+            auto headerType = fieldType->to<IR::Type_Header>();
+            if (!headerType) continue;
+            
+            // Check if this is a standard header we already support
+            cstring headerName = headerType->name;
+            
+            if (headerName == "ethernet_t" || 
+                headerName == "ipv4_t" || 
+                headerName == "ipv6_t" ||
+                headerName == "tcp_t" || 
+                headerName == "udp_t" ||
+                headerName == "vlan_tag_t") {
+                // Skip standard headers
+                continue;
+            }
+            
+            // This is a custom header!
+            CustomHeaderInfo info;
+            info.name = field->name;
+            info.isStack = false;
+            info.maxStackSize = 1;
+            info.elementTypeName = headerName;
+            info.parserBit = nextCustomBit++;
+            
+            // Extract fields
+            int bitOffset = 0;
+            for (auto hdrField : headerType->fields) {
+                CustomHeaderField fieldInfo;
+                fieldInfo.width = hdrField->type->width_bits();
+                fieldInfo.offset = bitOffset;
+                fieldInfo.isPartOfStack = false;
                 
-                // NEW: Create CustomHeaderField and add to map
-                CustomHeaderField field(hdrField->name, fWidth, currentOffset);
-                customInfo.fields[hdrField->name] = field;
-                
-                customInfo.totalWidth += fWidth;
-                currentOffset += fWidth;
+                info.fields[hdrField->name] = fieldInfo;
+                bitOffset += fieldInfo.width;
+            }
+            
+            info.totalWidth = bitOffset;
+            customHeaders[field->name] = info;
+            
+            if (g_verbose) {
+                std::cerr << "    Found custom header: " << field->name 
+                          << " (" << info.totalWidth << " bits)" << std::endl;
             }
         }
-        
-        customHeaders[headerName] = customInfo;
+        // ==========================================
+        // CASE 2: Header Stack (Array)
+        // ==========================================
+        else if (fieldType->is<IR::Type_Array>()) {
+            auto arrayType = fieldType->to<IR::Type_Array>();
+            if (!arrayType) continue;
+            
+            cstring stackName = field->name;
+            
+            // Get element type
+            auto elementType = arrayType->elementType->to<IR::Type_Header>();
+            if (!elementType) {
+                if (g_verbose) {
+                    std::cerr << "    Warning: Array " << stackName 
+                            << " has non-header element type" << std::endl;
+                }
+                continue;
+            }
+            
+            // Get array size
+            int stackSize = 10; // Default
+            if (auto sizeExpr = arrayType->size->to<IR::Constant>()) {
+                stackSize = sizeExpr->asInt();
+            }
+            
+            CustomHeaderInfo info;
+            info.name = stackName;
+            info.isStack = true;
+            info.maxStackSize = stackSize;
+            info.elementTypeName = elementType->name;
+            info.parserBit = nextCustomBit++;
+            
+            // Extract fields and detect BOS
+            int bitOffset = 0;
+            bool foundBos = false;
+            
+            for (auto hdrField : elementType->fields) {
+                CustomHeaderField fieldInfo;
+                fieldInfo.width = hdrField->type->width_bits();
+                fieldInfo.offset = bitOffset;
+                fieldInfo.isPartOfStack = true;
+                
+                std::string fieldNameStr = hdrField->name.string();
+                std::transform(fieldNameStr.begin(), fieldNameStr.end(), 
+                            fieldNameStr.begin(), ::tolower);
+                
+                if ((fieldNameStr == "bos" || fieldNameStr == "last") && 
+                    fieldInfo.width == 1) {
+                    info.hasBosField = true;
+                    info.bosFieldName = hdrField->name;
+                    info.bosFieldOffset = bitOffset;
+                    foundBos = true;
+                    
+                    if (g_verbose) {
+                        std::cerr << "      Found BOS field: " << hdrField->name 
+                                << " at bit " << bitOffset << std::endl;
+                    }
+                }
+                
+                info.fields[hdrField->name] = fieldInfo;
+                bitOffset += fieldInfo.width;
+            }
+            
+            info.totalWidth = bitOffset;
+            customHeaders[stackName] = info;
+            
+            if (g_verbose) {
+                std::cerr << "    Found header stack: " << stackName 
+                        << "[" << stackSize << "] of type " 
+                        << info.elementTypeName
+                        << " (" << info.totalWidth << " bits per element)" 
+                        << std::endl;
+                
+                if (!foundBos) {
+                    std::cerr << "      WARNING: No BOS field found!" << std::endl;
+                }
+            }
+        }
     }
+    
+    if (g_verbose && !customHeaders.empty()) {
+        std::cerr << "    Extracted " << customHeaders.size() 
+                  << " custom header(s)" << std::endl;
+    }
+}
+
+// ==========================================
+// Detect Header Stacks from Parser (.next accessor)
+// This complements extractCustomHeaders() by marking
+// headers as stacks if they use .next in parser
+// ==========================================
+
+void SVParser::detectHeaderStacksFromParser() {
+    if (!parserBlock || !parserBlock->container) return;
+    
+    auto p4parser = parserBlock->container->to<IR::P4Parser>();
+    if (!p4parser) return;
+    
+    if (g_verbose) {
+        std::cerr << "  Detecting .next accessor patterns" << std::endl;
+    }
+    
+    // Analyze parser states for stack extraction patterns
+    for (auto state : p4parser->states) {
+        if (!state || state->components.empty()) continue;
+        
+        for (auto component : state->components) {
+            // Look for packet.extract(hdr.xxx.next)
+            if (auto methodCall = component->to<IR::MethodCallStatement>()) {
+                auto method = methodCall->methodCall;
+                if (!method) continue;
+                
+                // Check if this is an extract() call
+                if (auto member = method->method->to<IR::Member>()) {
+                    if (member->member != "extract") continue;
+                    
+                    // Check if argument uses .next accessor
+                    if (method->arguments && method->arguments->size() > 0) {
+                        auto arg = method->arguments->at(0);
+                        if (!arg || !arg->expression) continue;
+                        
+                        // Look for hdr.srcRoutes.next pattern
+                        if (auto argMember = arg->expression->to<IR::Member>()) {
+                            if (argMember->member == "next") {
+                                // Found a stack extraction!
+                                if (auto stackAccess = argMember->expr->to<IR::Member>()) {
+                                    cstring stackName = stackAccess->member;
+                                    
+                                    // Check if already processed
+                                    if (customHeaders.count(stackName)) {
+                                        // Mark as stack (may already be marked from extractCustomHeaders)
+                                        if (!customHeaders[stackName].isStack) {
+                                            customHeaders[stackName].isStack = true;
+                                            customHeaders[stackName].maxStackSize = 10; // Default
+                                            
+                                            if (g_verbose) {
+                                                std::cerr << "    Detected stack: " << stackName 
+                                                          << " (from .next accessor)" << std::endl;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ==========================================
+// Helper methods for stack queries
+// ==========================================
+
+bool SVParser::hasHeaderStacks() const {
+    for (const auto& ch : customHeaders) {
+        if (ch.second.isStack) {
+            return true;
+        }
+    }
+    return false;
+}
+
+int SVParser::getMaxStackSize() const {
+    int maxSize = 0;
+    for (const auto& ch : customHeaders) {
+        if (ch.second.isStack && ch.second.maxStackSize > maxSize) {
+            maxSize = ch.second.maxStackSize;
+        }
+    }
+    return maxSize;
 }
 
 // ==========================================

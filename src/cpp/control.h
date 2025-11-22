@@ -34,6 +34,13 @@ struct ControlConfig {
     uint32_t ecnThreshold;
 };
 
+struct HashInfo {
+    cstring outputField;     // meta.flow_hash
+    cstring algorithm;       // crc16, crc32, xor
+    std::vector<cstring> inputFields;  // {srcAddr, dstAddr, ...}
+    int outputWidth;
+};
+
 class SVControl {
 private:
     SVProgram* program;
@@ -44,14 +51,16 @@ private:
     
     cstring controlName;
     bool isIngress;
-    bool isEgress;                    // NEW
-    bool hasEgressActions;            // NEW
+    bool isEgress;                    
+    bool hasEgressActions;
+    bool detectHashCalls();            
     
     std::map<cstring, SVTable*> svTables;
     std::map<cstring, SVAction*> svActions;
     std::map<cstring, std::set<cstring>> action_to_table;
         
     std::vector<std::pair<cstring, int>> getRequiredParsedFields();
+    std::vector<HashInfo> hashCalls;
     
     void extractTables();
     void extractActions();
@@ -73,8 +82,28 @@ public:
     bool hasStatefulOperations() const;
     
     void setIsIngress(bool value) { isIngress = value; }
+    const std::vector<HashInfo>& getHashCalls() const { return hashCalls; }
+    bool hasHashOperations() const { return !hashCalls.empty(); }
+
+     /** Get action by name */
+    SVAction* getAction(const cstring& name) const {
+        auto it = svActions.find(name);
+        return (it != svActions.end()) ? it->second : nullptr;
+    }
     
-    // NEW: Egress-related getters
+    /** Get action ID by name (index in action list) */
+    int getActionId(const cstring& name) const {
+        int actionId = 0;
+        for (const auto& actionPair : svActions) {
+            if (actionPair.first == name) {
+                return actionId;
+            }
+            actionId++;
+        }
+        return 0;  // Default to NoAction
+    }
+    
+    // Egress-related getters
     bool getIsEgress() const { return isEgress; }
     bool getHasEgressActions() const { return hasEgressActions; }
     

@@ -16,6 +16,7 @@ class SVCodeGen;
 class SVParser;
 class SVControl;
 class SVDeparser;
+class SVMetadata;
 
 class SVProgram : public FPGAObject {
 public:
@@ -29,6 +30,9 @@ public:
     SVControl* ingress;
     SVControl* egress;
     SVDeparser* deparser;
+
+    const SVMetadata* getMetadata() const { return metadata; }
+    void setMetadata(SVMetadata* m) { metadata = m; }
     
     std::map<const IR::Node*, const IR::Type*> metadata_to_table;
     std::set<cstring> reservedWords;
@@ -55,8 +59,9 @@ public:
         ingress(nullptr),
         egress(nullptr),
         deparser(nullptr),
-        parserConfig(0),
+        parserConfig(0),      
         deparserConfig(0),
+        metadata(nullptr),   
         ecnThreshold(10) {}  // Default threshold
     
     ~SVProgram();
@@ -83,6 +88,7 @@ public:
 
 private:
     void extractConstants();  // Extract P4 constants
+    SVMetadata* metadata;
 };
 
 }  // namespace SV

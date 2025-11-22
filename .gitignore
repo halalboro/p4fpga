@@ -45,6 +45,5 @@ matchtable_model.cpp
 cvc/
 bluesim/
 nfsume*/
-*.p4
 sample_input/
 sample_outputs/

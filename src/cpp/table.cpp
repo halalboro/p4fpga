@@ -58,7 +58,65 @@ bool SVTable::build() {
                   << actionNames.size() << " actions");
 #endif
     
+    // NEW: Check for const entries
+    for (auto prop : p4table->properties->properties) {
+        if (prop->name == "entries") {
+            TABLE_DEBUG("Table " << tableName << " has const entries");
+            hasConstEntries_ = true;
+            extractConstEntries(prop);
+        }
+    }
+
     return true;
+}
+
+
+void SVTable::extractConstEntries(const IR::Property* prop) {
+    auto exprList = prop->value->to<IR::ExpressionValue>();
+    if (!exprList) return;
+    
+    auto entries = exprList->expression->to<IR::ListExpression>();
+    if (!entries) return;
+    
+    for (auto entry : entries->components) {
+        auto entryExpr = entry->to<IR::Entry>();
+        if (!entryExpr) continue;
+        
+        ConstTableEntry constEntry;
+        
+        // Extract key values
+        if (auto keyTuple = entryExpr->keys->to<IR::ListExpression>()) {
+            for (auto key : keyTuple->components) {
+                if (auto constant = key->to<IR::Constant>()) {
+                    constEntry.keyValues.push_back(
+                        cstring::to_cstring(constant->value));
+                }
+            }
+        } else if (auto constant = entryExpr->keys->to<IR::Constant>()) {
+            constEntry.keyValues.push_back(
+                cstring::to_cstring(constant->value));
+        }
+        
+        // Extract action
+        if (auto actionCall = entryExpr->action->to<IR::MethodCallExpression>()) {
+            auto pathExpr = actionCall->method->to<IR::PathExpression>();
+            if (pathExpr) {
+                constEntry.actionName = pathExpr->path->name.name;
+                
+                // Extract action arguments
+                for (auto arg : *actionCall->arguments) {
+                    if (auto argConst = arg->expression->to<IR::Constant>()) {
+                        constEntry.actionArgs.push_back(
+                            cstring::to_cstring(argConst->value));
+                    }
+                }
+            }
+        }
+        
+        constEntries_.push_back(constEntry);
+        TABLE_DEBUG("  Const entry: " << constEntry.keyValues[0] 
+                      << " -> " << constEntry.actionName);
+    }
 }
 
 // ==========================================
@@ -82,8 +140,9 @@ void SVTable::extractKeys() {
                 }
                 
                 // Store field info
-                keyFields.push_back(std::make_pair(nullptr, fieldSize));
+                keyFields.push_back(std::make_pair(member->member, fieldSize)); 
                 keyWidth += fieldSize;
+                
                 
                 TABLE_TRACE("Key field: " << member->member << " (" << fieldSize << " bits)");
             }

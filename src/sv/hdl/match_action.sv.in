@@ -1,5 +1,6 @@
 module match_action #(
     parameter DATA_WIDTH = 512,
+    parameter METADATA_WIDTH = 64,
     parameter TABLE_SIZE = 1024,
     parameter ACTION_DATA_WIDTH = 128,
     parameter [7:0] ACTION_CONFIG = 8'b00000111,
@@ -10,6 +11,9 @@ module match_action #(
     input  wire                           aclk,
     input  wire                           aresetn,
     
+    input  wire [METADATA_WIDTH-1:0]  metadata_in,
+    output wire [METADATA_WIDTH-1:0]  metadata_out,
+
     // ==========================================
     // Packet Input (from Parser)
     // ==========================================
@@ -91,20 +95,29 @@ module match_action #(
     output wire [31:0]                    forwarded_count
 );
 
+    // Internal metadata bus
+    wire [METADATA_WIDTH-1:0] meta_parser;    // From parser
+    wire [METADATA_WIDTH-1:0] meta_match;     // From match
+    wire [METADATA_WIDTH-1:0] meta_action;    // From action
+
+    // ==========================================
+    // Metadata Pipeline
+    // ==========================================
+    // Pass metadata through: parser → match → action → deparser
+    assign meta_parser = metadata_in;         // From vfpga_top
+    assign metadata_out = meta_action;        // To vfpga_top 
+
     // ==========================================
     // Flow Hash Computation (for stateful)
     // ==========================================
     wire [31:0] flow_hash;
-    
-    // Simple 5-tuple hash: XOR of all fields
-    assign flow_hash = ipv4_src_addr ^ ipv4_dst_addr ^ 
-                       {16'h0, ipv4_src_port} ^ {16'h0, ipv4_dst_port} ^ 
-                       {24'h0, ipv4_protocol};
 
     // ==========================================
     // Custom Header Pass-Through Signals
     // ==========================================
     {{CUSTOM_HEADER_WIRES}}
+
+{{STACK_POINTER_SIGNALS}}
 
     // ==========================================
     // Internal signals between stages
@@ -130,13 +143,17 @@ module match_action #(
     {{CUSTOM_HEADER_PASSTHROUGH}}
 
     {{CONDITIONAL_LOGIC}}
+
+    {{HASH_INSTANTIATION}}
+
+    {{STACK_POINTER_FEEDBACK}}
     
     // ==========================================
     // Stage 1: Match Engine
     // ==========================================
     match #(
-        .MATCH_TYPE(1),
-        .KEY_WIDTH(32),
+        .MATCH_TYPE({{MATCH_TYPE}}),
+        .KEY_WIDTH({{KEY_WIDTH}}),
         .TABLE_SIZE(TABLE_SIZE),
         .ACTION_DATA_WIDTH(ACTION_DATA_WIDTH),
         .DATA_WIDTH(DATA_WIDTH)
@@ -144,10 +161,15 @@ module match_action #(
         .aclk(aclk),
         .aresetn(aresetn),
         
-        .lookup_key(ipv4_dst_addr),
-        .lookup_key_mask(32'hFFFFFFFF),
-        .lookup_valid(packet_valid_in && ipv4_valid),
+        {{TABLE_LOOKUP_LOGIC}}
         .lookup_ready(packet_ready_out),
+        
+        .ipv4_valid_in(ipv4_valid),
+        .eth_dst_addr_in(eth_dst_addr),
+        .eth_src_addr_in(eth_src_addr),
+        .ipv4_ttl_in(ipv4_ttl),
+        .ipv4_diffserv_in(ipv4_diffserv),
+        .ipv4_ecn_in(ipv4_ecn),
         
         .ipv4_valid_in(ipv4_valid),
         .eth_dst_addr_in(eth_dst_addr),
@@ -191,6 +213,7 @@ module match_action #(
     action #(
         .DATA_WIDTH(DATA_WIDTH),
         .ACTION_DATA_WIDTH(ACTION_DATA_WIDTH),
+        .METADATA_WIDTH(METADATA_WIDTH), 
         .ACTION_CONFIG(ACTION_CONFIG),
         .EGRESS_CONFIG(EGRESS_CONFIG),
         .ECN_THRESHOLD(ECN_THRESHOLD),
@@ -198,14 +221,19 @@ module match_action #(
     ) action_inst (
         .aclk(aclk),
         .aresetn(aresetn),
+
+    {{STACK_POINTER_CONNECTIONS}}
         
         .packet_in(match_packet_out),
         .packet_keep_in(match_keep_out),
         .packet_last_in(match_last_out),
         .packet_valid(match_valid),
         .packet_ready(match_ready),
+
+        .metadata_in(meta_parser),   
+        .metadata_out(meta_action), 
         
-        .action_id(match_action_id),
+        .action_id({{ACTION_ID_SIGNAL}}),
         .action_data(match_action_data),
         .action_valid(match_valid),
         

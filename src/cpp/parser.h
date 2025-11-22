@@ -1,4 +1,3 @@
-// parser.h
 #ifndef EXTENSIONS_CPP_LIBP4FPGA_INCLUDE_PARSER_H_
 #define EXTENSIONS_CPP_LIBP4FPGA_INCLUDE_PARSER_H_
 
@@ -14,7 +13,13 @@ class SVCodeGen;
 
 class SVParser {
 public:
-    
+    struct LookaheadInfo {
+        cstring state;
+        const IR::Type* type;
+        std::vector<cstring> fields;
+        size_t offset;  // Byte offset in packet
+    };
+
     // ==========================================
     // Custom Header Field Structure
     // ==========================================
@@ -22,6 +27,7 @@ public:
         cstring name;
         int width;      // Width in bits
         int offset;     // Bit offset within header
+        bool isPartOfStack = false;
         
         CustomHeaderField() : width(0), offset(0) {}
         CustomHeaderField(cstring n, int w, int o = 0) 
@@ -33,10 +39,20 @@ public:
     // Stores metadata for user-defined P4 headers
     // ==========================================
     struct CustomHeaderInfo {
-        cstring name;                                   // Header name (e.g., "myTunnel")
+        cstring name;                                   // Header name (e.g., "srcRoutes")
         std::map<cstring, CustomHeaderField> fields;    // Field name → field info
-        int totalWidth;                                 // Total header width in bits
+        int totalWidth;                                 // Total header width in bits (per element for stacks)
         int parserBit;                                  // Parser config bit position
+
+        // Stack-specific properties
+        bool isStack = false;                          // Is this a header stack?
+        int maxStackSize = 1;                          // Max elements in stack
+        cstring elementTypeName;                       // Element type (e.g., "srcRoute_t")
+        
+        // BOS (Bottom-of-Stack) field tracking
+        bool hasBosField = false;                      // Does element have BOS indicator?
+        cstring bosFieldName;                          // Which field is the BOS indicator
+        int bosFieldOffset = 0;                        // Bit offset of BOS field
         
         CustomHeaderInfo() : totalWidth(0), parserBit(-1) {}
     };
@@ -49,6 +65,19 @@ public:
         int startBit;
         int width;
         std::vector<std::pair<cstring, int>> fields;   // field name, width
+    };
+
+    // ==========================================
+    // Parser State Info (for state machine generation)
+    // ==========================================
+    struct ParserStateInfo {
+        cstring name;
+        bool isCustomState = false;
+        bool isStackParsingState = false;
+        cstring stackName;  // If stack parsing state
+        
+        std::vector<cstring> extractedHeaders;
+        std::map<cstring, cstring> transitions;  // condition → next_state
     };
     
     // ==========================================
@@ -71,7 +100,7 @@ public:
         PARSE_TCP      = 4,
         PARSE_UDP      = 5,
         PARSE_VXLAN    = 6,
-        PARSE_CUSTOM   = 7
+        PARSE_CUSTOM   = 7  // Custom headers start at bit 7
     };
     
     // ==========================================
@@ -97,6 +126,8 @@ public:
     std::string getParserConfigString() const;
     
     void printSummary() const;
+
+    void detectHeaderStacksFromParser();
     
     /** Get header parsing sequence */
     const std::vector<HeaderInfo>& getHeaderSequence() const { 
@@ -110,6 +141,17 @@ public:
     const std::map<cstring, CustomHeaderInfo>& getCustomHeaders() const {
         return customHeaders;
     }
+
+    std::vector<LookaheadInfo> lookaheads;
+    
+    void handleLookahead(const IR::MethodCallExpression* lookahead,
+                        const IR::ParserState* state);
+    std::vector<cstring> extractLookaheadFields(
+        const IR::MethodCallExpression* lookahead);
+
+    // Stack-related methods
+    bool hasHeaderStacks() const;
+    int getMaxStackSize() const;  // Largest stack size in program
 
 private:
     // ==========================================
@@ -145,6 +187,36 @@ private:
     void extractParserConfiguration();  
     void extractCustomHeaders();
     bool isStandardHeader(const cstring& name) const;
+};
+
+class SVMetadata {
+public:
+    struct MetadataField {
+        cstring name;
+        unsigned width;
+        unsigned offset;  // Bit offset in metadata bus
+    };
+    
+    std::map<cstring, MetadataField> fields;
+    unsigned totalWidth = 0;
+    
+    bool build(const IR::Type_Struct* metaStruct) {
+        unsigned offset = 0;
+        for (auto field : metaStruct->fields) {
+            auto type = field->type->to<IR::Type_Bits>();
+            if (!type) continue;
+            
+            MetadataField mf;
+            mf.name = field->name;
+            mf.width = type->width_bits();
+            mf.offset = offset;
+            
+            fields[field->name] = mf;
+            offset += mf.width;
+        }
+        totalWidth = offset;
+        return true;
+    }
 };
 
 } // namespace SV

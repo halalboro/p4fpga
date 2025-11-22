@@ -9,6 +9,7 @@ module action #(
     // ==========================================
     parameter DATA_WIDTH = 512,
     parameter ACTION_DATA_WIDTH = 128,
+    parameter METADATA_WIDTH = 64,
     
     // Action configuration bitmask
     // [0] = FORWARD
@@ -35,7 +36,11 @@ module action #(
     parameter [18:0] ECN_THRESHOLD = 19'd10
 ) (
     input  wire                           aclk,
-    input  wire                           aresetn,
+    input  wire                           aresetn,\
+    
+
+{{STACK_POINTER_INPUTS}}      
+{{STACK_POINTER_OUTPUTS}}     
     
     // ==========================================
     // Packet Input
@@ -46,6 +51,12 @@ module action #(
     input  wire                           packet_valid,
     output reg                            packet_ready,
     
+    // ==========================================
+    // Metadata Input/Output
+    // ==========================================
+    input  wire [METADATA_WIDTH-1:0]      metadata_in,
+    output reg  [METADATA_WIDTH-1:0]      metadata_out,
+
     // ==========================================
     // Action Control
     // ==========================================
@@ -111,6 +122,7 @@ module action #(
     localparam ACTION_CHECK_STATE   = 3'd6;
     localparam ACTION_UPDATE_STATE  = 3'd7;
     localparam ACTION_SET_FIELD     = 3'd8;
+    localparam ACTION_HASH_COMPUTE = 3'd9;
     
     // ==========================================
     // Configuration Bits
@@ -128,6 +140,7 @@ module action #(
     localparam ENABLE_ECN_MARKING   = EGRESS_CONFIG[1];
     localparam ENABLE_STATEFUL      = EGRESS_CONFIG[2];
     localparam ENABLE_MIRRORING     = EGRESS_CONFIG[3];
+
     
     // ==========================================
     // Internal Signals
@@ -135,6 +148,7 @@ module action #(
     reg [DATA_WIDTH-1:0] ingress_packet;  // After ingress processing
     reg [DATA_WIDTH-1:0] egress_packet;   // After egress processing
     reg [1:0]            ecn_bits;        // ECN field working copy
+    reg [METADATA_WIDTH-1:0] metadata_reg;  // Metadata working copy
     
     // ==========================================
     // Stateful Register Array
@@ -204,12 +218,16 @@ module action #(
             ipv4_diffserv_out <= 6'b0;
             ipv4_ecn_out      <= 2'b0;
             ipv4_ttl_out      <= 8'b0;
+            metadata_out      <= '0;
             
             if (ENABLE_STATEFUL) begin
                 gen_stateful.reg_addr         <= '0;
                 gen_stateful.reg_write_data   <= '0;
                 gen_stateful.reg_write_enable <= 1'b0;
             end
+
+            {{STACK_POINTER_RESET_OUT}}
+
         end else if (packet_ready) begin
             packet_out_valid  <= packet_valid && action_valid;
             packet_keep_out   <= packet_keep_in;
@@ -219,6 +237,9 @@ module action #(
             ipv4_diffserv_out <= ipv4_diffserv_in;
             ipv4_ecn_out      <= ipv4_ecn_in;
             ipv4_ttl_out      <= ipv4_ttl;
+        
+            // Default metadata pass-through
+            metadata_reg      <= metadata_in;
             
             // Default: no register write
             if (ENABLE_STATEFUL) begin
@@ -237,6 +258,8 @@ module action #(
                 header_modified = 1'b0;
                 
                 case (action_id)
+                {{STACK_POINTER_LOGIC_INOUT}}
+
                     // ==========================================
                     // FORWARD Action
                     // ==========================================
@@ -341,14 +364,17 @@ module action #(
                     end
                     
                     // ==========================================
-                    // HASH_SELECT Action (for load balancing)
+                    // HASH_COMPUTE Action (for load balancing)
                     // ==========================================
-                    ACTION_HASH_SELECT: begin
+                    ACTION_HASH_COMPUTE: begin
                         if (ENABLE_HASH) begin
+                            // Write hash to metadata[31:0] (first 32 bits)
+                            metadata_reg[31:0] = flow_hash;
+                            
                             // Use hash to select egress port
-                            automatic logic [31:0] hash_val;
-                            hash_val = ipv4_src_addr ^ ipv4_dst_addr;
-                            egress_port = hash_val[8:0];
+                            egress_port = flow_hash[8:0];  // Bottom 9 bits
+                            
+                            drop = 1'b0;
                             header_modified = 1'b0;
                         end
                     end
@@ -391,7 +417,7 @@ module action #(
                             egress_port = 9'd0;  // No egress port change
                         end
                     end
-                    
+
                     default: begin
                         // Unknown action: drop for safety
                         drop = 1'b1;
@@ -437,8 +463,228 @@ module action #(
                 
                 // Output final packet
                 packet_out = egress_packet;
+                metadata_out = metadata_reg;
             end
         end
     end
+
+endmodule
+
+// hash.sv
+// Hardware hash computation module
+// Supports CRC16, CRC32, and XOR hashing for load balancing and flow identification
+
+module hash #(
+    parameter HASH_TYPE = 0,     // 0=CRC16, 1=CRC32, 2=XOR
+    parameter INPUT_WIDTH = 104, // 5-tuple = 104 bits (default)
+    parameter OUTPUT_WIDTH = 16  // Output hash width
+) (
+    input  wire                        aclk,
+    input  wire                        aresetn,
+    
+    // Input data interface
+    input  wire [INPUT_WIDTH-1:0]      data_in,
+    input  wire                        valid_in,
+    output wire                        ready_out,
+    
+    // Output hash interface
+    output reg  [OUTPUT_WIDTH-1:0]     hash_out,
+    output reg                         valid_out
+);
+
+    // ==========================================
+    // CRC Polynomials
+    // ==========================================
+    // CRC16-CCITT: x^16 + x^12 + x^5 + 1
+    localparam [15:0] CRC16_POLY = 16'h1021;
+    
+    // CRC32-Ethernet: x^32 + x^26 + x^23 + ... + x^2 + x + 1
+    localparam [31:0] CRC32_POLY = 32'h04C11DB7;
+    
+    // ==========================================
+    // Hash Type Generation
+    // ==========================================
+    generate
+        // ==========================================
+        // CRC16 Hash (Optimized for Synthesis)
+        // ==========================================
+        if (HASH_TYPE == 0) begin : gen_crc16
+            
+            // Internal CRC register
+            reg [15:0] crc_reg;
+            
+            // Sequential CRC computation
+            always_ff @(posedge aclk) begin
+                if (!aresetn) begin
+                    crc_reg   <= 16'hFFFF;
+                    hash_out  <= {OUTPUT_WIDTH{1'b0}};
+                    valid_out <= 1'b0;
+                end else if (valid_in) begin
+                    // Compute CRC in one cycle using function
+                    crc_reg   <= compute_crc16(data_in);
+                    hash_out  <= compute_crc16(data_in)[OUTPUT_WIDTH-1:0];
+                    valid_out <= 1'b1;
+                end else begin
+                    valid_out <= 1'b0;
+                end
+            end
+            
+            // ==========================================
+            // CRC16 Computation Function (Byte-wise)
+            // Processes 8 bits at a time for better timing
+            // ==========================================
+            function [15:0] compute_crc16(input [INPUT_WIDTH-1:0] data);
+                reg [15:0] crc;
+                reg [15:0] crc_next;
+                reg [7:0] data_byte;
+                integer byte_idx, bit_idx;
+                integer num_bytes;
+                begin
+                    // Initialize CRC
+                    crc = 16'hFFFF;
+                    num_bytes = (INPUT_WIDTH + 7) / 8;
+                    
+                    // Process each byte
+                    for (byte_idx = 0; byte_idx < num_bytes; byte_idx = byte_idx + 1) begin
+                        // Extract byte (handle partial last byte)
+                        if ((byte_idx + 1) * 8 <= INPUT_WIDTH) begin
+                            data_byte = data[byte_idx*8 +: 8];
+                        end else begin
+                            // Last partial byte - pad with zeros
+                            data_byte = {data[INPUT_WIDTH-1 : byte_idx*8], 
+                                       {(8-(INPUT_WIDTH % 8)){1'b0}}};
+                        end
+                        
+                        // XOR byte into CRC
+                        crc_next = crc ^ {data_byte, 8'h00};
+                        
+                        // Process each bit using polynomial division
+                        for (bit_idx = 0; bit_idx < 8; bit_idx = bit_idx + 1) begin
+                            if (crc_next[15]) begin
+                                crc_next = {crc_next[14:0], 1'b0} ^ CRC16_POLY;
+                            end else begin
+                                crc_next = {crc_next[14:0], 1'b0};
+                            end
+                        end
+                        
+                        crc = crc_next;
+                    end
+                    
+                    compute_crc16 = ~crc;  // Final XOR (standard practice)
+                end
+            endfunction
+            
+        // ==========================================
+        // CRC32 Hash (Optimized for Synthesis)
+        // ==========================================
+        end else if (HASH_TYPE == 1) begin : gen_crc32
+            
+            // Internal CRC register
+            reg [31:0] crc_reg;
+            
+            // Sequential CRC computation
+            always_ff @(posedge aclk) begin
+                if (!aresetn) begin
+                    crc_reg   <= 32'hFFFFFFFF;
+                    hash_out  <= {OUTPUT_WIDTH{1'b0}};
+                    valid_out <= 1'b0;
+                end else if (valid_in) begin
+                    // Compute CRC in one cycle using function
+                    crc_reg   <= compute_crc32(data_in);
+                    hash_out  <= compute_crc32(data_in)[OUTPUT_WIDTH-1:0];
+                    valid_out <= 1'b1;
+                end else begin
+                    valid_out <= 1'b0;
+                end
+            end
+            
+            // ==========================================
+            // CRC32 Computation Function (Byte-wise)
+            // ==========================================
+            function [31:0] compute_crc32(input [INPUT_WIDTH-1:0] data);
+                reg [31:0] crc;
+                reg [31:0] crc_next;
+                reg [7:0] data_byte;
+                integer byte_idx, bit_idx;
+                integer num_bytes;
+                begin
+                    // Initialize CRC
+                    crc = 32'hFFFFFFFF;
+                    num_bytes = (INPUT_WIDTH + 7) / 8;
+                    
+                    // Process each byte
+                    for (byte_idx = 0; byte_idx < num_bytes; byte_idx = byte_idx + 1) begin
+                        // Extract byte (handle partial last byte)
+                        if ((byte_idx + 1) * 8 <= INPUT_WIDTH) begin
+                            data_byte = data[byte_idx*8 +: 8];
+                        end else begin
+                            // Last partial byte - pad with zeros
+                            data_byte = {data[INPUT_WIDTH-1 : byte_idx*8], 
+                                       {(8-(INPUT_WIDTH % 8)){1'b0}}};
+                        end
+                        
+                        // XOR byte into CRC (reflected input)
+                        crc_next = crc ^ {24'h000000, data_byte};
+                        
+                        // Process each bit using polynomial division
+                        for (bit_idx = 0; bit_idx < 8; bit_idx = bit_idx + 1) begin
+                            if (crc_next[0]) begin
+                                crc_next = {1'b0, crc_next[31:1]} ^ CRC32_POLY;
+                            end else begin
+                                crc_next = {1'b0, crc_next[31:1]};
+                            end
+                        end
+                        
+                        crc = crc_next;
+                    end
+                    
+                    compute_crc32 = ~crc;  // Final XOR
+                end
+            endfunction
+            
+        // ==========================================
+        // XOR Hash (Simplest, Fastest)
+        // ==========================================
+        end else begin : gen_xor
+            
+            // Sequential XOR computation
+            always_ff @(posedge aclk) begin
+                if (!aresetn) begin
+                    hash_out  <= {OUTPUT_WIDTH{1'b0}};
+                    valid_out <= 1'b0;
+                end else if (valid_in) begin
+                    hash_out  <= xor_reduce(data_in);
+                    valid_out <= 1'b1;
+                end else begin
+                    valid_out <= 1'b0;
+                end
+            end
+            
+            // ==========================================
+            // XOR Reduction Function
+            // Folds all input bits into OUTPUT_WIDTH bits
+            // ==========================================
+            function [OUTPUT_WIDTH-1:0] xor_reduce(input [INPUT_WIDTH-1:0] data);
+                reg [OUTPUT_WIDTH-1:0] result;
+                integer i;
+                begin
+                    result = {OUTPUT_WIDTH{1'b0}};
+                    
+                    // XOR all input bits into output width buckets
+                    for (i = 0; i < INPUT_WIDTH; i = i + 1) begin
+                        result[i % OUTPUT_WIDTH] = result[i % OUTPUT_WIDTH] ^ data[i];
+                    end
+                    
+                    xor_reduce = result;
+                end
+            endfunction
+            
+        end
+    endgenerate
+    
+    // ==========================================
+    // Always ready (single-cycle operation)
+    // ==========================================
+    assign ready_out = 1'b1;
 
 endmodule

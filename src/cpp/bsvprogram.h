@@ -1,4 +1,3 @@
-// codegen.h
 #ifndef P4FPGA_CODEGEN_H
 #define P4FPGA_CODEGEN_H
 
@@ -64,17 +63,18 @@ public:
     std::string generateCustomHeaderClear(const SVParser* parser);
     std::string generateCustomHeaderEthertypeCheck(const SVParser* parser);
     std::string generateCustomHeaderState(const SVParser* parser);
+    std::string generateCustomHeaderInternalSignals(const SVParser* parser);
     
     // ==========================================
-    // Deparser Code Generators 
+    // Deparser Code Generators
     // ==========================================
     std::string generateCustomHeaderInputs(const SVParser* parser);
     std::string generateCustomHeaderEmit(const SVParser* parser);
     std::string generateCustomHeaderBuildLogic(const SVParser* parser);
+    std::string generateDeparserStackPointerInputs(const SVParser* parser);
     
     // ==========================================
-    // Top Code Generators 
-    // CHANGED: All now use const SVParser*
+    // Top Code Generators
     // ==========================================
     std::string generateCustomHeaderSignals(const SVParser* parser);
     std::string generateCustomHeaderPipelineSignals(const SVParser* parser);
@@ -82,6 +82,13 @@ public:
     std::string generatePipelineCustomHeaderInputs(const SVParser* parser);
     std::string generatePipelineCustomHeaderOutputs(const SVParser* parser);
     std::string generateDeparserCustomHeaderPorts(const SVParser* parser);
+
+    // Stack operation generators
+    std::string generateStackPointerSignals(const SVParser* parser);
+    std::string generateStackPointerLogic(
+        const std::map<cstring, SVAction*>& actions,
+        const std::map<int, cstring>& actionIdMap
+    );
     
     // ==========================================
     // Utility Methods

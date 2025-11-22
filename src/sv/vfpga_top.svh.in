@@ -43,6 +43,8 @@ logic [15:0]                 udp_dst_port;
 
 {{CUSTOM_HEADER_SIGNALS}}
 
+{{STACK_POINTER_WIRES}}
+
 logic [AXI_DATA_BITS-1:0]    parser_payload_data;
 logic [AXI_DATA_BITS/8-1:0]  parser_payload_keep;
 logic                        parser_payload_valid;
@@ -79,6 +81,8 @@ logic [15:0]                 pipeline_udp_src_port;
 logic [15:0]                 pipeline_udp_dst_port;
 
 {{CUSTOM_HEADER_PIPELINE_SIGNALS}}
+
+{{METADATA_SIGNALS}}
 
 // Pipeline control signals
 logic                        pipeline_valid;
@@ -240,6 +244,7 @@ end
 // ============================================
 match_action #(
     .DATA_WIDTH(AXI_DATA_BITS),
+    .METADATA_WIDTH({{METADATA_WIDTH}}),
     .TABLE_SIZE(1024),
     .ACTION_DATA_WIDTH(128),
     .ACTION_CONFIG(8'b00000111),
@@ -248,6 +253,10 @@ match_action #(
 ) match_action_inst (
     .aclk(aclk),
     .aresetn(aresetn),
+    .metadata_in({{METADATA_IN}}),   
+    .metadata_out({{METADATA_OUT}}),
+
+{{MATCH_ACTION_STACK_POINTER_PORTS}}
     
     // Packet input from parser
     .packet_in(parser_payload_data),
@@ -405,6 +414,8 @@ deparser #(
     .vxlan_valid(1'b0),
     
 {{DEPARSER_CUSTOM_HEADER_PORTS}}
+
+{{DEPARSER_STACK_POINTER_PORTS}}
     
     // Payload input from pipeline
     .s_axis_tdata(pipeline_data),
