@@ -6,13 +6,13 @@ module match_action #(
     parameter [7:0] ACTION_CONFIG = 8'b00000111,
     parameter [7:0] EGRESS_CONFIG = 8'b00000000,
     parameter [18:0] ECN_THRESHOLD = 19'd10,
-    parameter NUM_REGISTERS = 1024           // For stateful processing
+    parameter NUM_REGISTERS = 1024
 ) (
     input  wire                           aclk,
     input  wire                           aresetn,
     
-    input  wire [METADATA_WIDTH-1:0]  metadata_in,
-    output wire [METADATA_WIDTH-1:0]  metadata_out,
+    input  wire [METADATA_WIDTH-1:0]      metadata_in,
+    output wire [METADATA_WIDTH-1:0]      metadata_out,
 
     // ==========================================
     // Packet Input (from Parser)
@@ -40,12 +40,17 @@ module match_action #(
     // ==========================================
     // Custom Header Inputs (from Parser)
     // ==========================================
-    {{CUSTOM_HEADER_INPUTS}}
+{{CUSTOM_HEADER_INPUTS}}
     
     // ==========================================
-    // Egress Control (for ECN)
+    // Egress Control
     // ==========================================
     input  wire [18:0]                    enq_qdepth,
+    input  wire [8:0]                     egress_port_id,
+    
+    // Probe header (for link_monitor)
+    input  wire                           probe_valid,
+    input  wire [7:0]                     probe_hop_cnt,
     
     // ==========================================
     // Packet Output (to Deparser)
@@ -59,7 +64,7 @@ module match_action #(
     // ==========================================
     // Custom Header Outputs (to Deparser)
     // ==========================================
-    {{CUSTOM_HEADER_OUTPUTS}}
+{{CUSTOM_HEADER_OUTPUTS}}
     
     // ==========================================
     // Modified Header Outputs (to Deparser)
@@ -75,6 +80,17 @@ module match_action #(
     output wire [8:0]                     egress_port,
     output wire                           header_modified,
     output wire                           ecn_marked,
+
+    // ==========================================
+    // Egress Probe Data Outputs
+    // ==========================================
+    output wire                           out_probe_data_valid,
+    output wire [6:0]                     out_probe_data_swid,
+    output wire [7:0]                     out_probe_data_port,
+    output wire [31:0]                    out_probe_data_byte_cnt,
+    output wire [47:0]                    out_probe_data_last_time,
+    output wire [47:0]                    out_probe_data_cur_time,
+    output wire                           out_probe_data_bos,
     
     // ==========================================
     // Table Programming (AXI-Lite Control)
@@ -96,26 +112,19 @@ module match_action #(
 );
 
     // Internal metadata bus
-    wire [METADATA_WIDTH-1:0] meta_parser;    // From parser
-    wire [METADATA_WIDTH-1:0] meta_match;     // From match
-    wire [METADATA_WIDTH-1:0] meta_action;    // From action
+    wire [METADATA_WIDTH-1:0] meta_parser;
+    wire [METADATA_WIDTH-1:0] meta_action;
 
-    // ==========================================
-    // Metadata Pipeline
-    // ==========================================
-    // Pass metadata through: parser → match → action → deparser
-    assign meta_parser = metadata_in;         // From vfpga_top
-    assign metadata_out = meta_action;        // To vfpga_top 
+    assign meta_parser = metadata_in;
+    assign metadata_out = meta_action;
 
-    // ==========================================
-    // Flow Hash Computation (for stateful)
-    // ==========================================
+    // Flow Hash
     wire [31:0] flow_hash;
 
     // ==========================================
     // Custom Header Pass-Through Signals
     // ==========================================
-    {{CUSTOM_HEADER_WIRES}}
+{{CUSTOM_HEADER_WIRES}}
 
 {{STACK_POINTER_SIGNALS}}
 
@@ -137,16 +146,13 @@ module match_action #(
     wire [5:0]                     match_ipv4_diffserv;
     wire [1:0]                     match_ipv4_ecn;
     
-    // ==========================================
-    // Custom Header Pass-Through (Parser → Action → Deparser)
-    // ==========================================
-    {{CUSTOM_HEADER_PASSTHROUGH}}
+{{CUSTOM_HEADER_PASSTHROUGH}}
 
-    {{CONDITIONAL_LOGIC}}
+{{CONDITIONAL_LOGIC}}
 
-    {{HASH_INSTANTIATION}}
+{{HASH_INSTANTIATION}}
 
-    {{STACK_POINTER_FEEDBACK}}
+{{STACK_POINTER_FEEDBACK}}
     
     // ==========================================
     // Stage 1: Match Engine
@@ -163,13 +169,6 @@ module match_action #(
         
         {{TABLE_LOOKUP_LOGIC}}
         .lookup_ready(packet_ready_out),
-        
-        .ipv4_valid_in(ipv4_valid),
-        .eth_dst_addr_in(eth_dst_addr),
-        .eth_src_addr_in(eth_src_addr),
-        .ipv4_ttl_in(ipv4_ttl),
-        .ipv4_diffserv_in(ipv4_diffserv),
-        .ipv4_ecn_in(ipv4_ecn),
         
         .ipv4_valid_in(ipv4_valid),
         .eth_dst_addr_in(eth_dst_addr),
@@ -222,7 +221,7 @@ module match_action #(
         .aclk(aclk),
         .aresetn(aresetn),
 
-    {{STACK_POINTER_CONNECTIONS}}
+{{STACK_POINTER_CONNECTIONS}}
         
         .packet_in(match_packet_out),
         .packet_keep_in(match_keep_out),
@@ -250,6 +249,10 @@ module match_action #(
         .ipv4_ecn_in(match_ipv4_ecn),
         .flow_hash(flow_hash),
         .enq_qdepth(enq_qdepth),
+        .egress_port_id(egress_port_id),
+        .packet_length_in(packet_length),
+        .probe_valid(probe_valid),
+        .probe_hop_cnt(probe_hop_cnt),
         
         .packet_out(packet_out),
         .packet_keep_out(packet_keep_out),
@@ -263,11 +266,24 @@ module match_action #(
         .ecn_marked(ecn_marked),
         .ipv4_diffserv_out(out_ipv4_diffserv),
         .ipv4_ecn_out(out_ipv4_ecn),
-        .ipv4_ttl_out(out_ipv4_ttl)
+        .ipv4_ttl_out(out_ipv4_ttl),
+        
+        .out_probe_data_valid(out_probe_data_valid),
+        .out_probe_data_swid(out_probe_data_swid),
+        .out_probe_data_port(out_probe_data_port),
+        .out_probe_data_byte_cnt(out_probe_data_byte_cnt),
+        .out_probe_data_last_time(out_probe_data_last_time),
+        .out_probe_data_cur_time(out_probe_data_cur_time),
+        .out_probe_data_bos(out_probe_data_bos),
+        
+        .egress_table_write_enable(1'b0),
+        .egress_table_write_addr(4'd0),
+        .egress_table_entry_action(3'd0),
+        .egress_table_entry_data(64'd0)
     );
     
     // ==========================================
-    // Stage 3: Stats Engine (Sidecar)
+    // Stage 3: Stats Engine
     // ==========================================
     stats #(
         .NUM_PORTS(16),

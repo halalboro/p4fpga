@@ -70,6 +70,7 @@ bool SVControl::build() {
     
     extractTables();
     extractActions();
+    extractRegisters(); 
     detectHashCalls();
     
     // Detect egress actions
@@ -166,6 +167,56 @@ void SVControl::extractActions() {
     
     CONTROL_TRACE("Extracted " << svActions.size() << " actions");
 }
+
+void SVControl::extractRegisters() {
+    if (!p4control) return;
+    
+    CONTROL_TRACE("Extracting registers");
+    
+    for (auto decl : p4control->controlLocals) {
+        if (auto declInstance = decl->to<IR::Declaration_Instance>()) {
+            std::string typeName = declInstance->type->toString().string();
+            
+            if (typeName.find("register") != std::string::npos ||
+                typeName.find("Register") != std::string::npos) {
+                
+                RegisterInfo regInfo;
+                regInfo.name = declInstance->name;
+                
+                // Parse register<T>(size)
+                if (auto specialized = declInstance->type->to<IR::Type_Specialized>()) {
+                    if (specialized->arguments && specialized->arguments->size() > 0) {
+                        auto elementType = specialized->arguments->at(0);
+                        regInfo.elementType = elementType->toString();
+                        
+                        if (auto bits = elementType->to<IR::Type_Bits>()) {
+                            regInfo.elementWidth = bits->size;
+                        }
+                    }
+                }
+                
+                // Get array size from constructor args
+                if (declInstance->arguments && declInstance->arguments->size() > 0) {
+                    auto sizeArg = declInstance->arguments->at(0);
+                    if (auto constant = sizeArg->expression->to<IR::Constant>()) {
+                        regInfo.arraySize = constant->asInt();
+                    } else if (auto path = sizeArg->expression->to<IR::PathExpression>()) {
+                        std::string constName = path->path->name.string();
+                        if (constName == "MAX_PORTS") regInfo.arraySize = 8;
+                        else if (constName == "MAX_HOPS") regInfo.arraySize = 10;
+                        else regInfo.arraySize = 256;
+                    }
+                }
+                
+                registers.push_back(regInfo);
+                CONTROL_DEBUG("Found register: " << regInfo.name 
+                             << " [" << regInfo.elementWidth << " bits x " 
+                             << regInfo.arraySize << "]");
+            }
+        }
+    }
+}
+
 
 // ==========================================
 // Extract Configuration
@@ -279,6 +330,8 @@ ControlConfig SVControl::extractConfiguration() {
 // ==========================================
 
 bool SVControl::hasStatefulOperations() const {
+    if (!registers.empty()) return true;
+    
     if (!p4control) return false;
     
     CONTROL_TRACE("Checking for stateful operations");

@@ -17,6 +17,7 @@ private:
     
     bool processMatchActionTemplate(SVProgram* program, const std::string& outputDir);
     bool processActionTemplate(SVProgram* program, const std::string& outputDir);
+    bool processEgressTemplate(SVProgram* program, const std::string& outputDir);
     
 public:
     Backend(P4::ReferenceMap* rm, P4::TypeMap* tm) :

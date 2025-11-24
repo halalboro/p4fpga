@@ -1,8 +1,3 @@
-// action.sv
-// Generic action execution engine
-// Supports multiple action types via configuration
-// Added stateful register support for connection tracking
-
 module action #(
     // ==========================================
     // Configuration Parameters
@@ -26,18 +21,28 @@ module action #(
     // [1] = ENABLE_ECN_MARKING
     // [2] = ENABLE_STATEFUL (registers/counters)
     // [3] = ENABLE_MIRRORING
+    // [4] = ENABLE_EGRESS_TABLE
+    // [5] = ENABLE_PUSH_FRONT
     parameter [7:0] EGRESS_CONFIG = 8'b00000000,  // Disabled by default
     
     // Stateful configuration
     parameter NUM_REGISTERS = 1024,               // Number of stateful registers
     parameter REGISTER_WIDTH = 32,                // Width of each register
     
+    // Egress register configuration
+    parameter NUM_EGRESS_REGISTERS = 8,           // Per-port registers (MAX_PORTS)
+    parameter EGRESS_REG_WIDTH = 32,              // Width of egress registers
+    parameter TIME_WIDTH = 48,                    // Timestamp width
+    
     // ECN threshold (queue depth)
-    parameter [18:0] ECN_THRESHOLD = 19'd10
+    parameter [18:0] ECN_THRESHOLD = 19'd10,
+    
+    // Egress table configuration
+    parameter EGRESS_TABLE_SIZE = 16,
+    parameter EGRESS_ACTION_DATA_WIDTH = 64
 ) (
     input  wire                           aclk,
-    input  wire                           aresetn,\
-    
+    input  wire                           aresetn,
 
 {{STACK_POINTER_INPUTS}}      
 {{STACK_POINTER_OUTPUTS}}     
@@ -58,14 +63,14 @@ module action #(
     output reg  [METADATA_WIDTH-1:0]      metadata_out,
 
     // ==========================================
-    // Action Control
+    // Action Control (Ingress)
     // ==========================================
-    input  wire [2:0]                     action_id,
+    input  wire [3:0]                     action_id,
     input  wire [ACTION_DATA_WIDTH-1:0]   action_data,
     input  wire                           action_valid,
     
     // ==========================================
-    // Ingress Header Fields (from match engine - PRESERVED)
+    // Ingress Header Fields (from match engine)
     // ==========================================
     input  wire                           ipv4_valid,
     input  wire [47:0]                    eth_dst_addr,
@@ -73,21 +78,29 @@ module action #(
     input  wire [7:0]                     ipv4_ttl,
     input  wire [31:0]                    ipv4_src_addr,
     input  wire [31:0]                    ipv4_dst_addr,
-    input  wire [15:0]                    ipv4_src_port,    // TCP/UDP src port
-    input  wire [15:0]                    ipv4_dst_port,    // TCP/UDP dst port
-    input  wire [7:0]                     ipv4_protocol,    // Protocol (TCP/UDP)
+    input  wire [15:0]                    ipv4_src_port,
+    input  wire [15:0]                    ipv4_dst_port,
+    input  wire [7:0]                     ipv4_protocol,
     input  wire [5:0]                     ipv4_diffserv_in,
     input  wire [1:0]                     ipv4_ecn_in,
     
     // ==========================================
     // Hash Input (for stateful indexing)
     // ==========================================
-    input  wire [31:0]                    flow_hash,        // 5-tuple hash
+    input  wire [31:0]                    flow_hash,
     
     // ==========================================
-    // Egress Control Inputs (for egress processing)
+    // Egress Control Inputs
     // ==========================================
-    input  wire [18:0]                    enq_qdepth,       // Queue depth
+    input  wire [18:0]                    enq_qdepth,
+    
+    // Standard Metadata for Egress
+    input  wire [8:0]                     egress_port_id,
+    input  wire [15:0]                    packet_length_in,
+    
+    // Probe header valid (for link_monitor)
+    input  wire                           probe_valid,
+    input  wire [7:0]                     probe_hop_cnt,
     
     // ==========================================
     // Packet Output
@@ -107,22 +120,41 @@ module action #(
     output reg                            ecn_marked,
     output reg  [5:0]                     ipv4_diffserv_out,
     output reg  [1:0]                     ipv4_ecn_out,
-    output reg  [7:0]                     ipv4_ttl_out
+    output reg  [7:0]                     ipv4_ttl_out,
+    
+    // Egress-modified probe_data fields
+    output reg                            out_probe_data_valid,
+    output reg  [6:0]                     out_probe_data_swid,
+    output reg  [7:0]                     out_probe_data_port,
+    output reg  [31:0]                    out_probe_data_byte_cnt,
+    output reg  [TIME_WIDTH-1:0]          out_probe_data_last_time,
+    output reg  [TIME_WIDTH-1:0]          out_probe_data_cur_time,
+    output reg                            out_probe_data_bos,
+    
+    // Egress table programming
+    input  wire                           egress_table_write_enable,
+    input  wire [$clog2(EGRESS_TABLE_SIZE)-1:0] egress_table_write_addr,
+    input  wire [2:0]                     egress_table_entry_action,
+    input  wire [EGRESS_ACTION_DATA_WIDTH-1:0] egress_table_entry_data
 );
 
     // ==========================================
-    // Action ID Definitions
+    // Action ID Definitions (Ingress)
     // ==========================================
-    localparam ACTION_FORWARD       = 3'd0;
-    localparam ACTION_DROP          = 3'd1;
-    localparam ACTION_NOACTION      = 3'd2;
-    localparam ACTION_ENCAP         = 3'd3;
-    localparam ACTION_DECAP         = 3'd4;
-    localparam ACTION_HASH_SELECT   = 3'd5;
-    localparam ACTION_CHECK_STATE   = 3'd6;
-    localparam ACTION_UPDATE_STATE  = 3'd7;
-    localparam ACTION_SET_FIELD     = 3'd8;
-    localparam ACTION_HASH_COMPUTE = 3'd9;
+    localparam ACTION_FORWARD       = 4'd0;
+    localparam ACTION_DROP          = 4'd1;
+    localparam ACTION_NOACTION      = 4'd2;
+    localparam ACTION_ENCAP         = 4'd3;
+    localparam ACTION_DECAP         = 4'd4;
+    localparam ACTION_HASH_SELECT   = 4'd5;
+    localparam ACTION_CHECK_STATE   = 4'd6;
+    localparam ACTION_UPDATE_STATE  = 4'd7;
+    localparam ACTION_SET_FIELD     = 4'd8;
+    localparam ACTION_HASH_COMPUTE  = 4'd9;
+    
+    // Egress Action IDs
+    localparam EGRESS_ACTION_NOACTION  = 3'd0;
+    localparam EGRESS_ACTION_SET_SWID  = 3'd1;
     
     // ==========================================
     // Configuration Bits
@@ -140,58 +172,179 @@ module action #(
     localparam ENABLE_ECN_MARKING   = EGRESS_CONFIG[1];
     localparam ENABLE_STATEFUL      = EGRESS_CONFIG[2];
     localparam ENABLE_MIRRORING     = EGRESS_CONFIG[3];
+    localparam ENABLE_EGRESS_TABLE  = EGRESS_CONFIG[4];
+    localparam ENABLE_PUSH_FRONT    = EGRESS_CONFIG[5];
 
+    // ==========================================
+    // Internal Timestamp Counter
+    // ==========================================
+    reg [TIME_WIDTH-1:0] global_timestamp;
     
+    always_ff @(posedge aclk or negedge aresetn) begin
+        if (!aresetn)
+            global_timestamp <= {TIME_WIDTH{1'b0}};
+        else
+            global_timestamp <= global_timestamp + 1;
+    end
+
     // ==========================================
     // Internal Signals
     // ==========================================
-    reg [DATA_WIDTH-1:0] ingress_packet;  // After ingress processing
-    reg [DATA_WIDTH-1:0] egress_packet;   // After egress processing
-    reg [1:0]            ecn_bits;        // ECN field working copy
-    reg [METADATA_WIDTH-1:0] metadata_reg;  // Metadata working copy
+    reg [DATA_WIDTH-1:0]     ingress_packet;
+    reg [DATA_WIDTH-1:0]     egress_packet;
+    reg [1:0]                ecn_bits;
+    reg [METADATA_WIDTH-1:0] metadata_reg;
     
     // ==========================================
-    // Stateful Register Array
+    // Ingress Stateful Register Interface Signals
+    // ==========================================
+    reg  [$clog2(NUM_REGISTERS)-1:0] stateful_reg_addr_in;
+    reg  [REGISTER_WIDTH-1:0]        stateful_reg_write_data_in;
+    reg                              stateful_reg_write_en_in;
+    wire [REGISTER_WIDTH-1:0]        stateful_reg_read_data_out;
+    
+    // ==========================================
+    // Egress Register Interface Signals
+    // ==========================================
+    reg  [$clog2(NUM_EGRESS_REGISTERS)-1:0] egress_reg_index_in;
+    reg  [EGRESS_REG_WIDTH-1:0]             byte_cnt_write_data_in;
+    reg                                     byte_cnt_write_en_in;
+    reg  [TIME_WIDTH-1:0]                   last_time_write_data_in;
+    reg                                     last_time_write_en_in;
+    wire [EGRESS_REG_WIDTH-1:0]             byte_cnt_read_out;
+    wire [TIME_WIDTH-1:0]                   last_time_read_out;
+    
+    // ==========================================
+    // Egress Table Interface Signals
+    // ==========================================
+    wire [2:0]                              egress_action_id_out;
+    wire [EGRESS_ACTION_DATA_WIDTH-1:0]     egress_action_data_out;
+
+    // ==========================================
+    // Ingress Stateful Register Array
     // ==========================================
     generate
         if (ENABLE_STATEFUL) begin : gen_stateful
-            // Register array for connection state
             reg [REGISTER_WIDTH-1:0] state_registers [0:NUM_REGISTERS-1];
             
-            // Register access signals
-            reg  [$clog2(NUM_REGISTERS)-1:0] reg_addr;
-            reg  [REGISTER_WIDTH-1:0]        reg_read_data;
-            reg  [REGISTER_WIDTH-1:0]        reg_write_data;
-            reg                              reg_write_enable;
-            
-            // Initialize registers to 0
-            integer i;
             initial begin
-                for (i = 0; i < NUM_REGISTERS; i = i + 1) begin
+                for (int i = 0; i < NUM_REGISTERS; i++) begin
                     state_registers[i] = {REGISTER_WIDTH{1'b0}};
                 end
             end
             
-            // Register read/write logic
+            // Combinational read
+            assign stateful_reg_read_data_out = state_registers[stateful_reg_addr_in];
+            
+            // Sequential write
             always_ff @(posedge aclk) begin
                 if (!aresetn) begin
-                    reg_read_data <= '0;
-                end else begin
-                    // Read
-                    reg_read_data <= state_registers[reg_addr];
-                    
-                    // Write
-                    if (reg_write_enable) begin
-                        state_registers[reg_addr] <= reg_write_data;
+                    for (int i = 0; i < NUM_REGISTERS; i++) begin
+                        state_registers[i] <= {REGISTER_WIDTH{1'b0}};
                     end
+                end else if (stateful_reg_write_en_in) begin
+                    state_registers[stateful_reg_addr_in] <= stateful_reg_write_data_in;
                 end
             end
         end else begin : gen_no_stateful
-            // Dummy signals when stateful is disabled
-            wire [$clog2(NUM_REGISTERS)-1:0] reg_addr = '0;
-            wire [REGISTER_WIDTH-1:0]        reg_read_data = '0;
-            wire [REGISTER_WIDTH-1:0]        reg_write_data = '0;
-            wire                             reg_write_enable = 1'b0;
+            assign stateful_reg_read_data_out = '0;
+        end
+    endgenerate
+    
+    // ==========================================
+    // Egress Register Arrays
+    // For link_monitor: byte_cnt_reg and last_time_reg
+    // ==========================================
+    generate
+        if (ENABLE_EGRESS && ENABLE_STATEFUL) begin : gen_egress_registers
+            reg [EGRESS_REG_WIDTH-1:0] byte_cnt_reg [0:NUM_EGRESS_REGISTERS-1];
+            reg [TIME_WIDTH-1:0]       last_time_reg [0:NUM_EGRESS_REGISTERS-1];
+            
+            initial begin
+                for (int j = 0; j < NUM_EGRESS_REGISTERS; j++) begin
+                    byte_cnt_reg[j]  = {EGRESS_REG_WIDTH{1'b0}};
+                    last_time_reg[j] = {TIME_WIDTH{1'b0}};
+                end
+            end
+            
+            // Combinational read
+            assign byte_cnt_read_out  = byte_cnt_reg[egress_reg_index_in];
+            assign last_time_read_out = last_time_reg[egress_reg_index_in];
+            
+            // Sequential write
+            always_ff @(posedge aclk) begin
+                if (!aresetn) begin
+                    for (int j = 0; j < NUM_EGRESS_REGISTERS; j++) begin
+                        byte_cnt_reg[j]  <= {EGRESS_REG_WIDTH{1'b0}};
+                        last_time_reg[j] <= {TIME_WIDTH{1'b0}};
+                    end
+                end else begin
+                    if (byte_cnt_write_en_in)
+                        byte_cnt_reg[egress_reg_index_in] <= byte_cnt_write_data_in;
+                    if (last_time_write_en_in)
+                        last_time_reg[egress_reg_index_in] <= last_time_write_data_in;
+                end
+            end
+        end else begin : gen_no_egress_registers
+            assign byte_cnt_read_out  = '0;
+            assign last_time_read_out = '0;
+        end
+    endgenerate
+    
+    // ==========================================
+    // Egress Table (swid table)
+    // ==========================================
+    generate
+        if (ENABLE_EGRESS && ENABLE_EGRESS_TABLE) begin : gen_egress_table
+            typedef struct packed {
+                logic                              valid;
+                logic [2:0]                        action_id;
+                logic [EGRESS_ACTION_DATA_WIDTH-1:0] action_data;
+            } egress_table_entry_t;
+            
+            egress_table_entry_t egress_table [0:EGRESS_TABLE_SIZE-1];
+            
+            // Table lookup result (internal)
+            reg [2:0]                        egress_action_id;
+            reg [EGRESS_ACTION_DATA_WIDTH-1:0] egress_action_data;
+            reg                              egress_table_hit;
+            
+            initial begin
+                for (int k = 0; k < EGRESS_TABLE_SIZE; k++) begin
+                    egress_table[k].valid = 1'b0;
+                    egress_table[k].action_id = 3'd0;
+                    egress_table[k].action_data = '0;
+                end
+            end
+            
+            // Table write
+            always_ff @(posedge aclk) begin
+                if (egress_table_write_enable) begin
+                    egress_table[egress_table_write_addr].valid      <= 1'b1;
+                    egress_table[egress_table_write_addr].action_id  <= egress_table_entry_action;
+                    egress_table[egress_table_write_addr].action_data <= egress_table_entry_data;
+                end
+            end
+            
+            // Table lookup (default entry at index 0)
+            always_comb begin
+                if (egress_table[0].valid) begin
+                    egress_table_hit   = 1'b1;
+                    egress_action_id   = egress_table[0].action_id;
+                    egress_action_data = egress_table[0].action_data;
+                end else begin
+                    egress_table_hit   = 1'b0;
+                    egress_action_id   = EGRESS_ACTION_NOACTION;
+                    egress_action_data = '0;
+                end
+            end
+            
+            // Interface signals
+            assign egress_action_id_out   = egress_action_id;
+            assign egress_action_data_out = egress_action_data;
+        end else begin : gen_no_egress_table
+            assign egress_action_id_out   = EGRESS_ACTION_NOACTION;
+            assign egress_action_data_out = '0;
         end
     endgenerate
     
@@ -220,13 +373,26 @@ module action #(
             ipv4_ttl_out      <= 8'b0;
             metadata_out      <= '0;
             
-            if (ENABLE_STATEFUL) begin
-                gen_stateful.reg_addr         <= '0;
-                gen_stateful.reg_write_data   <= '0;
-                gen_stateful.reg_write_enable <= 1'b0;
-            end
+            // Reset egress outputs
+            out_probe_data_valid     <= 1'b0;
+            out_probe_data_swid      <= 7'd0;
+            out_probe_data_port      <= 8'd0;
+            out_probe_data_byte_cnt  <= 32'd0;
+            out_probe_data_last_time <= {TIME_WIDTH{1'b0}};
+            out_probe_data_cur_time  <= {TIME_WIDTH{1'b0}};
+            out_probe_data_bos       <= 1'b0;
+            
+            // Reset interface signals
+            stateful_reg_addr_in       <= '0;
+            stateful_reg_write_data_in <= '0;
+            stateful_reg_write_en_in   <= 1'b0;
+            egress_reg_index_in        <= '0;
+            byte_cnt_write_data_in     <= '0;
+            byte_cnt_write_en_in       <= 1'b0;
+            last_time_write_data_in    <= '0;
+            last_time_write_en_in      <= 1'b0;
 
-            {{STACK_POINTER_RESET_OUT}}
+{{STACK_POINTER_RESET_OUT}}
 
         end else if (packet_ready) begin
             packet_out_valid  <= packet_valid && action_valid;
@@ -237,53 +403,47 @@ module action #(
             ipv4_diffserv_out <= ipv4_diffserv_in;
             ipv4_ecn_out      <= ipv4_ecn_in;
             ipv4_ttl_out      <= ipv4_ttl;
-        
-            // Default metadata pass-through
             metadata_reg      <= metadata_in;
             
-            // Default: no register write
-            if (ENABLE_STATEFUL) begin
-                gen_stateful.reg_write_enable <= 1'b0;
-            end
+            // Default: no writes
+            stateful_reg_write_en_in <= 1'b0;
+            byte_cnt_write_en_in     <= 1'b0;
+            last_time_write_en_in    <= 1'b0;
+
+            // Default: no probe data output
+            out_probe_data_valid <= 1'b0;
             
             if (packet_valid && action_valid) begin
                 // ============================================
                 // STAGE 1: INGRESS PROCESSING
                 // ============================================
                 
-                // Default: pass through
                 ingress_packet  = packet_in;
                 drop            = 1'b0;
                 egress_port     = 9'd0;
                 header_modified = 1'b0;
                 
                 case (action_id)
-                {{STACK_POINTER_LOGIC_INOUT}}
+{{STACK_POINTER_LOGIC_INOUT}}
 
                     // ==========================================
                     // FORWARD Action
                     // ==========================================
                     ACTION_FORWARD: begin
                         if (ENABLE_FORWARD && ENABLE_MODIFY_HEADER) begin
-                            // Check ipv4_valid before modifying
                             if (ipv4_valid) begin
-                                // Modify Ethernet destination MAC
-                                ingress_packet[47:0] = action_data[47:0];  // New dst MAC
-                                
-                                // Swap source MAC (old dst becomes new src)
+                                ingress_packet[47:0] = action_data[47:0];
                                 ingress_packet[95:48] = eth_dst_addr;
                                 
-                                // Decrement TTL
                                 if (ipv4_ttl > 8'd0) begin
                                     ingress_packet[183:176] = ipv4_ttl - 8'd1;
                                     ipv4_ttl_out    = ipv4_ttl - 8'd1;
                                     egress_port     = action_data[56:48];
                                     header_modified = 1'b1;
                                 end else begin
-                                    drop = 1'b1;  // TTL expired
+                                    drop = 1'b1;
                                 end
                             end else begin
-                                // No IPv4 header, cannot forward
                                 drop = 1'b1;
                             end
                         end
@@ -302,7 +462,6 @@ module action #(
                     // NOACTION
                     // ==========================================
                     ACTION_NOACTION: begin
-                        // Pass through unchanged
                         drop            = 1'b0;
                         header_modified = 1'b0;
                     end
@@ -312,14 +471,11 @@ module action #(
                     // ==========================================
                     ACTION_CHECK_STATE: begin
                         if (ENABLE_STATEFUL) begin
-                            // Use flow hash to index into register array
-                            gen_stateful.reg_addr = flow_hash[$clog2(NUM_REGISTERS)-1:0];
-                            
-                            // Read register value (available next cycle due to FF)
-                            if (gen_stateful.reg_read_data == 32'd0) begin
-                                drop = 1'b1;  // No connection found
+                            stateful_reg_addr_in = flow_hash[$clog2(NUM_REGISTERS)-1:0];
+                            if (stateful_reg_read_data_out == 32'd0) begin
+                                drop = 1'b1;
                             end else begin
-                                drop = 1'b0;  // Connection exists
+                                drop = 1'b0;
                             end
                         end
                     end
@@ -329,13 +485,9 @@ module action #(
                     // ==========================================
                     ACTION_UPDATE_STATE: begin
                         if (ENABLE_STATEFUL) begin
-                            // Use flow hash to index into register array
-                            gen_stateful.reg_addr = flow_hash[$clog2(NUM_REGISTERS)-1:0];
-                            
-                            // Write connection state (e.g., timestamp)
-                            gen_stateful.reg_write_data   = 32'd1;  // Mark as active
-                            gen_stateful.reg_write_enable = 1'b1;
-                            
+                            stateful_reg_addr_in       = flow_hash[$clog2(NUM_REGISTERS)-1:0];
+                            stateful_reg_write_data_in = 32'd1;
+                            stateful_reg_write_en_in   = 1'b1;
                             drop            = 1'b0;
                             header_modified = 1'b0;
                         end
@@ -425,32 +577,75 @@ module action #(
                 endcase
                 
                 // ============================================
-                // STAGE 2: EGRESS PROCESSING
+                // STAGE 2: EGRESS PROCESSING 
                 // ============================================
                 
-                egress_packet = ingress_packet;  // Default: pass through
+                egress_packet = ingress_packet;
                 ecn_marked    = 1'b0;
                 
-                // Only process if egress is enabled and packet not dropped
-                if (ENABLE_EGRESS && !drop && ipv4_valid) begin
+                if (ENABLE_EGRESS && !drop) begin
                     
                     // ------------------------------------------
                     // ECN MARKING LOGIC
                     // ------------------------------------------
-                    if (ENABLE_ECN_MARKING) begin
-                        // Use input ECN bits
+                    if (ENABLE_ECN_MARKING && ipv4_valid) begin
                         ecn_bits = ipv4_ecn_in;
-                        
-                        // Check if ECN-capable transport (ECT)
                         if (ecn_bits == 2'b01 || ecn_bits == 2'b10) begin
-                            // Check if queue is experiencing congestion
                             if (enq_qdepth >= ECN_THRESHOLD) begin
-                                // Mark Congestion Experienced (CE)
                                 ipv4_ecn_out    = 2'b11;
                                 header_modified = 1'b1;
                                 ecn_marked      = 1'b1;
                             end
                         end
+                    end
+                    
+                    // ------------------------------------------
+                    // EGRESS REGISTER OPERATIONS
+                    // (link_monitor.p4 byte counting logic)
+                    // ------------------------------------------
+                    if (ENABLE_STATEFUL) begin
+                        egress_reg_index_in <= egress_port_id[$clog2(NUM_EGRESS_REGISTERS)-1:0];
+                        
+                        begin
+                            reg [EGRESS_REG_WIDTH-1:0] current_byte_cnt;
+                            reg [EGRESS_REG_WIDTH-1:0] new_byte_cnt;
+                            
+                            current_byte_cnt = byte_cnt_read_out;
+                            new_byte_cnt = current_byte_cnt + {16'd0, packet_length_in};
+                            
+                            if (probe_valid) begin
+                                out_probe_data_byte_cnt <= current_byte_cnt;
+                                byte_cnt_write_data_in  <= 32'd0;
+                                byte_cnt_write_en_in    <= 1'b1;
+                                
+                                out_probe_data_last_time <= last_time_read_out;
+                                out_probe_data_cur_time  <= global_timestamp;
+                                last_time_write_data_in  <= global_timestamp;
+                                last_time_write_en_in    <= 1'b1;
+                                
+                                out_probe_data_port  <= egress_port_id[7:0];
+                                out_probe_data_bos   <= (probe_hop_cnt == 8'd1);
+                                out_probe_data_valid <= 1'b1;
+                                header_modified      <= 1'b1;
+                            end else begin
+                                byte_cnt_write_data_in <= new_byte_cnt;
+                                byte_cnt_write_en_in   <= 1'b1;
+                            end
+                        end
+                    end
+                    
+                    // ------------------------------------------
+                    // EGRESS TABLE (swid)
+                    // ------------------------------------------
+                    if (ENABLE_EGRESS_TABLE && probe_valid) begin
+                        case (egress_action_id_out)
+                            EGRESS_ACTION_SET_SWID: begin
+                                out_probe_data_swid <= egress_action_data_out[6:0];
+                            end
+                            default: begin
+                                out_probe_data_swid <= 7'd0;
+                            end
+                        endcase
                     end
                     
                     // ------------------------------------------
@@ -462,7 +657,7 @@ module action #(
                 end
                 
                 // Output final packet
-                packet_out = egress_packet;
+                packet_out   = egress_packet;
                 metadata_out = metadata_reg;
             end
         end
@@ -470,9 +665,11 @@ module action #(
 
 endmodule
 
+// ============================================================================
 // hash.sv
 // Hardware hash computation module
 // Supports CRC16, CRC32, and XOR hashing for load balancing and flow identification
+// ============================================================================
 
 module hash #(
     parameter HASH_TYPE = 0,     // 0=CRC16, 1=CRC32, 2=XOR

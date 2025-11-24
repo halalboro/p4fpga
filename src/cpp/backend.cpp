@@ -929,60 +929,151 @@ bool Backend::processActionTemplate(SVProgram* program, const std::string& outpu
     // ==========================================
     std::stringstream logicSS;
     auto ingress = program->getIngress();
+    auto egress = program->getEgress();
     
-    if (ingress && !customHeaders.empty()) {
-        const auto& actions = ingress->getActions();
-        
-        // Build action name → ID map
-        std::map<cstring, int> actionNameToId;
-        int actionId = 0;
-        for (const auto& actionPair : actions) {
-            actionNameToId[actionPair.first] = actionId;
-            actionId++;
+    if (!customHeaders.empty()) {
+        // Build action name → ID map for ingress
+        std::map<cstring, int> ingressActionNameToId;
+        if (ingress) {
+            int actionId = 0;
+            for (const auto& actionPair : ingress->getActions()) {
+                ingressActionNameToId[actionPair.first] = actionId++;
+            }
         }
         
-        // For each stack header, generate logic based on action inspection
-        for (const auto& headerPair : customHeaders) {
-            if (headerPair.second.isStack) {
-                std::string stackName = headerPair.first.string();
+        // Build action name → ID map for egress (offset by ingress count)
+        std::map<cstring, int> egressActionNameToId;
+        int egressActionOffset = ingressActionNameToId.size();
+        if (egress) {
+            int actionId = 0;
+            for (const auto& actionPair : egress->getActions()) {
+                egressActionNameToId[actionPair.first] = egressActionOffset + actionId++;
+            }
+        }
+        
+        // Process ingress actions
+        if (ingress) {
+            for (const auto& actionPair : ingress->getActions()) {
+                SVAction* action = actionPair.second;
+                int currentActionId = ingressActionNameToId[actionPair.first];
+                std::string actionName = actionPair.first.string();
                 
-                // Look through actions to find ones that modify this stack
-                for (const auto& actionPair : actions) {
-                    int currentActionId = actionNameToId[actionPair.first];
-                    std::string actionName = actionPair.first.string();
+                // Use proper stack operation detection
+                if (action->usesStackOperations()) {
+                    for (const auto& stackOp : action->getStackOperations()) {
+                        std::string stackName = stackOp.stackName.string();
+                        
+                        if (stackOp.type == StackOperation::POP_FRONT) {
+                            logicSS << "                    " << currentActionId 
+                                   << ": begin  // " << actionName << " (pop_front)\n";
+                            if (stackOp.count == 1) {
+                                logicSS << "                        " << stackName 
+                                       << "_ptr_out <= " << stackName << "_ptr_in + 1;\n";
+                            } else {
+                                logicSS << "                        " << stackName 
+                                       << "_ptr_out <= " << stackName << "_ptr_in + " 
+                                       << stackOp.count << ";\n";
+                            }
+                            logicSS << "                    end\n";
+                            
+                            BACKEND_DEBUG("Action " << actionName << " uses pop_front(" 
+                                        << stackOp.count << ") on " << stackName);
+                        }
+                        else if (stackOp.type == StackOperation::PUSH_FRONT) {
+                            logicSS << "                    " << currentActionId 
+                                   << ": begin  // " << actionName << " (push_front)\n";
+                            // push_front DECREMENTS the pointer
+                            // Also need bounds checking to prevent underflow
+                            if (stackOp.count == 1) {
+                                logicSS << "                        if (" << stackName 
+                                       << "_ptr_in > 0)\n";
+                                logicSS << "                            " << stackName 
+                                       << "_ptr_out <= " << stackName << "_ptr_in - 1;\n";
+                                logicSS << "                        else\n";
+                                logicSS << "                            " << stackName 
+                                       << "_ptr_out <= 0;  // Already at beginning\n";
+                            } else {
+                                logicSS << "                        if (" << stackName 
+                                       << "_ptr_in >= " << stackOp.count << ")\n";
+                                logicSS << "                            " << stackName 
+                                       << "_ptr_out <= " << stackName << "_ptr_in - " 
+                                       << stackOp.count << ";\n";
+                                logicSS << "                        else\n";
+                                logicSS << "                            " << stackName 
+                                       << "_ptr_out <= 0;\n";
+                            }
+                            logicSS << "                    end\n";
+                            
+                            BACKEND_DEBUG("Action " << actionName << " uses push_front(" 
+                                        << stackOp.count << ") on " << stackName);
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Process egress actions (link_monitor uses push_front in egress!)
+        if (egress) {
+            for (const auto& actionPair : egress->getActions()) {
+                SVAction* action = actionPair.second;
+                int currentActionId = egressActionNameToId[actionPair.first];
+                std::string actionName = actionPair.first.string();
+                
+                if (action->usesStackOperations()) {
+                    for (const auto& stackOp : action->getStackOperations()) {
+                        std::string stackName = stackOp.stackName.string();
+                        
+                        if (stackOp.type == StackOperation::PUSH_FRONT) {
+                            // For egress push_front (like link_monitor's probe_data)
+                            // This happens in the egress processing section
+                            BACKEND_DEBUG("Egress action " << actionName 
+                                        << " uses push_front on " << stackName);
                     
-                    // Check action body for stack operations (simple heuristic)
-                    // This is a simplified approach - checks action name patterns
-                    bool hasPopFront = (actionName.find("pop") != std::string::npos) ||
-                                      (actionName.find("nhop") != std::string::npos) ||
-                                      (actionName.find("route") != std::string::npos);
-                    
-                    bool hasPushFront = (actionName.find("push") != std::string::npos) ||
-                                       (actionName.find("insert") != std::string::npos);
-                    
-                    // Alternative: check if action body contains the stack name
-                    // (This requires access to the action's statement list)
-                    
-                    if (hasPopFront) {
-                        logicSS << "                " << currentActionId << ": begin  // " 
-                               << actionName << "\n";
-                        logicSS << "                    " << stackName 
-                               << "_ptr_out <= " << stackName << "_ptr_in + 1;\n";
-                        logicSS << "                end\n";
-                    } else if (hasPushFront) {
-                        logicSS << "                " << currentActionId << ": begin  // " 
-                               << actionName << "\n";
-                        logicSS << "                    " << stackName 
-                               << "_ptr_out <= " << stackName << "_ptr_in - 1;\n";
-                        logicSS << "                end\n";
+                        }
                     }
                 }
             }
         }
     }
-    
+
     // ==========================================
-    // 5. Replace All Placeholders
+    // 5. Generate Egress Register Parameters
+    // ==========================================
+    auto egress = program->getEgress();
+    if (egress && egress->hasRegisters()) {
+        const auto& registers = egress->getRegisters();
+        
+        // Find max register size for NUM_EGRESS_REGISTERS
+        int maxRegSize = 8;  // Default
+        for (const auto& reg : registers) {
+            if (reg.arraySize > maxRegSize) {
+                maxRegSize = reg.arraySize;
+            }
+        }
+        
+        // Update EGRESS_CONFIG to enable stateful (Bit 0 = egress, Bit 2 = stateful)
+        actionTemplate = replaceAll(actionTemplate,
+            "{{EGRESS_CONFIG}}",
+            "8'b00000101");
+        
+        actionTemplate = replaceAll(actionTemplate,
+            "{{NUM_EGRESS_REGISTERS}}",
+            std::to_string(maxRegSize));
+            
+        BACKEND_DEBUG("Enabled egress stateful with " << maxRegSize << " registers");
+    } else {
+        // No egress registers - use defaults
+        actionTemplate = replaceAll(actionTemplate,
+            "{{EGRESS_CONFIG}}",
+            "8'b00000000");
+        
+        actionTemplate = replaceAll(actionTemplate,
+            "{{NUM_EGRESS_REGISTERS}}",
+            "8");
+    }
+        
+    // ==========================================
+    // 6. Replace All Placeholders
     // ==========================================
     actionTemplate = replaceAll(actionTemplate, "{{STACK_POINTER_INPUTS}}", inputsSS.str());
     actionTemplate = replaceAll(actionTemplate, "{{STACK_POINTER_OUTPUTS}}", outputsSS.str());
@@ -990,7 +1081,7 @@ bool Backend::processActionTemplate(SVProgram* program, const std::string& outpu
     actionTemplate = replaceAll(actionTemplate, "{{STACK_POINTER_LOGIC_INOUT}}", logicSS.str());
     
     // ==========================================
-    // 6. Write Output File
+    // 7. Write Output File
     // ==========================================
     boost::filesystem::path outputPath = 
         boost::filesystem::path(outputDir) / "hdl" / "action.sv";
@@ -1006,6 +1097,38 @@ bool Backend::processActionTemplate(SVProgram* program, const std::string& outpu
     
     BACKEND_DEBUG("Generated action.sv");
     return true;
+}
+
+bool Backend::processEgressTemplate(SVProgram* program, const std::string& outputDir) {
+    BACKEND_DEBUG("Generating egress pipeline");
+    
+    auto egress = program->getEgress();
+    if (!egress || !egress->hasRegisters()) {
+        return true;  // No egress processing needed
+    }
+    
+    // egress is integrated into action.sv
+    // This function can generate additional egress-specific modules if needed
+    
+    const auto& registers = egress->getRegisters();
+    BACKEND_DEBUG("Egress has " << registers.size() << " register(s)");
+    
+    for (const auto& reg : registers) {
+        BACKEND_DEBUG("  Register: " << reg.name << "[" << reg.arraySize << "] x " << reg.elementWidth << " bits");
+    }
+    
+    return true;
+}
+
+std::string generateEgressInstance(SVProgram* program) {
+    auto egress = program->getEgress();
+    if (!egress || !egress->hasRegisters()) {
+        return "";
+    }
+    
+    // egress is part of match_action pipeline
+    // Return empty - no separate instance needed
+    return "";
 }
 
 std::string generateConstEntriesInit(SVTable* table, SVControl* control) {
@@ -1168,7 +1291,14 @@ bool Backend::run(const SVOptions& options,
         return false;
     }
     BACKEND_SUCCESS("Generated match_action.sv");
-    
+
+    if (svprog.getEgress() && svprog.getEgress()->hasRegisters()) {
+        if (!processEgressTemplate(&svprog, options.outputDir.string())) {
+            BACKEND_ERROR("Failed to generate egress module");
+            // Non-fatal - egress is optional
+        }
+    }
+
     // Generate control slave
     BACKEND_DEBUG("Generating control slave");
     std::string slaveTemplate = loadTemplate("../src/sv/hdl/slave.sv.in");
@@ -1236,8 +1366,12 @@ bool Backend::run(const SVOptions& options,
                                 codegen.generatePipelineCustomHeaderOutputs(svprog.getParser()));
     vfpgaTemplate = replaceAll(vfpgaTemplate, "{{DEPARSER_CUSTOM_HEADER_PORTS}}", 
                                 codegen.generateDeparserCustomHeaderPorts(svprog.getParser()));
-    
-    
+    std::string egressInstance = "";
+    if (svprog.getEgress() && svprog.getEgress()->hasRegisters()) {
+        egressInstance = generateEgressInstance(&svprog);
+    }
+    vfpgaTemplate = replaceAll(vfpgaTemplate, "{{EGRESS_PIPELINE_INSTANCE}}", egressInstance);
+        
     // ==========================================
     // Generate Deparser Stack Pointer Connections
     // ==========================================
@@ -1338,6 +1472,51 @@ bool Backend::run(const SVOptions& options,
         vfpgaTemplate = replaceAll(vfpgaTemplate, "{{EGRESS_CONFIG}}", "8'b00000000");
         vfpgaTemplate = replaceAll(vfpgaTemplate, "{{ECN_THRESHOLD}}", "19'd10");
     }
+
+    // ==========================================
+    // Generate Probe Header Wiring 
+    // For link_monitor.p4: probe_t header → match_action
+    // ==========================================
+    std::string probeValidExpr = "1'b0";
+    std::string probeHopCntExpr = "8'd0";
+    
+    for (const auto& headerPair : stackHeaders) {
+        std::string headerName = headerPair.first.string();
+        const auto& headerInfo = headerPair.second;
+        
+        // Check if this is a probe header (name contains "probe" or type is "probe_t")
+        bool isProbeHeader = (headerName == "probe" || 
+                            headerName.find("probe") != std::string::npos);
+        
+        // Also check element type name for stacks
+        if (!isProbeHeader && !headerInfo.elementTypeName.isNullOrEmpty()) {
+            std::string typeName = headerInfo.elementTypeName.string();
+            isProbeHeader = (typeName.find("probe") != std::string::npos);
+        }
+        
+        if (isProbeHeader && !headerInfo.isStack) {
+            // Single probe header - wire directly
+            probeValidExpr = headerName + "_valid";
+            
+            // Look for hop_cnt field
+            for (const auto& fieldPair : headerInfo.fields) {
+                std::string fieldName = fieldPair.first.string();
+                if (fieldName == "hop_cnt" || fieldName == "hopCnt" || 
+                    fieldName == "hop_count" || fieldName == "hops") {
+                    probeHopCntExpr = headerName + "_" + fieldName;
+                    BACKEND_DEBUG("Found probe header: " << headerName 
+                                << " with " << fieldName << " field");
+                    break;
+                }
+            }
+            break;
+        }
+    }
+    
+    vfpgaTemplate = replaceAll(vfpgaTemplate, "{{PROBE_VALID}}", probeValidExpr);
+    vfpgaTemplate = replaceAll(vfpgaTemplate, "{{PROBE_HOP_CNT}}", probeHopCntExpr);
+    
+    BACKEND_DEBUG("Probe wiring: valid=" << probeValidExpr << ", hop_cnt=" << probeHopCntExpr);
     
     // Write vfpga_top.svh
     boost::filesystem::path vfpgaPath = outputDir / "vfpga_top.svh";

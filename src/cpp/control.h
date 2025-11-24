@@ -41,6 +41,15 @@ struct HashInfo {
     int outputWidth;
 };
 
+struct RegisterInfo {
+    cstring name;
+    cstring elementType;
+    int elementWidth;
+    int arraySize;
+    
+    RegisterInfo() : elementWidth(32), arraySize(1) {}
+};
+
 class SVControl {
 private:
     SVProgram* program;
@@ -61,7 +70,9 @@ private:
         
     std::vector<std::pair<cstring, int>> getRequiredParsedFields();
     std::vector<HashInfo> hashCalls;
+    std::vector<RegisterInfo> registers;
     
+    void extractRegisters();
     void extractTables();
     void extractActions();
 
@@ -84,6 +95,9 @@ public:
     void setIsIngress(bool value) { isIngress = value; }
     const std::vector<HashInfo>& getHashCalls() const { return hashCalls; }
     bool hasHashOperations() const { return !hashCalls.empty(); }
+    const std::vector<RegisterInfo>& getRegisters() const { return registers; }
+    bool hasRegisters() const { return !registers.empty(); }
+
 
      /** Get action by name */
     SVAction* getAction(const cstring& name) const {

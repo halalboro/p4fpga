@@ -79,6 +79,7 @@ logic [15:0]                 pipeline_tcp_src_port;
 logic [15:0]                 pipeline_tcp_dst_port;
 logic [15:0]                 pipeline_udp_src_port;
 logic [15:0]                 pipeline_udp_dst_port;
+logic [8:0]                  pipeline_egress_port_d;
 
 {{CUSTOM_HEADER_PIPELINE_SIGNALS}}
 
@@ -239,6 +240,11 @@ always_comb begin
     end
 end
 
+
+always_ff @(posedge aclk) begin
+    pipeline_egress_port_d <= pipeline_egress_port;
+end
+
 // ============================================
 // Match-Action-Stats Pipeline
 // ============================================
@@ -280,6 +286,10 @@ match_action #(
     .packet_length(parser_packet_length),
     
 {{PIPELINE_EGRESS_INPUT}}
+
+    .egress_port_id(pipeline_egress_port_d),  // Feedback from own output
+    .probe_valid({{PROBE_VALID}}),
+    .probe_hop_cnt({{PROBE_HOP_CNT}}),
     
     // Packet output to deparser
     .packet_out(pipeline_data),
