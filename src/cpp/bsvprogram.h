@@ -82,6 +82,7 @@ public:
     std::string generatePipelineCustomHeaderInputs(const SVParser* parser);
     std::string generatePipelineCustomHeaderOutputs(const SVParser* parser);
     std::string generateDeparserCustomHeaderPorts(const SVParser* parser);
+    std::string generateEgressProbeDataInputs(const SVParser* parser);
 
     // Stack operation generators
     std::string generateStackPointerSignals(const SVParser* parser);

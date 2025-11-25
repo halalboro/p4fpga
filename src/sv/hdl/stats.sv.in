@@ -1,7 +1,3 @@
-// stats.sv
-// Generic statistics and counter engine
-// Supports packet counters, byte counters, and registers
-
 module stats #(
     // ==========================================
     // Configuration Parameters

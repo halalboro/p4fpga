@@ -607,17 +607,37 @@ std::string SVCodeGen::generateCustomHeaderBuildLogic(const SVParser* parser) {
     
     for (const auto& ch : customHeaders) {
         const auto& info = ch.second;
-        
         if (info.isStack) {
             // ==========================================
-            // POINTER-BASED STACK EMISSION
+            // POINTER-BASED STACK EMISSION WITH EGRESS PUSH_FRONT
             // ==========================================
-            ss << "                    // Build " << info.name << " stack (" 
-               << (info.totalWidth / 8) << " bytes per element)\n";
+            ss << "                    // Build " << info.name << " stack ("
+            << (info.totalWidth / 8) << " bytes per element)\n";
             ss << "                    if (EMIT_" << info.name << ") begin\n";
-            ss << "                        // Loop from stack_ptr to end (skip popped elements)\n";
+            // Check if this is probe_data stack (needs egress element first)
+            std::string stackName = info.name.string();
+            bool isProbeData = (stackName == "probe_data" || 
+                            stackName.find("probe_data") != std::string::npos);
+            
+            if (isProbeData) {
+                // Emit egress-created element FIRST (push_front result)
+                ss << "                        // Emit egress-created element first (push_front)\n";
+                ss << "                        if (egress_probe_data_valid) begin\n";
+                ss << "                            header_buffer[byte_offset*8 + 0 +: 1] <= egress_probe_data_bos;\n";
+                ss << "                            header_buffer[byte_offset*8 + 1 +: 7] <= egress_probe_data_swid;\n";
+                ss << "                            header_buffer[byte_offset*8 + 8 +: 8] <= egress_probe_data_port;\n";
+                ss << "                            header_buffer[byte_offset*8 + 16 +: 32] <= egress_probe_data_byte_cnt;\n";
+                ss << "                            header_buffer[byte_offset*8 + 48 +: 48] <= egress_probe_data_last_time;\n";
+                ss << "                            header_buffer[byte_offset*8 + 96 +: 48] <= egress_probe_data_cur_time;\n";
+                ss << "                            byte_offset <= byte_offset + 11'd" 
+                << (info.totalWidth / 8) << ";\n";
+                ss << "                        end\n\n";
+            }
+            
+            // Then emit existing stack elements
+            ss << "                        // Emit existing stack elements (from ptr to end)\n";
             ss << "                        for (int stack_i = " << info.name << "_ptr; stack_i < " 
-               << info.maxStackSize << "; stack_i++) begin\n";
+            << info.maxStackSize << "; stack_i++) begin\n";
             ss << "                            if (" << info.name << "_valid[stack_i]) begin\n";
             
             // Sort fields by offset
@@ -637,15 +657,14 @@ std::string SVCodeGen::generateCustomHeaderBuildLogic(const SVParser* parser) {
                 
                 ss << "                                header_buffer[byte_offset*8 + " << field.offset;  
                 ss << " +: " << field.width << "] <= " << info.name << "_" << fieldName 
-                   << "[stack_i];\n";
+                << "[stack_i];\n";
             }
             
             ss << "                                byte_offset <= byte_offset + 11'd" 
-               << (info.totalWidth / 8) << ";\n";
+            << (info.totalWidth / 8) << ";\n";
             ss << "                            end\n";
             ss << "                        end\n";
             ss << "                    end\n\n";
-            
         } else {
             // ==========================================
             // SINGLE HEADER EMISSION (unchanged)
@@ -722,6 +741,45 @@ std::string SVCodeGen::generateDeparserStackPointerInputs(const SVParser* parser
     
     ss << "\n";
     return ss.str();
+}
+
+// ==========================================
+// Generate Egress Probe Data Inputs for Deparser
+// For link_monitor.p4: receives new probe_data element from egress
+// ==========================================
+std::string SVCodeGen::generateEgressProbeDataInputs(const SVParser* parser) {
+if (!parser) return "";
+const auto& customHeaders = parser->getCustomHeaders();
+if (customHeaders.empty()) return "";
+
+// Check for probe_data stack header
+bool hasProbeData = false;
+for (const auto& ch : customHeaders) {
+    std::string name = ch.first.string();
+    if (name == "probe_data" || name.find("probe_data") != std::string::npos) {
+        if (ch.second.isStack) {
+            hasProbeData = true;
+            break;
+        }
+    }
+}
+
+if (!hasProbeData) return "";
+
+std::stringstream ss;
+ss << "    // ==========================================\n";
+ss << "    // Egress Probe Data Inputs (new element from push_front)\n";
+ss << "    // ==========================================\n";
+ss << "    input  wire                      egress_probe_data_valid,\n";
+ss << "    input  wire                      egress_probe_data_bos,\n";
+ss << "    input  wire [6:0]                egress_probe_data_swid,\n";
+ss << "    input  wire [7:0]                egress_probe_data_port,\n";
+ss << "    input  wire [31:0]               egress_probe_data_byte_cnt,\n";
+ss << "    input  wire [47:0]               egress_probe_data_last_time,\n";
+ss << "    input  wire [47:0]               egress_probe_data_cur_time,\n";
+ss << "\n";
+
+return ss.str();
 }
 
 // ==========================================
@@ -967,6 +1025,8 @@ void SVCodeGen::processDeparserTemplate(const SVParser* parser, const std::strin
     
     replaceAll(content, "{{STACK_POINTER_INPUTS}}", 
                generateDeparserStackPointerInputs(parser));  
+    replaceAll(content, "{{EGRESS_PROBE_DATA_INPUTS}}",
+               generateEgressProbeDataInputs(parser));
     replaceAll(content, "{{CUSTOM_HEADER_INPUTS}}", 
                generateCustomHeaderInputs(parser));
     replaceAll(content, "{{CUSTOM_HEADER_EMIT_PARAMS}}", 

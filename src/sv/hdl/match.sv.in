@@ -1,7 +1,3 @@
-// match.sv
-// Generic table matching engine supporting multiple match types
-// Configurable via MATCH_TYPE parameter
-
 module match #(
     // ==========================================
     // Configuration Parameters

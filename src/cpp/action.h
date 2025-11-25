@@ -22,6 +22,12 @@ struct StackOperation {
     StackOperation() : type(POP_FRONT), count(1) {}
 };
 
+struct Assignment {
+    std::string dest;
+    std::string source;
+    // Add other fields if needed
+};
+
 class SVAction {
 private:
     SVControl* control;
@@ -29,6 +35,7 @@ private:
     const TypeMap* typeMap;
     cstring actionName;
     int parameterWidth;
+    std::vector<Assignment> assignments;
     
     std::vector<const IR::Parameter*> parameters;
     std::map<cstring, cstring> fieldModifications;
@@ -57,8 +64,10 @@ public:
     bool usesRegisters() const;
     bool usesHash() const;
     bool usesCounters() const;
+
+    const std::vector<Assignment>& getAssignments() const { return assignments; }
     
-    // PHASE 2: Stack operation queries
+    // Stack operation queries
     bool usesStackOperations() const { return !stackOperations.empty(); }
     const std::vector<StackOperation>& getStackOperations() const { 
         return stackOperations; 

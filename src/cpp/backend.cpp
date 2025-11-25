@@ -1039,7 +1039,6 @@ bool Backend::processActionTemplate(SVProgram* program, const std::string& outpu
     // ==========================================
     // 5. Generate Egress Register Parameters
     // ==========================================
-    auto egress = program->getEgress();
     if (egress && egress->hasRegisters()) {
         const auto& registers = egress->getRegisters();
         
@@ -1071,7 +1070,23 @@ bool Backend::processActionTemplate(SVProgram* program, const std::string& outpu
             "{{NUM_EGRESS_REGISTERS}}",
             "8");
     }
-        
+    
+    // Check for multicast actions
+    bool hasMulticast = false;
+    if (ingress) {
+        for (const auto& actionPair : ingress->getActions()) {
+            SVAction* action = actionPair.second;
+            for (const auto& assignment : action->getAssignments()) {
+                if (assignment.dest.find("mcast_grp") != std::string::npos) {
+                    hasMulticast = true;
+                    BACKEND_DEBUG("Action " << actionPair.first << " uses multicast");
+                    break;
+                }
+            }
+            if (hasMulticast) break;
+        }
+    }
+
     // ==========================================
     // 6. Replace All Placeholders
     // ==========================================
@@ -1371,7 +1386,7 @@ bool Backend::run(const SVOptions& options,
         egressInstance = generateEgressInstance(&svprog);
     }
     vfpgaTemplate = replaceAll(vfpgaTemplate, "{{EGRESS_PIPELINE_INSTANCE}}", egressInstance);
-        
+    
     // ==========================================
     // Generate Deparser Stack Pointer Connections
     // ==========================================
@@ -1388,6 +1403,34 @@ bool Backend::run(const SVOptions& options,
     vfpgaTemplate = replaceAll(vfpgaTemplate, "{{METADATA_SIGNALS}}",
                                 generateMetadataSignals(&svprog));
 
+    // ==========================================
+    // Generate Deparser Egress Probe Data Wiring 
+    // ==========================================
+    std::stringstream deparserEgressSS;
+    bool hasProbeDataStack = false;
+    for (const auto& headerPair : stackHeaders) {
+        std::string headerName = headerPair.first.string();
+        if ((headerName == "probe_data" || headerName.find("probe_data") != std::string::npos) 
+            && headerPair.second.isStack) {
+            hasProbeDataStack = true;
+            break;
+        }
+    }
+
+    if (hasProbeDataStack) {
+        deparserEgressSS << "    // Egress probe_data element (from push_front)\n";
+        deparserEgressSS << "    .egress_probe_data_valid(pipeline_out_probe_data_valid),\n";
+        deparserEgressSS << "    .egress_probe_data_bos(pipeline_out_probe_data_bos),\n";
+        deparserEgressSS << "    .egress_probe_data_swid(pipeline_out_probe_data_swid),\n";
+        deparserEgressSS << "    .egress_probe_data_port(pipeline_out_probe_data_port),\n";
+        deparserEgressSS << "    .egress_probe_data_byte_cnt(pipeline_out_probe_data_byte_cnt),\n";
+        deparserEgressSS << "    .egress_probe_data_last_time(pipeline_out_probe_data_last_time),\n";
+        deparserEgressSS << "    .egress_probe_data_cur_time(pipeline_out_probe_data_cur_time),\n";
+    }
+
+    vfpgaTemplate = replaceAll(vfpgaTemplate, "{{DEPARSER_EGRESS_PROBE_DATA_PORTS}}", 
+                            deparserEgressSS.str());
+    
     // ==========================================
     // Calculate and Replace Metadata Width
     // ==========================================
