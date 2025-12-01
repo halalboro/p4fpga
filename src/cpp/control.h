@@ -50,6 +50,19 @@ struct RegisterInfo {
     RegisterInfo() : elementWidth(32), arraySize(1) {}
 };
 
+// Inline register operation info (for bloom filter patterns)
+struct InlineRegisterOp {
+    cstring registerName;      // e.g., "bloom_filter_1"
+    cstring operation;         // "read" or "write"
+    cstring indexExpr;         // e.g., "(bit<32>)reg_pos_one"
+    cstring outputVar;         // for read: variable to store result
+    cstring writeValue;        // for write: value to write
+    cstring condition;         // enclosing if condition (if any)
+    int conditionBranch;       // 0 = no condition, 1 = true branch, 2 = false branch
+    
+    InlineRegisterOp() : conditionBranch(0) {}
+};
+
 class SVControl {
 private:
     SVProgram* program;
@@ -62,7 +75,9 @@ private:
     bool isIngress;
     bool isEgress;                    
     bool hasEgressActions;
-    bool detectHashCalls();            
+    bool detectHashCalls();
+    std::vector<InlineRegisterOp> inlineRegisterOps;   
+    bool detectInlineRegisterOps();         
     
     std::map<cstring, SVTable*> svTables;
     std::map<cstring, SVAction*> svActions;
@@ -89,6 +104,9 @@ public:
     
     // Extract configuration for submodules
     ControlConfig extractConfiguration();
+
+    const std::vector<InlineRegisterOp>& getInlineRegisterOps() const { return inlineRegisterOps; }
+    bool hasInlineRegisterOps() const { return !inlineRegisterOps.empty(); }
 
     bool hasStatefulOperations() const;
     

@@ -22,6 +22,7 @@ module match_action #(
     input  wire                           packet_last_in,
     input  wire                           packet_valid_in,
     output wire                           packet_ready_out,
+    input  wire [8:0]                     ingress_port_in, 
     
     // Header fields from parser
     input  wire                           ipv4_valid,
@@ -108,7 +109,9 @@ module match_action #(
     // ==========================================
     output wire [31:0]                    packet_count,
     output wire [31:0]                    dropped_count,
-    output wire [31:0]                    forwarded_count
+    output wire [31:0]                    forwarded_count,
+    
+    output wire [15:0]                    mcast_grp
 );
 
     // Internal metadata bus
@@ -145,12 +148,20 @@ module match_action #(
     wire [7:0]                     match_ipv4_ttl;
     wire [5:0]                     match_ipv4_diffserv;
     wire [1:0]                     match_ipv4_ecn;
+
+    // Alias for standard_metadata.ingress_port
+    wire [8:0] ingress_port;
+    assign ingress_port = ingress_port_in;
     
 {{CUSTOM_HEADER_PASSTHROUGH}}
 
 {{CONDITIONAL_LOGIC}}
 
 {{HASH_INSTANTIATION}}
+
+{{INLINE_REGISTER_LOGIC}}
+
+{{ECMP_LOGIC}}
 
 {{STACK_POINTER_FEEDBACK}}
     
@@ -206,6 +217,10 @@ module match_action #(
         .table_entry_action_data(table_entry_action_data)
     );
     
+{{ACTION_DROP_WIRE}}
+
+{{EGRESS_PORT_WIRE}}
+
     // ==========================================
     // Stage 2: Action Engine
     // ==========================================
@@ -231,6 +246,8 @@ module match_action #(
 
         .metadata_in(meta_parser),   
         .metadata_out(meta_action), 
+        .ingress_port_in(ingress_port_in),
+        .mcast_grp(mcast_grp),
         
         .action_id({{ACTION_ID_SIGNAL}}),
         .action_data(match_action_data),
@@ -260,8 +277,8 @@ module match_action #(
         .packet_out_valid(packet_valid_out),
         .packet_out_ready(packet_ready_in),
         
-        .drop(drop),
-        .egress_port(egress_port),
+        .drop({{DROP_SIGNAL_NAME}}),
+        .egress_port({{EGRESS_PORT_ACTION_NAME}}),
         .header_modified(header_modified),
         .ecn_marked(ecn_marked),
         .ipv4_diffserv_out(out_ipv4_diffserv),
@@ -282,6 +299,10 @@ module match_action #(
         .egress_table_entry_data(64'd0)
     );
     
+ {{FINAL_DROP_ASSIGNMENT}}
+
+ {{FINAL_EGRESS_PORT}}
+
     // ==========================================
     // Stage 3: Stats Engine
     // ==========================================

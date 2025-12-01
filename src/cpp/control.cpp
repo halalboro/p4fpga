@@ -72,6 +72,7 @@ bool SVControl::build() {
     extractActions();
     extractRegisters(); 
     detectHashCalls();
+    detectInlineRegisterOps(); 
     
     // Detect egress actions
     if (isEgress) {
@@ -204,6 +205,7 @@ void SVControl::extractRegisters() {
                         std::string constName = path->path->name.string();
                         if (constName == "MAX_PORTS") regInfo.arraySize = 8;
                         else if (constName == "MAX_HOPS") regInfo.arraySize = 10;
+                        else if (constName == "BLOOM_FILTER_ENTRIES") regInfo.arraySize = 4096;
                         else regInfo.arraySize = 256;
                     }
                 }
@@ -331,6 +333,7 @@ ControlConfig SVControl::extractConfiguration() {
 
 bool SVControl::hasStatefulOperations() const {
     if (!registers.empty()) return true;
+     if (!inlineRegisterOps.empty()) return true;
     
     if (!p4control) return false;
     
@@ -587,6 +590,140 @@ bool SVControl::detectHashCalls() {
     }
     
     CONTROL_TRACE("No hash() calls found");
+    return false;
+}
+
+
+// ==========================================
+// Detect Inline Register Operations
+// Scans control block body for .read()/.write() calls
+// ==========================================
+
+bool SVControl::detectInlineRegisterOps() {
+    if (!p4control || !p4control->body) {
+        return false;
+    }
+    
+    CONTROL_TRACE("Detecting inline register operations in control body");
+    
+    // Helper lambda to scan a single statement
+    std::function<void(const IR::Node*, cstring, int)> scanNode;
+    
+    scanNode = [&](const IR::Node* node, cstring currentCondition, int branch) {
+        if (!node) return;
+        
+        // Method call statement: check for .read() or .write()
+        if (auto methodStmt = node->to<IR::MethodCallStatement>()) {
+            auto methodCall = methodStmt->methodCall;
+            if (!methodCall || !methodCall->method) return;
+            
+            // Check if it's a member expression (register.read/write)
+            if (auto member = methodCall->method->to<IR::Member>()) {
+                std::string methodName = member->member.string();
+                
+                if (methodName == "read" || methodName == "write") {
+                    InlineRegisterOp op;
+                    op.operation = cstring(methodName);
+                    op.condition = currentCondition;
+                    op.conditionBranch = branch;
+                    
+                    // Get register name from the object expression
+                    if (auto pathExpr = member->expr->to<IR::PathExpression>()) {
+                        op.registerName = pathExpr->path->name;
+                    } else if (auto innerMember = member->expr->to<IR::Member>()) {
+                        op.registerName = innerMember->member;
+                    }
+                    
+                    // Parse arguments
+                    auto args = methodCall->arguments;
+                    if (args && args->size() >= 2) {
+                        // read(output, index) or write(index, value)
+                        if (methodName == "read") {
+                            // Arg 0: output variable
+                            auto arg0 = args->at(0)->expression;
+                            if (arg0) {
+                                if (auto path = arg0->to<IR::PathExpression>()) {
+                                    op.outputVar = path->path->name;
+                                } else {
+                                    op.outputVar = cstring(arg0->toString());
+                                }
+                            }
+                            // Arg 1: index
+                            auto arg1 = args->at(1)->expression;
+                            if (arg1) {
+                                op.indexExpr = cstring(arg1->toString());
+                            }
+                        } else {  // write
+                            // Arg 0: index
+                            auto arg0 = args->at(0)->expression;
+                            if (arg0) {
+                                op.indexExpr = cstring(arg0->toString());
+                            }
+                            // Arg 1: value
+                            auto arg1 = args->at(1)->expression;
+                            if (arg1) {
+                                op.writeValue = cstring(arg1->toString());
+                            }
+                        }
+                    }
+                    
+                    inlineRegisterOps.push_back(op);
+                    
+                    CONTROL_DEBUG("Found inline register op: " << op.registerName 
+                                << "." << op.operation 
+                                << " index=" << op.indexExpr
+                                << (op.operation == "read" ? " -> " + op.outputVar.string() : " val=" + op.writeValue.string())
+                                << (op.condition.isNullOrEmpty() ? "" : " [cond: " + op.condition.string() + "]"));
+                }
+            }
+            return;
+        }
+        
+        // Block statement: recurse into components
+        if (auto blockStmt = node->to<IR::BlockStatement>()) {
+            for (auto component : blockStmt->components) {
+                scanNode(component, currentCondition, branch);
+            }
+            return;
+        }
+        
+        // If statement: track condition and recurse
+        if (auto ifStmt = node->to<IR::IfStatement>()) {
+            cstring condStr = cstring(ifStmt->condition->toString());
+            
+            // Scan true branch
+            if (ifStmt->ifTrue) {
+                scanNode(ifStmt->ifTrue, condStr, 1);
+            }
+            
+            // Scan false branch
+            if (ifStmt->ifFalse) {
+                scanNode(ifStmt->ifFalse, condStr, 2);
+            }
+            return;
+        }
+        
+        // Switch statement: recurse into cases
+        if (auto switchStmt = node->to<IR::SwitchStatement>()) {
+            for (auto switchCase : switchStmt->cases) {
+                if (switchCase->statement) {
+                    scanNode(switchCase->statement, currentCondition, branch);
+                }
+            }
+            return;
+        }
+    };
+    
+    // Scan all statements in control body
+    for (auto component : p4control->body->components) {
+        scanNode(component, cstring::empty, 0);
+    }
+
+    if (!inlineRegisterOps.empty()) {
+        CONTROL_DEBUG("Detected " << inlineRegisterOps.size() << " inline register operation(s)");
+        return true;
+    }
+    
     return false;
 }
 

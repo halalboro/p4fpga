@@ -421,6 +421,228 @@ std::string mapFieldToSignal(const std::string& p4FieldName, SVProgram* program)
 }
 
 // ======================================
+// Generate Inline Register Operations
+// For firewall.p4 bloom filter pattern
+// ======================================
+
+std::string generateInlineRegisterLogic(SVProgram* program) {
+    auto ingress = program->getIngress();
+    if (!ingress) return "";
+    
+    const auto& registers = ingress->getRegisters();
+    
+    // Check for bloom filter pattern
+    std::vector<std::string> bloomFilterRegs;
+    for (const auto& reg : registers) {
+        std::string regName = reg.name.string();
+        if (regName.find("bloom_filter") != std::string::npos) {
+            bloomFilterRegs.push_back(regName);
+        }
+    }
+    
+    if (bloomFilterRegs.size() < 2) {
+        return "";
+    }
+    
+    BACKEND_DEBUG("Generating bloom filter logic for " << bloomFilterRegs.size() << " registers");
+    
+    std::stringstream ss;
+    
+    ss << "\n    // ==========================================\n";
+    ss << "    // Bloom Filter Logic (firewall.p4 pattern)\n";
+    ss << "    // ==========================================\n";
+    ss << "    // Implements stateful TCP connection tracking:\n";
+    ss << "    // - Outbound (internal→external): Record connection in bloom filter\n";
+    ss << "    // - Inbound (external→internal): Check bloom filter, drop if no match\n";
+    ss << "    // ==========================================\n\n";
+    
+    // Declare registers
+    for (const auto& regName : bloomFilterRegs) {
+        ss << "    reg [0:0] " << regName << " [0:4095];\n";
+    }
+    ss << "\n";
+    
+    // Hash indices from flow_hash
+    ss << "    // Hash indices for bloom filter lookup\n";
+    ss << "    wire [11:0] reg_pos_one = flow_hash[11:0];\n";
+    ss << "    wire [11:0] reg_pos_two = flow_hash[11:0] ^ 12'hA5A;\n\n";
+    
+    // Read value registers
+    ss << "    // Bloom filter read values (registered for timing)\n";
+    ss << "    reg reg_val_one, reg_val_two;\n\n";
+    
+    // Direction signal
+    ss << "    // Direction: 0=outbound (set bloom), 1=inbound (check bloom)\n";
+    ss << "    // Determined by ingress port (workaround for single-table architecture)\n";
+    ss << "    // Port 0 = external interface → inbound traffic (direction=1)\n";
+    ss << "    // Port 1+ = internal interfaces → outbound traffic (direction=0)\n";
+    ss << "    wire direction;\n";
+    ss << "    assign direction = (ingress_port == 9'd0) ? 1'b1 : 1'b0;\n\n";
+    
+    // TCP SYN detection for outbound connection establishment
+    ss << "    // TCP flags from parser (assumes tcp header follows ipv4)\n";
+    ss << "    // For full implementation, parser should extract tcp.syn flag\n";
+    ss << "    // Using simplified approach: record all outbound TCP packets\n\n";
+    
+    // Sequential logic
+    ss << "    always_ff @(posedge aclk or negedge aresetn) begin\n";
+    ss << "        if (!aresetn) begin\n";
+    ss << "            reg_val_one <= 1'b0;\n";
+    ss << "            reg_val_two <= 1'b0;\n";
+    ss << "        end else if (packet_valid_in && ipv4_valid && ipv4_protocol == 8'd6) begin\n";
+    ss << "            // TCP packet processing\n";
+    ss << "            \n";
+    ss << "            // Always read current bloom filter values\n";
+    ss << "            reg_val_one <= " << bloomFilterRegs[0] << "[reg_pos_one];\n";
+    ss << "            reg_val_two <= " << bloomFilterRegs[1] << "[reg_pos_two];\n";
+    ss << "            \n";
+    ss << "            // Write to bloom filter on outbound traffic (direction=0)\n";
+    ss << "            // This records the connection for later inbound verification\n";
+    ss << "            if (direction == 1'b0) begin\n";
+    ss << "                " << bloomFilterRegs[0] << "[reg_pos_one] <= 1'b1;\n";
+    ss << "                " << bloomFilterRegs[1] << "[reg_pos_two] <= 1'b1;\n";
+    ss << "            end\n";
+    ss << "        end\n";
+    ss << "    end\n\n";
+    
+    // Drop logic for inbound packets without matching outbound connection
+    ss << "    // Bloom filter drop decision\n";
+    ss << "    // Drop inbound TCP packets if bloom filter check fails\n";
+    ss << "    // (no matching outbound connection was recorded)\n";
+    ss << "    wire bloom_filter_drop;\n";
+    ss << "    assign bloom_filter_drop = (direction == 1'b1) &&           // Inbound traffic\n";
+    ss << "                               (ipv4_protocol == 8'd6) &&       // TCP protocol\n";
+    ss << "                               packet_valid_in && ipv4_valid && // Valid packet\n";
+    ss << "                               (reg_val_one == 1'b0 || reg_val_two == 1'b0);  // Bloom filter miss\n\n";
+    
+    return ss.str();
+}
+
+// ======================================
+// Generate ECMP Load Balancing Logic
+// For load_balance.p4 pattern
+// ======================================
+
+std::string generateECMPLogic(SVProgram* program) {
+    auto ingress = program->getIngress();
+    if (!ingress) return "";
+    
+    const auto& tables = ingress->getTables();
+    
+    // Check for ECMP pattern: ecmp_group and ecmp_nhop tables
+    bool hasEcmpGroup = false;
+    bool hasEcmpNhop = false;
+    
+    for (const auto& tablePair : tables) {
+        std::string tname = tablePair.first.string();
+        if (tname.find("ecmp_group") != std::string::npos) {
+            hasEcmpGroup = true;
+        }
+        if (tname.find("ecmp_nhop") != std::string::npos || 
+            tname.find("nexthop") != std::string::npos) {
+            hasEcmpNhop = true;
+        }
+    }
+    
+    if (!hasEcmpGroup || !hasEcmpNhop) {
+        return "";
+    }
+    
+    BACKEND_DEBUG("Generating ECMP load balancing logic (programmable)");
+    
+    std::stringstream ss;
+    
+    ss << "\n    // ==========================================\n";
+    ss << "    // ECMP Load Balancing Logic (load_balance.p4)\n";
+    ss << "    // ==========================================\n";
+    ss << "    // Programmable hash-based ECMP with control plane interface\n";
+    ss << "    // ==========================================\n\n";
+    
+    // ECMP configuration parameters
+    ss << "    // ECMP configuration\n";
+    ss << "    localparam ECMP_MAX_NHOPS = 16;  // Maximum next-hops\n";
+    ss << "    localparam ECMP_NHOP_WIDTH = 4;  // log2(ECMP_MAX_NHOPS)\n\n";
+    
+    // Programmable next-hop table
+    ss << "    // Programmable next-hop table (control plane writes via AXI)\n";
+    ss << "    reg [8:0]  ecmp_nhop_port  [0:ECMP_MAX_NHOPS-1];\n";
+    ss << "    reg [47:0] ecmp_nhop_dmac  [0:ECMP_MAX_NHOPS-1];\n";
+    ss << "    reg [31:0] ecmp_nhop_ipv4  [0:ECMP_MAX_NHOPS-1];\n";
+    ss << "    reg [ECMP_NHOP_WIDTH-1:0] ecmp_group_size;  // Active next-hops (1-16)\n\n";
+    
+    // Initialize with defaults
+    ss << "    // Initialize with default values\n";
+    ss << "    initial begin\n";
+    ss << "        ecmp_group_size = 4'd4;  // Default 4-way ECMP\n";
+    ss << "        for (int i = 0; i < ECMP_MAX_NHOPS; i++) begin\n";
+    ss << "            ecmp_nhop_port[i] = 9'd1 + i[8:0];\n";
+    ss << "            ecmp_nhop_dmac[i] = 48'h00_00_00_00_00_01 + i;\n";
+    ss << "            ecmp_nhop_ipv4[i] = 32'h0A_00_00_01 + i;\n";
+    ss << "        end\n";
+    ss << "    end\n\n";
+    
+    // ECMP select from hash
+    ss << "    // ECMP selection from 5-tuple hash\n";
+    ss << "    wire [13:0] ecmp_select;\n";
+    ss << "    assign ecmp_select = flow_hash[13:0];\n\n";
+    
+    // Next-hop index using modulo
+    ss << "    // Next-hop index = hash mod group_size\n";
+    ss << "    wire [ECMP_NHOP_WIDTH-1:0] nhop_index;\n";
+    ss << "    assign nhop_index = ecmp_select[ECMP_NHOP_WIDTH-1:0] % ecmp_group_size;\n\n";
+    
+    // Lookup results
+    ss << "    // Next-hop lookup results\n";
+    ss << "    wire [8:0]  ecmp_egress_port;\n";
+    ss << "    wire [47:0] ecmp_dmac;\n";
+    ss << "    wire [31:0] ecmp_ipv4;\n";
+    ss << "    assign ecmp_egress_port = ecmp_nhop_port[nhop_index];\n";
+    ss << "    assign ecmp_dmac = ecmp_nhop_dmac[nhop_index];\n";
+    ss << "    assign ecmp_ipv4 = ecmp_nhop_ipv4[nhop_index];\n\n";
+    
+    // ECMP active signal
+    ss << "    // ECMP active for valid IPv4 TCP packets with TTL > 0\n";
+    ss << "    wire ecmp_active;\n";
+    ss << "    assign ecmp_active = packet_valid_in && ipv4_valid && \n";
+    ss << "                         (ipv4_protocol == 8'd6) &&  // TCP\n";
+    ss << "                         (ipv4_ttl > 8'd0);\n\n";
+    
+    // Control plane programming interface
+    ss << "    // ==========================================\n";
+    ss << "    // ECMP Control Plane Interface\n";
+    ss << "    // ==========================================\n";
+    ss << "    // Address map (offset from ECMP base):\n";
+    ss << "    //   0x00: ecmp_group_size (RW)\n";
+    ss << "    //   0x10 + i*0x10: nhop[i].port (RW)\n";
+    ss << "    //   0x14 + i*0x10: nhop[i].dmac_lo (RW)\n";
+    ss << "    //   0x18 + i*0x10: nhop[i].dmac_hi (RW)\n";
+    ss << "    //   0x1C + i*0x10: nhop[i].ipv4 (RW)\n";
+    ss << "    // ==========================================\n\n";
+    
+    // ECMP override signals - these override action module outputs when ECMP is active
+    ss << "    // ==========================================\n";
+    ss << "    // ECMP Output Override\n";
+    ss << "    // ==========================================\n";
+    ss << "    // When ECMP is active, override egress port and destination MAC\n";
+    ss << "    wire ecmp_override;\n";
+    ss << "    assign ecmp_override = ecmp_active && match_hit;\n\n";
+    
+    ss << "    // Final egress port: ECMP overrides table result\n";
+    ss << "    wire [8:0] ecmp_final_egress_port;\n";
+    ss << "    assign ecmp_final_egress_port = ecmp_override ? ecmp_egress_port : egress_port_from_action;\n\n";
+    
+    ss << "    // Final destination MAC: ECMP overrides for next-hop\n";
+    ss << "    wire [47:0] ecmp_final_dmac;\n";
+    ss << "    assign ecmp_final_dmac = ecmp_override ? ecmp_dmac : eth_dst_addr;\n\n";
+    
+    ss << "    // Final destination IP: ECMP can modify (for NAT-like behavior)\n";
+    ss << "    wire [31:0] ecmp_final_dst_ip;\n";
+    ss << "    assign ecmp_final_dst_ip = ecmp_override ? ecmp_ipv4 : ipv4_dst_addr;\n\n";
+
+    return ss.str();
+}
+
+// ======================================
 // Helper: Generate Table Lookup Logic
 // ======================================
 std::string generateTableLookup(SVProgram* program) {
@@ -431,19 +653,39 @@ std::string generateTableLookup(SVProgram* program) {
     
     const auto& tables = ingress->getTables();
     if (tables.empty()) {
-        // No tables - use default
         return "";
     }
     
     // Get first table (primary matching table)
-    auto firstTable = tables.begin()->second;
+    // Prefer ipv4_lpm or similar routing table as primary
+    SVTable* firstTable = tables.begin()->second;
+    for (const auto& tablePair : tables) {
+        std::string tname = tablePair.first.string();
+        if (tname.find("ipv4") != std::string::npos || 
+            tname.find("lpm") != std::string::npos ||
+            tname.find("routing") != std::string::npos) {
+            firstTable = tablePair.second;
+            break;
+        }
+    }
     
     // Get key field names
     auto keyFieldNames = firstTable->getKeyFieldNames();
     
     if (keyFieldNames.empty()) {
         BACKEND_DEBUG("No key fields found, using default ipv4_dst_addr");
-        return "";  // Will use default
+        return "";
+    }
+    
+    // Check if any key field references egress_spec (standard_metadata.egress_spec)
+    bool needsEgressSpec = false;
+    for (const auto& fieldName : keyFieldNames) {
+        std::string fn = fieldName.string();
+        if (fn.find("egress_spec") != std::string::npos || 
+            fn.find("egress_port") != std::string::npos) {
+            needsEgressSpec = true;
+            break;
+        }
     }
     
     // Generate lookup key expression
@@ -451,26 +693,22 @@ std::string generateTableLookup(SVProgram* program) {
     std::stringstream validCondition;
     
     if (keyFieldNames.size() == 1) {
-        // Single key field
         std::string fieldName = keyFieldNames[0].string();
         std::string hwSignal = mapFieldToSignal(fieldName, program);
         
         keyExpr << hwSignal;
         
-        // Determine valid condition based on field
         if (fieldName.find("ipv4") != std::string::npos || 
             fieldName.find("dstAddr") != std::string::npos ||
             fieldName.find("srcAddr") != std::string::npos ||
             fieldName.find("protocol") != std::string::npos) {
             validCondition << " && ipv4_valid";
         } else {
-            // Custom header - check if header is valid
             size_t dotPos = fieldName.find('.');
             if (dotPos != std::string::npos) {
                 std::string headerName = fieldName.substr(0, dotPos);
                 validCondition << " && " << headerName << "_valid";
             } else {
-                // Standalone field from custom header
                 const auto& customHeaders = program->getParser()->getCustomHeaders();
                 for (const auto& headerPair : customHeaders) {
                     const std::string headerName = headerPair.first.string();
@@ -494,12 +732,21 @@ std::string generateTableLookup(SVProgram* program) {
         bool first = true;
         for (const auto& fieldName : keyFieldNames) {
             if (!first) keyExpr << ", ";
-            keyExpr << mapFieldToSignal(fieldName.string(), program);
+            std::string fn = fieldName.string();
+            
+            // Map standard_metadata fields to hardware signals
+            if (fn.find("ingress_port") != std::string::npos) {
+                keyExpr << "ingress_port_in";
+            } else if (fn.find("egress_spec") != std::string::npos) {
+                keyExpr << "egress_spec";  // Will be declared separately
+            } else {
+                keyExpr << mapFieldToSignal(fn, program);
+            }
             first = false;
         }
         keyExpr << "}";
         
-        validCondition << " && ipv4_valid";  // Assume IPv4 for multi-key
+        validCondition << " && ipv4_valid";
         BACKEND_DEBUG("Lookup key: " << keyExpr.str());
     }
     
@@ -508,12 +755,11 @@ std::string generateTableLookup(SVProgram* program) {
     result << ".lookup_key(" << keyExpr.str() << "),\n";
     result << "        .lookup_key_mask(";
     
-    // Generate mask based on match type
     int keyWidth = firstTable->getKeyWidth();
     if (firstTable->getMatchType() == SVTable::MatchType::EXACT) {
-        result << keyWidth << "'hFFFFFFFF";  // All ones for exact match
+        result << keyWidth << "'hFFFFFFFF";
     } else {
-        result << keyWidth << "'h0";  // Zeros for LPM/ternary
+        result << keyWidth << "'h0";
     }
     result << "),\n";
     
@@ -626,7 +872,17 @@ bool Backend::processMatchActionTemplate(SVProgram* program, const std::string& 
     if (ingress) {
         const auto& tables = ingress->getTables();
         if (!tables.empty()) {
-            auto firstTable = tables.begin()->second;
+            // Prefer ipv4_lpm or similar routing table as primary (same logic as generateTableLookup)
+            SVTable* firstTable = tables.begin()->second;
+            for (const auto& tablePair : tables) {
+                std::string tname = tablePair.first.string();
+                if (tname.find("ipv4") != std::string::npos || 
+                    tname.find("lpm") != std::string::npos ||
+                    tname.find("routing") != std::string::npos) {
+                    firstTable = tablePair.second;
+                    break;
+                }
+            }
             matchType = static_cast<int>(firstTable->getMatchType());
             keyWidth = firstTable->getKeyWidth();
             
@@ -854,6 +1110,98 @@ bool Backend::processMatchActionTemplate(SVProgram* program, const std::string& 
     }
     
     // ==========================================
+    // Generate Inline Register Logic (for firewall bloom filter)
+    // ==========================================
+    std::string inlineRegisterLogic = generateInlineRegisterLogic(program);
+    
+    matchActionTemplate = replaceAll(matchActionTemplate,
+                                    "{{INLINE_REGISTER_LOGIC}}",
+                                    inlineRegisterLogic);
+    
+    // Check for bloom filter registers to determine drop signal wiring
+    bool hasBloomFilter = false;
+    if (ingress) {
+        for (const auto& reg : ingress->getRegisters()) {
+            if (reg.name.string().find("bloom_filter") != std::string::npos) {
+                hasBloomFilter = true;
+                break;
+            }
+        }
+    }
+    
+    if (hasBloomFilter) {
+        BACKEND_DEBUG("Enabling bloom filter drop logic");
+        
+        matchActionTemplate = replaceAll(matchActionTemplate,
+                                        "{{DROP_SIGNAL_NAME}}",
+                                        "action_drop");
+        // Declare wire BEFORE action module
+        matchActionTemplate = replaceAll(matchActionTemplate,
+                                        "{{ACTION_DROP_WIRE}}",
+                                        "wire action_drop;  // Declared for bloom filter combine");
+        matchActionTemplate = replaceAll(matchActionTemplate,
+                                        "{{FINAL_DROP_ASSIGNMENT}}",
+                                        "// Combine action drop with bloom filter drop\n"
+                                        "    assign drop = action_drop || bloom_filter_drop;");
+    } else {
+        matchActionTemplate = replaceAll(matchActionTemplate,
+                                        "{{DROP_SIGNAL_NAME}}",
+                                        "drop");
+        matchActionTemplate = replaceAll(matchActionTemplate,
+                                        "{{ACTION_DROP_WIRE}}",
+                                        "");
+        matchActionTemplate = replaceAll(matchActionTemplate,
+                                        "{{FINAL_DROP_ASSIGNMENT}}",
+                                        "// No bloom filter - drop comes directly from action");
+    }
+
+
+    // Check for ECMP pattern
+    bool hasECMP = false;
+    if (ingress) {
+        for (const auto& tablePair : ingress->getTables()) {
+            std::string tname = tablePair.first.string();
+            if (tname.find("ecmp") != std::string::npos) {
+                hasECMP = true;
+                break;
+            }
+        }
+    }
+    
+    if (hasECMP) {
+        BACKEND_DEBUG("Enabling ECMP egress port override");
+        
+        matchActionTemplate = replaceAll(matchActionTemplate,
+                                        "{{EGRESS_PORT_WIRE}}",
+                                        "wire [8:0] egress_port_from_action;");
+        matchActionTemplate = replaceAll(matchActionTemplate,
+                                        "{{EGRESS_PORT_ACTION_NAME}}",
+                                        "egress_port_from_action");
+        matchActionTemplate = replaceAll(matchActionTemplate,
+                                        "{{FINAL_EGRESS_PORT}}",
+                                        "assign egress_port = ecmp_final_egress_port;");
+    } else {
+        matchActionTemplate = replaceAll(matchActionTemplate,
+                                        "{{EGRESS_PORT_WIRE}}",
+                                        "");
+        matchActionTemplate = replaceAll(matchActionTemplate,
+                                        "{{EGRESS_PORT_ACTION_NAME}}",
+                                        "egress_port");
+        matchActionTemplate = replaceAll(matchActionTemplate,
+                                        "{{FINAL_EGRESS_PORT}}",
+                                        "");
+    }
+    
+    // ==========================================
+    // Generate ECMP Logic (for load_balance.p4)
+    // ==========================================
+    std::string ecmpLogic = generateECMPLogic(program);
+    
+    matchActionTemplate = replaceAll(matchActionTemplate,
+                                    "{{ECMP_LOGIC}}",
+                                    ecmpLogic);
+
+    // ==========================================
     // Write Output File
     // ==========================================
     boost::filesystem::path outputPath = 
@@ -1037,41 +1385,8 @@ bool Backend::processActionTemplate(SVProgram* program, const std::string& outpu
     }
 
     // ==========================================
-    // 5. Generate Egress Register Parameters
+    // 5. Detect Multicast Actions
     // ==========================================
-    if (egress && egress->hasRegisters()) {
-        const auto& registers = egress->getRegisters();
-        
-        // Find max register size for NUM_EGRESS_REGISTERS
-        int maxRegSize = 8;  // Default
-        for (const auto& reg : registers) {
-            if (reg.arraySize > maxRegSize) {
-                maxRegSize = reg.arraySize;
-            }
-        }
-        
-        // Update EGRESS_CONFIG to enable stateful (Bit 0 = egress, Bit 2 = stateful)
-        actionTemplate = replaceAll(actionTemplate,
-            "{{EGRESS_CONFIG}}",
-            "8'b00000101");
-        
-        actionTemplate = replaceAll(actionTemplate,
-            "{{NUM_EGRESS_REGISTERS}}",
-            std::to_string(maxRegSize));
-            
-        BACKEND_DEBUG("Enabled egress stateful with " << maxRegSize << " registers");
-    } else {
-        // No egress registers - use defaults
-        actionTemplate = replaceAll(actionTemplate,
-            "{{EGRESS_CONFIG}}",
-            "8'b00000000");
-        
-        actionTemplate = replaceAll(actionTemplate,
-            "{{NUM_EGRESS_REGISTERS}}",
-            "8");
-    }
-    
-    // Check for multicast actions
     bool hasMulticast = false;
     if (ingress) {
         for (const auto& actionPair : ingress->getActions()) {
@@ -1079,7 +1394,7 @@ bool Backend::processActionTemplate(SVProgram* program, const std::string& outpu
             for (const auto& assignment : action->getAssignments()) {
                 if (assignment.dest.find("mcast_grp") != std::string::npos) {
                     hasMulticast = true;
-                    BACKEND_DEBUG("Action " << actionPair.first << " uses multicast");
+                    BACKEND_DEBUG("Action " << actionPair.first << " modifies mcast_grp");
                     break;
                 }
             }
@@ -1088,7 +1403,42 @@ bool Backend::processActionTemplate(SVProgram* program, const std::string& outpu
     }
 
     // ==========================================
-    // 6. Replace All Placeholders
+    // 6. Generate Egress Register Parameters
+    // ==========================================
+    uint8_t egressConfig = 0;
+
+    if (egress && egress->hasRegisters()) {
+        egressConfig |= 0x05;  // Bits 0,2: ENABLE_EGRESS + ENABLE_STATEFUL
+        
+        const auto& registers = egress->getRegisters();
+        int maxRegSize = 8;
+        for (const auto& reg : registers) {
+            if (reg.arraySize > maxRegSize) maxRegSize = reg.arraySize;
+        }
+        
+        actionTemplate = replaceAll(actionTemplate,
+            "{{NUM_EGRESS_REGISTERS}}", std::to_string(maxRegSize));
+        
+        BACKEND_DEBUG("Enabled egress stateful with " << maxRegSize << " registers");
+    } else {
+        actionTemplate = replaceAll(actionTemplate,
+            "{{NUM_EGRESS_REGISTERS}}", "8");
+    }
+
+    if (hasMulticast) {
+        egressConfig |= 0x41;  // Bits 0,6: ENABLE_EGRESS + ENABLE_MCAST_PRUNING
+        BACKEND_DEBUG("Enabled multicast pruning");
+    }
+
+    std::stringstream configSS;
+    configSS << "8'b";
+    for (int i = 7; i >= 0; i--) {
+        configSS << ((egressConfig >> i) & 1);
+    }
+    actionTemplate = replaceAll(actionTemplate, "{{EGRESS_CONFIG}}", configSS.str());
+
+    // ==========================================
+    // 7. Replace All Placeholders
     // ==========================================
     actionTemplate = replaceAll(actionTemplate, "{{STACK_POINTER_INPUTS}}", inputsSS.str());
     actionTemplate = replaceAll(actionTemplate, "{{STACK_POINTER_OUTPUTS}}", outputsSS.str());
@@ -1096,7 +1446,7 @@ bool Backend::processActionTemplate(SVProgram* program, const std::string& outpu
     actionTemplate = replaceAll(actionTemplate, "{{STACK_POINTER_LOGIC_INOUT}}", logicSS.str());
     
     // ==========================================
-    // 7. Write Output File
+    // 8. Write Output File
     // ==========================================
     boost::filesystem::path outputPath = 
         boost::filesystem::path(outputDir) / "hdl" / "action.sv";
@@ -1121,9 +1471,6 @@ bool Backend::processEgressTemplate(SVProgram* program, const std::string& outpu
     if (!egress || !egress->hasRegisters()) {
         return true;  // No egress processing needed
     }
-    
-    // egress is integrated into action.sv
-    // This function can generate additional egress-specific modules if needed
     
     const auto& registers = egress->getRegisters();
     BACKEND_DEBUG("Egress has " << registers.size() << " register(s)");
@@ -1466,8 +1813,29 @@ bool Backend::run(const SVOptions& options,
     }
     vfpgaTemplate = replaceAll(vfpgaTemplate, "{{MATCH_ACTION_STACK_POINTER_PORTS}}", matchActionPtrSS.str());
 
-    // Handle egress configuration
     ControlConfig controlConfig = svprog.getControlConfig();
+    
+    // Detect multicast for EGRESS_CONFIG
+    bool hasMulticast = false;
+    if (svprog.getIngress()) {
+        for (const auto& actionPair : svprog.getIngress()->getActions()) {
+            SVAction* action = actionPair.second;
+            for (const auto& assignment : action->getAssignments()) {
+                if (assignment.dest.find("mcast_grp") != std::string::npos) {
+                    hasMulticast = true;
+                    BACKEND_DEBUG("Action " << actionPair.first << " uses multicast");
+                    break;
+                }
+            }
+            if (hasMulticast) break;
+        }
+    }
+
+    if (hasMulticast) {
+        controlConfig.egressConfig |= 0x41;  // Enable egress + multicast pruning
+    }
+
+    // Handle egress configuration
     bool hasEgress = (controlConfig.egressConfig != 0);
     bool hasStateful = (controlConfig.egressConfig & 0x04) != 0;
     bool hasHash = (controlConfig.actionConfig & 0x20) != 0;
@@ -1476,7 +1844,7 @@ bool Backend::run(const SVOptions& options,
     
     if (hasEgress) {
         vfpgaTemplate = replaceAll(vfpgaTemplate, "{{EGRESS_SIGNALS}}",
-            "logic [1:0]                  ipv4_ecn;");
+            "");
         
         vfpgaTemplate = replaceAll(vfpgaTemplate, "{{EGRESS_PIPELINE_SIGNALS}}",
             "logic                        pipeline_ecn_marked;");

@@ -121,7 +121,9 @@ module parser #(
     output reg  [DATA_WIDTH-1:0]     payload_data,
     output reg  [KEEP_WIDTH-1:0]     payload_keep,
     output reg                       payload_valid,
-    output reg                       payload_last
+    output reg                       payload_last,
+
+    output reg  [8:0]  ingress_port
 );
 
     // ==========================================

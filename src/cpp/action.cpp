@@ -343,11 +343,26 @@ void SVAction::analyzeBody() {
     // Analyze action body to determine what fields are modified
     for (auto stmt : p4action->body->components) {
         if (auto assign = stmt->to<IR::AssignmentStatement>()) {
-            if (auto lhs = assign->left->to<IR::Member>()) {
-                auto fieldName = lhs->member;
-                // Store the assignment for code generation
-                fieldModifications[fieldName] = cstring::literal("modified");
-                ACTION_TRACE("Action " << actionName << " modifies field: " << fieldName);
+            Assignment a;
+            
+            // Build full destination path
+            if (auto member = assign->left->to<IR::Member>()) {
+                std::stringstream destSS;
+                
+                // Handle nested members: standard_metadata.mcast_grp
+                if (auto parent = member->expr->to<IR::Member>()) {
+                    destSS << parent->member.string() << "." << member->member.string();
+                } else if (auto path = member->expr->to<IR::PathExpression>()) {
+                    destSS << path->path->name.string() << "." << member->member.string();
+                } else {
+                    destSS << member->member.string();
+                }
+                
+                a.dest = destSS.str();
+                assignments.push_back(a);
+                
+                fieldModifications[member->member] = cstring::literal("modified");
+                ACTION_TRACE("Action " << actionName << " modifies field: " << a.dest);
             }
         } else if (auto methodCall = stmt->to<IR::MethodCallStatement>()) {
             auto method = methodCall->methodCall->method->toString();
