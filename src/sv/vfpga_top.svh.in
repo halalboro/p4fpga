@@ -55,20 +55,15 @@ logic [15:0]                 pipeline_mcast_grp;
 
 {{EGRESS_SIGNALS}}
 
-// Pipeline → Deparser (only modified fields from match_action)
+// Pipeline → Deparser 
 logic [5:0]                  pipeline_ipv4_diffserv;
 logic [1:0]                  pipeline_ipv4_ecn; 
 logic [7:0]                  pipeline_ipv4_ttl;
 logic [8:0]                  pipeline_egress_port_d;
+logic [47:0]                 pipeline_eth_dst_addr;
+logic [47:0]                 pipeline_eth_src_addr;
 
-// Egress probe_data outputs (from match_action)
-logic                        pipeline_out_probe_data_valid;
-logic                        pipeline_out_probe_data_bos;
-logic [6:0]                  pipeline_out_probe_data_swid;
-logic [7:0]                  pipeline_out_probe_data_port;
-logic [31:0]                 pipeline_out_probe_data_byte_cnt;
-logic [47:0]                 pipeline_out_probe_data_last_time;
-logic [47:0]                 pipeline_out_probe_data_cur_time;
+{{PROBE_DATA_SIGNALS}}
 
 {{CUSTOM_HEADER_PIPELINE_SIGNALS}}
 
@@ -281,8 +276,6 @@ match_action #(
     // Egress control
     .enq_qdepth(19'd15),  // TODO: Connect to actual queue depth
     .egress_port_id(pipeline_egress_port_d),
-    .probe_valid({{PROBE_VALID}}),
-    .probe_hop_cnt({{PROBE_HOP_CNT}}),
     
     // Packet output to deparser
     .packet_out(pipeline_data),
@@ -297,6 +290,8 @@ match_action #(
     .out_ipv4_diffserv(pipeline_ipv4_diffserv),
     .out_ipv4_ecn(pipeline_ipv4_ecn),
     .out_ipv4_ttl(pipeline_ipv4_ttl),
+    .out_eth_dst_addr(pipeline_eth_dst_addr),
+    .out_eth_src_addr(pipeline_eth_src_addr),
     
     // Control outputs
     .drop(pipeline_drop),
@@ -316,16 +311,7 @@ match_action #(
     // Statistics outputs
     .packet_count(packet_count),
     .dropped_count(dropped_count),
-    .forwarded_count(forwarded_count),
-
-    // Egress probe data outputs
-    .out_probe_data_valid(pipeline_out_probe_data_valid),
-    .out_probe_data_bos(pipeline_out_probe_data_bos),
-    .out_probe_data_swid(pipeline_out_probe_data_swid),
-    .out_probe_data_port(pipeline_out_probe_data_port),
-    .out_probe_data_byte_cnt(pipeline_out_probe_data_byte_cnt),
-    .out_probe_data_last_time(pipeline_out_probe_data_last_time),
-    .out_probe_data_cur_time(pipeline_out_probe_data_cur_time)
+    .forwarded_count(forwarded_count){{MATCH_ACTION_PROBE_DATA_PORTS}}
 );
 
 // ============================================
@@ -339,9 +325,9 @@ deparser #(
     .aclk(aclk),
     .aresetn(aresetn),
     
-    // Ethernet inputs (pass through from parser - not modified by match_action)
-    .eth_dst_addr(eth_dst_addr),
-    .eth_src_addr(eth_src_addr),
+    // Ethernet inputs 
+    .eth_dst_addr(pipeline_eth_dst_addr),
+    .eth_src_addr(pipeline_eth_src_addr),
     .eth_ether_type(eth_type),
     .eth_valid(ethernet_valid),
     

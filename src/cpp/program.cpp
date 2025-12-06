@@ -118,7 +118,9 @@ bool SVProgram::build() {
             return false;
         }
     }
-    
+        
+    extractConstants(); 
+
     // Process all objects in the program
     for (auto obj : program->objects) {
         if (auto p = obj->to<IR::P4Parser>()) {
@@ -194,8 +196,6 @@ bool SVProgram::build() {
             }
         }
     }
-    
-    extractConstants(); 
 
     // Create defaults only if components weren't found
     if (!parser) {
@@ -254,14 +254,28 @@ void SVProgram::extractConstants() {
     
     for (auto obj : program->objects) {
         if (auto constant = obj->to<IR::Declaration_Constant>()) {
-            if (constant->name == "ECN_THRESHOLD") {
-                if (auto expr = constant->initializer->to<IR::Constant>()) {
-                    ecnThreshold = expr->asUnsigned();  
-                    PROGRAM_TRACE("Found ECN_THRESHOLD = " << ecnThreshold);
+            PROGRAM_TRACE("    Found Declaration_Constant: " << constant->name);
+            
+            const IR::Expression* init = constant->initializer;
+            
+            // Unwrap Cast if present
+            if (auto cast = init->to<IR::Cast>()) {
+                init = cast->expr;
+            }
+            
+            if (auto expr = init->to<IR::Constant>()) {
+                int64_t value = expr->asInt();
+                constants[constant->name] = value;
+                PROGRAM_TRACE("    Value: " << value);
+                
+                if (constant->name == "ECN_THRESHOLD") {
+                    ecnThreshold = expr->asUnsigned();
                 }
             }
         }
     }
+    
+    PROGRAM_TRACE("Extracted " << constants.size() << " constants");
 }
 
 }  // namespace SV

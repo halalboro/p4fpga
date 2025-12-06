@@ -1,4 +1,10 @@
-// backend.h
+/*
+ * P4-FPGA Compiler - Backend Component
+ *
+ * Orchestrates SystemVerilog code generation from P4 IR.
+ * Processes templates and generates synthesizable HDL modules.
+ */
+
 #ifndef BACKENDS_SV_BACKEND_H_
 #define BACKENDS_SV_BACKEND_H_
 
@@ -14,7 +20,8 @@ private:
     P4::TypeMap* typeMap;
     
     bool copyStaticTemplates(const std::string& outputDir);
-    
+
+    bool processMatchTemplate(SVProgram* program, const std::string& outputDir);
     bool processMatchActionTemplate(SVProgram* program, const std::string& outputDir);
     bool processActionTemplate(SVProgram* program, const std::string& outputDir);
     bool processEgressTemplate(SVProgram* program, const std::string& outputDir);

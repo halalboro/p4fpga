@@ -1,3 +1,10 @@
+/*
+ * P4-FPGA Compiler - Common Definitions and Data Structures
+ *
+ * This file contains shared type definitions, global data structures,
+ * and utility functions used throughout the P4-to-HDL compiler.
+ */
+
 #ifndef P4FPGA_COMMON_H
 #define P4FPGA_COMMON_H
 
@@ -79,6 +86,7 @@ namespace SV {
         bool isAccept;
         std::vector<cstring> extractedHeaders;  // Names of headers to extract
         std::map<cstring, cstring> transitions;  // condition -> next_state
+        std::map<P4::cstring, uint64_t> ethertypeValues; // nextState -> ethertype value
         
         ExtractedParserState(cstring n) : name(n), isStart(false), isAccept(false) {}
     };
@@ -151,17 +159,6 @@ namespace SV {
         return cs.isNull() ? "" : cs.c_str();
     }
     
-    // Logging macros (if not already defined)
-    #ifndef LOG1
-    #define LOG1(x) LOG4(x)
-    #endif
-    #ifndef LOG2
-    #define LOG2(x) LOG4(x)
-    #endif
-    #ifndef LOG3
-    #define LOG3(x) LOG4(x)
-    #endif
-    
 }  // namespace SV
 
-#endif
+#endif  // P4FPGA_COMMON_H

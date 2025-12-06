@@ -36,6 +36,9 @@ public:
     
     std::map<const IR::Node*, const IR::Type*> metadata_to_table;
     std::set<cstring> reservedWords;
+
+    std::map<cstring, int64_t> constants;
+    const std::map<cstring, int64_t>& getConstants() const { return constants; }    
     
     struct {
         int dataWidth = 512;

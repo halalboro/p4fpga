@@ -1,3 +1,11 @@
+/*
+ * P4-FPGA Compiler - Parser Component
+ *
+ * Handles P4 parser analysis and SystemVerilog parser generation.
+ * Extracts header definitions, parse states, transitions, and custom headers.
+ * Generates parser configuration for hardware implementation.
+ */
+
 #ifndef EXTENSIONS_CPP_LIBP4FPGA_INCLUDE_PARSER_H_
 #define EXTENSIONS_CPP_LIBP4FPGA_INCLUDE_PARSER_H_
 
@@ -43,6 +51,8 @@ public:
         std::map<cstring, CustomHeaderField> fields;    // Field name → field info
         int totalWidth;                                 // Total header width in bits (per element for stacks)
         int parserBit;                                  // Parser config bit position
+
+        uint16_t ethertype = 0x1234;
 
         // Stack-specific properties
         bool isStack = false;                          // Is this a header stack?

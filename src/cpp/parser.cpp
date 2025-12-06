@@ -19,9 +19,6 @@ namespace SV {
 #define PARSER_DEBUG(msg) if (SV::g_verbose) std::cerr << "  " << msg << std::endl
 #define PARSER_TRACE(msg) if (SV::g_verbose) std::cerr << "    " << msg << std::endl
 
-// Global storage for extracted parser states
-std::map<P4::cstring, std::vector<ExtractedParserState>> g_extractedParserStates;
-
 // ==========================================
 // Constructor
 // ==========================================
@@ -472,6 +469,13 @@ void SVParser::extractParserConfiguration() {
     
     parserConfig = 0;
     
+    // If we have custom headers, we MUST enable Ethernet parsing
+    // because custom headers are detected via ethertype after Ethernet
+    if (!customHeaders.empty()) {
+        parserConfig |= (1 << PARSE_ETHERNET);
+        PARSER_TRACE("Enabled Ethernet (required for custom headers)");
+    }
+    
     // Map header names to configuration bits
     for (auto& header : headerSequence) {
         std::string headerName = header.name.string();
@@ -504,7 +508,7 @@ void SVParser::extractParserConfiguration() {
 }
 
 // ==========================================
-// Extract Custom Headers (PHASE 1.7 - COMPLETE)
+// Extract Custom Headers 
 // Detects both single headers AND header stacks from P4 struct
 // ==========================================
 
@@ -553,20 +557,16 @@ void SVParser::extractCustomHeaders() {
     for (auto field : headersType->fields) {
         auto fieldType = field->type;
         
-        // DEBUG OUTPUT: Show what types we're seeing
         if (g_verbose) {
             std::cerr << "    Field: " << field->name 
                       << " Type: " << fieldType->node_type_name() << std::endl;
         }
         
-        // ==========================================
         // CASE 1: Single Header
-        // ==========================================
         if (fieldType->is<IR::Type_Header>()) {
             auto headerType = fieldType->to<IR::Type_Header>();
             if (!headerType) continue;
             
-            // Check if this is a standard header we already support
             cstring headerName = headerType->name;
             
             if (headerName == "ethernet_t" || 
@@ -575,11 +575,9 @@ void SVParser::extractCustomHeaders() {
                 headerName == "tcp_t" || 
                 headerName == "udp_t" ||
                 headerName == "vlan_tag_t") {
-                // Skip standard headers
                 continue;
             }
             
-            // This is a custom header!
             CustomHeaderInfo info;
             info.name = field->name;
             info.isStack = false;
@@ -587,7 +585,6 @@ void SVParser::extractCustomHeaders() {
             info.elementTypeName = headerName;
             info.parserBit = nextCustomBit++;
             
-            // Extract fields
             int bitOffset = 0;
             for (auto hdrField : headerType->fields) {
                 CustomHeaderField fieldInfo;
@@ -607,16 +604,13 @@ void SVParser::extractCustomHeaders() {
                           << " (" << info.totalWidth << " bits)" << std::endl;
             }
         }
-        // ==========================================
         // CASE 2: Header Stack (Array)
-        // ==========================================
         else if (fieldType->is<IR::Type_Array>()) {
             auto arrayType = fieldType->to<IR::Type_Array>();
             if (!arrayType) continue;
             
             cstring stackName = field->name;
             
-            // Get element type
             auto elementType = arrayType->elementType->to<IR::Type_Header>();
             if (!elementType) {
                 if (g_verbose) {
@@ -626,8 +620,7 @@ void SVParser::extractCustomHeaders() {
                 continue;
             }
             
-            // Get array size
-            int stackSize = 10; // Default
+            int stackSize = 10;
             if (auto sizeExpr = arrayType->size->to<IR::Constant>()) {
                 stackSize = sizeExpr->asInt();
             }
@@ -639,7 +632,6 @@ void SVParser::extractCustomHeaders() {
             info.elementTypeName = elementType->name;
             info.parserBit = nextCustomBit++;
             
-            // Extract fields and detect BOS
             int bitOffset = 0;
             bool foundBos = false;
             
@@ -687,6 +679,32 @@ void SVParser::extractCustomHeaders() {
         }
     }
     
+    // ==========================================
+    // Resolve ethertypes from extracted parser states
+    // ==========================================
+    if (g_extractedParserStates.count(p4parser->name)) {
+        for (const auto& state : g_extractedParserStates[p4parser->name]) {
+            for (const auto& etPair : state.ethertypeValues) {
+                std::string nextStateName = etPair.first.string();
+                uint64_t ethertypeValue = etPair.second;
+                
+                for (auto& chPair : customHeaders) {
+                    std::string headerName = chPair.first.string();
+                    
+                    // Match by name similarity
+                    if (nextStateName.find(headerName) != std::string::npos ||
+                        headerName.find(nextStateName) != std::string::npos ||
+                        nextStateName.find("parse_" + headerName) != std::string::npos ||
+                        nextStateName.find("check_" + headerName) != std::string::npos) {
+                        chPair.second.ethertype = static_cast<uint16_t>(ethertypeValue);
+                        PARSER_DEBUG("Resolved ethertype for " << headerName 
+                                    << ": 0x" << std::hex << ethertypeValue << std::dec);
+                    }
+                }
+            }
+        }
+    }
+
     if (g_verbose && !customHeaders.empty()) {
         std::cerr << "    Extracted " << customHeaders.size() 
                   << " custom header(s)" << std::endl;

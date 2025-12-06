@@ -63,6 +63,95 @@ std::string replaceAll(std::string str, const std::string& from, const std::stri
 }
 
 // ======================================
+// Helper: Check if action only modifies DSCP/diffserv
+// ======================================
+static bool isDscpOnlyAction(SVProgram* program, const std::string& actionName) {
+    if (!program->getIngress()) return false;
+
+    const auto& actions = program->getIngress()->getActions();
+    auto it = actions.find(cstring(actionName));
+    if (it == actions.end()) return false;
+
+    SVAction* action = it->second;
+    const auto& assignments = action->getAssignments();
+
+    // Check if all assignments only modify diffserv
+    for (const auto& assign : assignments) {
+        // dest format is typically "ipv4.diffserv" or similar
+        if (assign.dest.find("diffserv") == std::string::npos &&
+            assign.dest.find("dscp") == std::string::npos) {
+            // This action modifies something other than DSCP
+            return false;
+        }
+    }
+
+    // Action only modifies DSCP (or is empty)
+    return !assignments.empty();
+}
+
+// ======================================
+// Helper: Extract DSCP value from action
+// ======================================
+static int getDscpValueFromAction(SVProgram* program, const std::string& actionName) {
+    if (!program->getIngress()) return 0;
+
+    const auto& actions = program->getIngress()->getActions();
+    auto it = actions.find(cstring(actionName));
+    if (it == actions.end()) return 0;
+
+    SVAction* action = it->second;
+    const auto& assignments = action->getAssignments();
+
+    for (const auto& assign : assignments) {
+        if (assign.dest.find("diffserv") != std::string::npos ||
+            assign.dest.find("dscp") != std::string::npos) {
+            // Try to parse the source as a constant
+            try {
+                return std::stoi(assign.source);
+            } catch (...) {
+                return 0;
+            }
+        }
+    }
+    return 0;
+}
+
+// ======================================
+// Helper: Detect Source Routing Pattern
+// ======================================
+// Source routing uses header stacks and isValid() checks.
+// The pattern is: if srcRoutes[0].isValid() { srcRoute_nhop(); } else { drop(); }
+// This maps to: ipv4_valid ? DROP : srcRoute_nhop
+static bool isSourceRoutingPattern(SVProgram* program) {
+    if (!program->getIngress()) return false;
+
+    const auto& actions = program->getIngress()->getActions();
+
+    // Check for srcRoute_nhop action
+    bool hasSrcRouteNhop = false;
+    for (const auto& action : actions) {
+        std::string actionName = action.first.string();
+        if (actionName.find("srcRoute") != std::string::npos ||
+            actionName.find("source_route") != std::string::npos) {
+            hasSrcRouteNhop = true;
+            break;
+        }
+    }
+
+    // Check if there's a header stack (srcRoutes, etc.) by looking at stack operations
+    bool hasStackOps = false;
+    for (const auto& action : actions) {
+        SVAction* svAction = action.second;
+        if (!svAction->getStackOperations().empty()) {
+            hasStackOps = true;
+            break;
+        }
+    }
+
+    return hasSrcRouteNhop || hasStackOps;
+}
+
+// ======================================
 // Generate Conditional Logic
 // ======================================
 
@@ -70,62 +159,100 @@ std::string generateConditionalLogic(SVProgram* program) {
     if (g_detectedIfElse.empty()) {
         return "";
     }
-    
+
     BACKEND_DEBUG("Generating conditional logic for " << g_detectedIfElse.size() << " if-else statement(s)");
-    
+
+    // Special case: Source routing pattern
+    // For source routing, we use packet type detection instead of header field comparison
+    if (isSourceRoutingPattern(program)) {
+        BACKEND_DEBUG("Detected source routing pattern - using simplified logic");
+
+        std::stringstream ss;
+        ss << "\n    // ==========================================\n";
+        ss << "    //          Conditional Action Selection\n";
+        ss << "    // ==========================================\n";
+        ss << "    // Source Routing Action Logic:\n";
+        ss << "    // - Source routed packets (eth_type=0x1234, ipv4_valid=0): use srcRoute_nhop action (2)\n";
+        ss << "    // - Regular IPv4 packets (eth_type=0x0800, ipv4_valid=1): DROP (no srcRoutes)\n";
+        ss << "    //\n";
+        ss << "    // Detection: use match_ipv4_valid which is already pipelined by match module\n\n";
+
+        // Use fixed action IDs that match action.sv localparams:
+        // ACTION_DROP = 4'd1, srcRoute_nhop is handled as action_id=2 in action.sv case statement
+        // The action module has hardcoded handling for these IDs
+        int dropActionId = 1;       // ACTION_DROP in action.sv
+        int srcRouteActionId = 2;   // srcRoute_nhop case in action.sv
+
+        ss << "    // Final action selection based on packet type\n";
+        ss << "    wire [3:0] final_action_id;\n";
+        ss << "    assign final_action_id = match_ipv4_valid ? 4'd" << dropActionId << " :  // Regular IPv4 -> DROP\n";
+        ss << "                                                4'd" << srcRouteActionId << ";   // Source routed -> srcRoute_nhop\n\n";
+
+        return ss.str();
+    }
+
     std::stringstream ss;
-    
-    ss << "\n    // ==========================================\n";
-    ss << "    //          Conditional Action Selection\n";
-    ss << "    // ==========================================\n";
-    ss << "    // Overrides table action when conditions match\n\n";
-    
+
+    // Separate DSCP-only conditionals from action-override conditionals
+    std::vector<std::tuple<std::string, std::string, int>> dscpConditions;  // (condition, hwSignal, dscpValue)
+    std::vector<std::tuple<std::string, std::string, int, int>> actionConditions;  // (condition, hwSignal, trueActionId, falseActionId)
+
     // Get action list to map names to IDs
     const auto& actions = program->getIngress()->getActions();
     std::map<std::string, int> actionNameToId;
-    
+
     int actionIdx = 0;
     for (const auto& action : actions) {
         actionNameToId[action.first.string()] = actionIdx;
         actionIdx++;
     }
-    
-    // Generate conditional logic
-    bool hasConditional = false;
-    int condId = 0;
-    
+
+    // Classify each conditional
     for (const auto& ifElse : g_detectedIfElse) {
         // Only generate for ingress control
         if (ifElse.controlName != "MyIngress") {
             continue;
         }
-        
+
         // Parse the condition
         if (auto equ = ifElse.condition->to<IR::Equ>()) {
             auto left = equ->left;
             auto right = equ->right;
-            
+
             // Extract header type, field name, and value
             std::string headerType;  // "ipv4", "tcp", "udp", etc.
             std::string fieldName;
             std::string compareValue;
             int bitWidth = 8;
-            
+
             // ==========================================
             // LEFT SIDE: Extract header.field
             // ==========================================
+            bool isHeaderStack = false;
+            int stackIndex = 0;
+
             if (auto member = left->to<IR::Member>()) {
                 fieldName = member->member.string();
-                
+
                 // Try to determine header type from the expression
                 if (auto pathExpr = member->expr->to<IR::Member>()) {
                     // Pattern: hdr.ipv4.protocol or hdr.tcp.dstPort
                     headerType = pathExpr->member.string();
+                } else if (auto arrayIndex = member->expr->to<IR::ArrayIndex>()) {
+                    // Pattern: hdr.srcRoutes[0].bos (header stack access)
+                    isHeaderStack = true;
+                    if (auto constant = arrayIndex->right->to<IR::Constant>()) {
+                        stackIndex = constant->asInt();
+                    }
+                    if (auto stackMember = arrayIndex->left->to<IR::Member>()) {
+                        headerType = stackMember->member.string();
+                    }
+                    BACKEND_DEBUG("  Detected header stack access: " << headerType << "[" << stackIndex << "]." << fieldName);
                 } else {
                     // Fallback: assume IPv4 for common fields
                     headerType = "ipv4";
                 }
-                
+
                 // Map field name to hardware signal and bit width
                 if (fieldName == "protocol") {
                     bitWidth = 8;
@@ -137,11 +264,15 @@ std::string generateConditionalLogic(SVProgram* program) {
                     bitWidth = 16;
                 } else if (fieldName == "ttl") {
                     bitWidth = 8;
+                } else if (fieldName == "bos") {
+                    bitWidth = 1;  // Bottom-of-stack bit
+                } else if (fieldName == "port") {
+                    bitWidth = 15;  // Source routing port field
                 } else {
                     bitWidth = 8;  // Default
                 }
             }
-            
+
             // ==========================================
             // RIGHT SIDE: Extract comparison value
             // ==========================================
@@ -150,128 +281,234 @@ std::string generateConditionalLogic(SVProgram* program) {
             } else if (auto path = right->to<IR::PathExpression>()) {
                 // Named constant (e.g., IP_PROTOCOLS_UDP)
                 std::string constName = path->path->name.string();
-                
+
                 if (constName == "IP_PROTOCOLS_UDP") compareValue = "17";
                 else if (constName == "IP_PROTOCOLS_TCP") compareValue = "6";
                 else if (constName == "IP_PROTOCOLS_ICMP") compareValue = "1";
                 else if (constName == "IP_PROTOCOLS_IGMP") compareValue = "2";
                 else compareValue = "0";
             }
-            
+
             if (!fieldName.empty() && !compareValue.empty()) {
-                hasConditional = true;
-                condId++;
-                
                 // ==========================================
                 // MAP TO HARDWARE SIGNAL
                 // ==========================================
                 std::string hwSignal;
-                
+
                 // Map based on header type and field name
-                if (headerType == "ipv4" || headerType == "ipv6") {
+                if (isHeaderStack) {
+                    // Header stack: srcRoutes[0].bos -> srcRoutes_bos[0]
+                    hwSignal = headerType + "_" + fieldName + "[" + std::to_string(stackIndex) + "]";
+                    BACKEND_DEBUG("  Header stack signal: " << hwSignal);
+                } else if (headerType == "ipv4" || headerType == "ipv6") {
                     hwSignal = headerType + "_" + fieldName;
                 } else if (headerType == "tcp") {
-                    // TCP fields map to ipv4_src_port/ipv4_dst_port
                     if (fieldName == "srcPort") {
                         hwSignal = "ipv4_src_port";
                     } else if (fieldName == "dstPort") {
                         hwSignal = "ipv4_dst_port";
                     } else {
-                        hwSignal = "tcp_" + fieldName;  // For future TCP fields
+                        hwSignal = "tcp_" + fieldName;
                     }
                 } else if (headerType == "udp") {
-                    // UDP fields also map to ipv4_src_port/ipv4_dst_port
                     if (fieldName == "srcPort") {
                         hwSignal = "ipv4_src_port";
                     } else if (fieldName == "dstPort") {
                         hwSignal = "ipv4_dst_port";
                     } else {
-                        hwSignal = "udp_" + fieldName;  // For future UDP fields
+                        hwSignal = "udp_" + fieldName;
                     }
                 } else {
-                    // Fallback: assume IPv4
                     hwSignal = "ipv4_" + fieldName;
                 }
-                
-                // ==========================================
-                // LOOKUP ACTION IDs
-                // ==========================================
-                int trueActionId = 0;  // NoAction
-                int falseActionId = 0;
-                
-                auto trueIt = actionNameToId.find(ifElse.trueAction.string());
-                if (trueIt != actionNameToId.end()) {
-                    trueActionId = trueIt->second;
-                }
-                
-                if (!ifElse.falseAction.isNullOrEmpty()) {
-                    auto falseIt = actionNameToId.find(ifElse.falseAction.string());
-                    if (falseIt != actionNameToId.end()) {
-                        falseActionId = falseIt->second;
+
+                // Build condition string
+                std::string condStr = "(" + hwSignal + " == " + std::to_string(bitWidth) + "'d" + compareValue + ")";
+
+                // Check if this is a DSCP-only action
+                std::string trueActionName = ifElse.trueAction.string();
+                if (isDscpOnlyAction(program, trueActionName)) {
+                    int dscpValue = getDscpValueFromAction(program, trueActionName);
+                    dscpConditions.push_back(std::make_tuple(condStr, hwSignal, dscpValue));
+
+                    BACKEND_DEBUG("  DSCP-only conditional: " << headerType << "." << fieldName
+                                << " == " << compareValue << " → DSCP=" << dscpValue);
+                } else {
+                    // Regular action override
+                    int trueActionId = 0;
+                    int falseActionId = 0;
+
+                    auto trueIt = actionNameToId.find(trueActionName);
+                    if (trueIt != actionNameToId.end()) {
+                        trueActionId = trueIt->second;
                     }
+
+                    if (!ifElse.falseAction.isNullOrEmpty()) {
+                        auto falseIt = actionNameToId.find(ifElse.falseAction.string());
+                        if (falseIt != actionNameToId.end()) {
+                            falseActionId = falseIt->second;
+                        }
+                    }
+
+                    actionConditions.push_back(std::make_tuple(condStr, hwSignal, trueActionId, falseActionId));
+
+                    BACKEND_DEBUG("  Action-override conditional: " << headerType << "." << fieldName
+                                << " == " << compareValue
+                                << " → true=" << ifElse.trueAction << " (id=" << trueActionId << ")"
+                                << ", false=" << ifElse.falseAction << " (id=" << falseActionId << ")");
                 }
-                
-                // ==========================================
-                // GENERATE HARDWARE LOGIC
-                // ==========================================
-                ss << "    // Conditional #" << condId << ": " 
-                   << headerType << "." << fieldName << " == " << compareValue << "\n";
-                ss << "    wire cond_" << condId << "_match;\n";
-                ss << "    wire [2:0] cond_" << condId << "_action;\n";
-                ss << "    assign cond_" << condId << "_match = (" << hwSignal 
-                   << " == " << bitWidth << "'d" << compareValue << ");\n";
-                ss << "    assign cond_" << condId << "_action = cond_" << condId << "_match ? 3'd" 
-                   << trueActionId << " : 3'd" << falseActionId << ";\n\n";
-                
-                BACKEND_DEBUG("  Cond " << condId << ": " << headerType << "." << fieldName 
-                            << " == " << compareValue 
-                            << " → hw=" << hwSignal
-                            << ", true=" << ifElse.trueAction << " (id=" << trueActionId << ")"
-                            << ", false=" << ifElse.falseAction << " (id=" << falseActionId << ")");
             }
         }
     }
-    
-    if (!hasConditional) {
-        return "";
-    }
-    
+
     // ==========================================
-    // Generate Action Override Logic
+    // Generate DSCP Override Logic (Post-Action)
     // ==========================================
-    ss << "    // Action Override Logic\n";
-    ss << "    // When conditional matches, override table action\n";
-    ss << "    wire conditional_override;\n";
-    ss << "    wire [2:0] conditional_action_id;\n\n";
-    
-    if (condId == 1) {
-        // Single condition
-        ss << "    assign conditional_override = cond_1_match;\n";
-        ss << "    assign conditional_action_id = cond_1_action;\n\n";
-    } else {
-        // Multiple conditions - OR them together
-        ss << "    assign conditional_override = ";
-        for (int i = 1; i <= condId; i++) {
-            if (i > 1) ss << " || ";
-            ss << "cond_" << i << "_match";
+    if (!dscpConditions.empty()) {
+        ss << "\n    // ==========================================\n";
+        ss << "    //          QoS DSCP Override Logic\n";
+        ss << "    // ==========================================\n";
+        ss << "    // Post-action DSCP modification based on protocol\n";
+        ss << "    // Allows forwarding action to execute normally,\n";
+        ss << "    // then overrides DSCP field based on conditions\n\n";
+
+        // Pipeline protocol detection to align with action output (3 cycles)
+        ss << "    // Pipeline protocol detection to align with action output (3 cycles)\n";
+        ss << "    reg [7:0] proto_d1, proto_d2, proto_d3;\n";
+        ss << "    reg ipv4_valid_d1, ipv4_valid_d2, ipv4_valid_d3;\n\n";
+
+        ss << "    always @(posedge aclk) begin\n";
+        ss << "        if (!aresetn) begin\n";
+        ss << "            proto_d1 <= 8'd0;\n";
+        ss << "            proto_d2 <= 8'd0;\n";
+        ss << "            proto_d3 <= 8'd0;\n";
+        ss << "            ipv4_valid_d1 <= 1'b0;\n";
+        ss << "            ipv4_valid_d2 <= 1'b0;\n";
+        ss << "            ipv4_valid_d3 <= 1'b0;\n";
+        ss << "        end else begin\n";
+        ss << "            proto_d1 <= ipv4_protocol;\n";
+        ss << "            proto_d2 <= proto_d1;\n";
+        ss << "            proto_d3 <= proto_d2;\n";
+        ss << "            ipv4_valid_d1 <= ipv4_valid;\n";
+        ss << "            ipv4_valid_d2 <= ipv4_valid_d1;\n";
+        ss << "            ipv4_valid_d3 <= ipv4_valid_d2;\n";
+        ss << "        end\n";
+        ss << "    end\n\n";
+
+        // Generate condition wires
+        int qosCondId = 0;
+        for (const auto& cond : dscpConditions) {
+            qosCondId++;
+            std::string condStr = std::get<0>(cond);
+            int dscpValue = std::get<2>(cond);
+
+            // Replace the original signal with the delayed version
+            std::string delayedCond = condStr;
+            size_t pos = delayedCond.find("ipv4_protocol");
+            if (pos != std::string::npos) {
+                delayedCond.replace(pos, 13, "proto_d3");
+            }
+
+            ss << "    // QoS Condition #" << qosCondId << ": DSCP = " << dscpValue << "\n";
+            ss << "    wire qos_cond_" << qosCondId << "_match;\n";
+            ss << "    assign qos_cond_" << qosCondId << "_match = ipv4_valid_d3 && " << delayedCond << ";\n\n";
         }
-        ss << ";\n\n";
-        
-        // Priority encoder for action selection (first match wins)
-        ss << "    assign conditional_action_id = \n";
-        for (int i = 1; i <= condId; i++) {
-            ss << "        cond_" << i << "_match ? cond_" << i << "_action :\n";
+
+        // Generate DSCP override mux
+        // Note: action_ipv4_diffserv will be connected from action module output
+        ss << "    // DSCP value from action module (before override)\n";
+        ss << "    wire [5:0] action_ipv4_diffserv;\n\n";
+
+        ss << "    // Final DSCP with QoS override\n";
+        ss << "    wire [5:0] qos_ipv4_diffserv;\n";
+        ss << "    assign qos_ipv4_diffserv = \n";
+
+        qosCondId = 0;
+        for (const auto& cond : dscpConditions) {
+            qosCondId++;
+            int dscpValue = std::get<2>(cond);
+            ss << "        qos_cond_" << qosCondId << "_match ? 6'd" << dscpValue << " :\n";
         }
-        ss << "        3'd0;  // NoAction if no match\n\n";
+        ss << "        action_ipv4_diffserv;  // Default: use action output\n\n";
+
+        BACKEND_DEBUG("Generated QoS DSCP override logic with " << dscpConditions.size() << " condition(s)");
     }
-    
-    ss << "    // Final action selection: conditional overrides table\n";
-    ss << "    wire [2:0] final_action_id;\n";
-    ss << "    assign final_action_id = conditional_override ? conditional_action_id : match_action_id;\n\n";
-    
-    BACKEND_DEBUG("Generated conditional override logic with " << condId << " condition(s)");
-    
+
+    // ==========================================
+    // Generate Action Override Logic (if any)
+    // ==========================================
+    if (!actionConditions.empty()) {
+        ss << "\n    // ==========================================\n";
+        ss << "    //          Conditional Action Selection\n";
+        ss << "    // ==========================================\n";
+        ss << "    // Overrides table action when conditions match\n\n";
+
+        int condId = 0;
+        for (const auto& cond : actionConditions) {
+            condId++;
+            std::string condStr = std::get<0>(cond);
+            int trueActionId = std::get<2>(cond);
+            int falseActionId = std::get<3>(cond);
+
+            ss << "    // Conditional #" << condId << "\n";
+            ss << "    wire cond_" << condId << "_match;\n";
+            ss << "    wire [3:0] cond_" << condId << "_action;\n";
+            ss << "    assign cond_" << condId << "_match = " << condStr << ";\n";
+            ss << "    assign cond_" << condId << "_action = cond_" << condId << "_match ? 4'd"
+               << trueActionId << " : 4'd" << falseActionId << ";\n\n";
+        }
+
+        ss << "    // Action Override Logic\n";
+        ss << "    wire conditional_override;\n";
+        ss << "    wire [3:0] conditional_action_id;\n\n";
+
+        if (condId == 1) {
+            ss << "    assign conditional_override = cond_1_match;\n";
+            ss << "    assign conditional_action_id = cond_1_action;\n\n";
+        } else {
+            ss << "    assign conditional_override = ";
+            for (int i = 1; i <= condId; i++) {
+                if (i > 1) ss << " || ";
+                ss << "cond_" << i << "_match";
+            }
+            ss << ";\n\n";
+
+            ss << "    assign conditional_action_id = \n";
+            for (int i = 1; i <= condId; i++) {
+                ss << "        cond_" << i << "_match ? cond_" << i << "_action :\n";
+            }
+            ss << "        4'd0;  // NoAction if no match\n\n";
+        }
+
+        ss << "    // Final action selection: conditional overrides table\n";
+        ss << "    wire [3:0] final_action_id;\n";
+        ss << "    assign final_action_id = conditional_override ? conditional_action_id : match_action_id;\n\n";
+
+        BACKEND_DEBUG("Generated conditional action override logic with " << actionConditions.size() << " condition(s)");
+    }
+
     return ss.str();
+}
+
+// ======================================
+// Helper: Check if there are DSCP-only conditionals
+// ======================================
+static bool hasDscpOnlyConditionals(SVProgram* program) {
+    if (g_detectedIfElse.empty()) {
+        return false;
+    }
+
+    for (const auto& ifElse : g_detectedIfElse) {
+        if (ifElse.controlName != "MyIngress") {
+            continue;
+        }
+
+        std::string trueActionName = ifElse.trueAction.string();
+        if (isDscpOnlyAction(program, trueActionName)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 // ======================================
@@ -290,9 +527,8 @@ bool Backend::copyStaticTemplates(const std::string& outputDir) {
     // Source directory
     boost::filesystem::path srcDir = "../src/sv/hdl";
     
-    // Define static modules
+    // Define static modules (match.sv is processed separately with custom headers)
     std::map<std::string, std::string> staticModules = {
-        {"match.sv.in", "match.sv"},
         {"stats.sv.in", "stats.sv"}
     };
     
@@ -320,6 +556,106 @@ bool Backend::copyStaticTemplates(const std::string& outputDir) {
         }
     }
     
+    return true;
+}
+
+// ======================================
+// Process Match Module Template
+// ======================================
+
+bool Backend::processMatchTemplate(SVProgram* program, const std::string& outputDir) {
+    BACKEND_DEBUG("Processing match.sv template");
+
+    // Load template
+    std::string matchTemplate = loadTemplate("../src/sv/hdl/match.sv.in");
+    if (matchTemplate.empty()) {
+        BACKEND_ERROR("Failed to load match.sv.in template");
+        return false;
+    }
+
+    // Get custom headers
+    const auto& customHeaders = program->getParser()->getCustomHeaders();
+
+    // Generate custom header inputs (for non-stack headers only: probe)
+    std::stringstream customInputs;
+    std::stringstream customOutputs;
+    std::stringstream customRegs;
+    std::stringstream customRegResets;
+    std::stringstream customRegAssigns;
+    std::stringstream customOutResets;
+    std::stringstream customOutAssigns;
+
+    if (!customHeaders.empty()) {
+        for (const auto& headerPair : customHeaders) {
+            const std::string headerName = headerPair.first.string();
+            const SVParser::CustomHeaderInfo& headerInfo = headerPair.second;
+
+            // Only process non-stack headers (like probe)
+            // Stack headers (probe_data, probe_fwd) pass through match_action directly
+            if (!headerInfo.isStack) {
+                // Generate input ports
+                for (const auto& fieldPair : headerInfo.fields) {
+                    const std::string fieldName = fieldPair.first.string();
+                    const SVParser::CustomHeaderField& field = fieldPair.second;
+
+                    customInputs << "    input  wire [" << (field.width - 1) << ":0]           "
+                                 << headerName << "_" << fieldName << "_in,\n";
+
+                    customOutputs << "    output reg  [" << (field.width - 1) << ":0]           "
+                                  << headerName << "_" << fieldName << "_out,\n";
+
+                    customRegs << "    reg  [" << (field.width - 1) << ":0]                   "
+                               << headerName << "_" << fieldName << "_d1;\n";
+
+                    customRegResets << "            " << headerName << "_" << fieldName << "_d1  <= "
+                                    << field.width << "'b0;\n";
+
+                    customRegAssigns << "            " << headerName << "_" << fieldName << "_d1  <= "
+                                     << headerName << "_" << fieldName << "_in;\n";
+
+                    customOutResets << "            " << headerName << "_" << fieldName << "_out <= "
+                                    << field.width << "'b0;\n";
+
+                    customOutAssigns << "            " << headerName << "_" << fieldName << "_out <= "
+                                     << headerName << "_" << fieldName << "_d1;\n";
+                }
+                // Valid signal
+                customInputs << "    input  wire                           " << headerName << "_valid_in,\n";
+                customOutputs << "    output reg                            " << headerName << "_valid_out,\n";
+                customRegs << "    reg                           " << headerName << "_valid_d1;\n";
+                customRegResets << "            " << headerName << "_valid_d1   <= 1'b0;\n";
+                customRegAssigns << "            " << headerName << "_valid_d1   <= " << headerName << "_valid_in;\n";
+                customOutResets << "            " << headerName << "_valid_out  <= 1'b0;\n";
+                customOutAssigns << "            " << headerName << "_valid_out  <= " << headerName << "_valid_d1;\n";
+            }
+        }
+    }
+
+    // Replace placeholders
+    matchTemplate = replaceAll(matchTemplate, "{{MATCH_CUSTOM_HEADER_INPUTS}}", customInputs.str());
+    matchTemplate = replaceAll(matchTemplate, "{{MATCH_CUSTOM_HEADER_OUTPUTS}}", customOutputs.str());
+    matchTemplate = replaceAll(matchTemplate, "{{MATCH_CUSTOM_HEADER_REGS}}", customRegs.str());
+    matchTemplate = replaceAll(matchTemplate, "{{MATCH_CUSTOM_HEADER_REG_RESETS}}", customRegResets.str());
+    matchTemplate = replaceAll(matchTemplate, "{{MATCH_CUSTOM_HEADER_REG_ASSIGNS}}", customRegAssigns.str());
+    matchTemplate = replaceAll(matchTemplate, "{{MATCH_CUSTOM_HEADER_OUT_RESETS}}", customOutResets.str());
+    matchTemplate = replaceAll(matchTemplate, "{{MATCH_CUSTOM_HEADER_OUT_ASSIGNS}}", customOutAssigns.str());
+
+    // Write output
+    boost::filesystem::path hdlDir = boost::filesystem::path(outputDir) / "hdl";
+    if (!boost::filesystem::exists(hdlDir)) {
+        boost::filesystem::create_directories(hdlDir);
+    }
+
+    std::string outputPath = (hdlDir / "match.sv").string();
+    std::ofstream ofs(outputPath);
+    if (!ofs.is_open()) {
+        BACKEND_ERROR("Failed to create match.sv");
+        return false;
+    }
+    ofs << matchTemplate;
+    ofs.close();
+
+    BACKEND_DEBUG("Generated match.sv with custom headers");
     return true;
 }
 
@@ -369,7 +705,38 @@ std::string generateHashInstantiation(SVProgram* program) {
     
     ss << "    // Use hardware hash result\n";
     ss << "    assign flow_hash = hash_result_0;\n\n";
-    
+
+    // Add pipeline registers to align ECMP signals with action output (3-cycle delay)
+    ss << "    // Pipeline registers to align ECMP signals with action output (3-cycle delay)\n";
+    ss << "    // Stage 1-2: align with match output, Stage 3: align with action output\n";
+    ss << "    reg ecmp_active_d1, ecmp_active_d2, ecmp_active_d3;\n";
+    ss << "    reg [31:0] flow_hash_d1, flow_hash_d2, flow_hash_d3;\n";
+    ss << "    reg match_hit_d1;\n\n";
+
+    ss << "    always @(posedge aclk or negedge aresetn) begin\n";
+    ss << "        if (!aresetn) begin\n";
+    ss << "            ecmp_active_d1 <= 1'b0;\n";
+    ss << "            ecmp_active_d2 <= 1'b0;\n";
+    ss << "            ecmp_active_d3 <= 1'b0;\n";
+    ss << "            flow_hash_d1   <= 32'd0;\n";
+    ss << "            flow_hash_d2   <= 32'd0;\n";
+    ss << "            flow_hash_d3   <= 32'd0;\n";
+    ss << "            match_hit_d1   <= 1'b0;\n";
+    ss << "        end else begin\n";
+    ss << "            // Stage 1: delay inputs\n";
+    ss << "            ecmp_active_d1 <= packet_valid_in && ipv4_valid &&\n";
+    ss << "                             (ipv4_protocol == 8'd6) && (ipv4_ttl > 8'd0);\n";
+    ss << "            flow_hash_d1   <= flow_hash;\n";
+    ss << "            // Stage 2: align with match output\n";
+    ss << "            ecmp_active_d2 <= ecmp_active_d1;\n";
+    ss << "            flow_hash_d2   <= flow_hash_d1;\n";
+    ss << "            // Stage 3: align with action output (one more cycle)\n";
+    ss << "            ecmp_active_d3 <= ecmp_active_d2;\n";
+    ss << "            flow_hash_d3   <= flow_hash_d2;\n";
+    ss << "            match_hit_d1   <= match_hit;\n";
+    ss << "        end\n";
+    ss << "    end\n\n";
+
     return ss.str();
 }
 
@@ -393,26 +760,45 @@ std::string mapFieldToSignal(const std::string& p4FieldName, SVProgram* program)
         }
     }
     
-    // Standard field mapping
-    if (p4FieldName == "dstAddr") return "ipv4_dst_addr";
-    if (p4FieldName == "srcAddr") return "ipv4_src_addr";
-    if (p4FieldName == "protocol") return "ipv4_protocol";
-    if (p4FieldName == "op") return "p4calc_op";  // For calc.p4
-    
-    // Try pattern matching for "header.field"
+    // Try pattern matching for "header.field" FIRST (more specific)
     size_t dotPos = p4FieldName.find('.');
     if (dotPos != std::string::npos) {
         std::string headerName = p4FieldName.substr(0, dotPos);
         std::string fieldName = p4FieldName.substr(dotPos + 1);
-        
+
         // Check if it's a custom header
         if (customHeaders.count(cstring(headerName))) {
             return headerName + "_" + fieldName;
         }
-        
-        // Standard headers
+
+        // Standard header mappings with proper signal names
+        if (headerName == "ethernet" || headerName == "eth") {
+            if (fieldName == "dstAddr") return "eth_dst_addr";
+            if (fieldName == "srcAddr") return "eth_src_addr";
+            if (fieldName == "etherType") return "eth_type";
+        }
+        if (headerName == "ipv4") {
+            if (fieldName == "dstAddr") return "ipv4_dst_addr";
+            if (fieldName == "srcAddr") return "ipv4_src_addr";
+            if (fieldName == "protocol") return "ipv4_protocol";
+            if (fieldName == "ttl") return "ipv4_ttl";
+            if (fieldName == "diffserv") return "ipv4_diffserv";
+            if (fieldName == "ecn") return "ipv4_ecn";
+        }
+        if (headerName == "tcp" || headerName == "udp") {
+            if (fieldName == "srcPort") return headerName + "_src_port";
+            if (fieldName == "dstPort") return headerName + "_dst_port";
+        }
+
+        // Default: use header_field format
         return headerName + "_" + fieldName;
     }
+
+    // Fallback for simple field names without header prefix (legacy behavior)
+    if (p4FieldName == "dstAddr") return "ipv4_dst_addr";
+    if (p4FieldName == "srcAddr") return "ipv4_src_addr";
+    if (p4FieldName == "protocol") return "ipv4_protocol";
+    if (p4FieldName == "op") return "p4calc_op";  // For calc.p4
     
     // Default: return as-is with underscores
     std::string signal = p4FieldName;
@@ -422,7 +808,7 @@ std::string mapFieldToSignal(const std::string& p4FieldName, SVProgram* program)
 
 // ======================================
 // Generate Inline Register Operations
-// For firewall.p4 bloom filter pattern
+// For firewall bloom filter pattern
 // ======================================
 
 std::string generateInlineRegisterLogic(SVProgram* program) {
@@ -454,66 +840,101 @@ std::string generateInlineRegisterLogic(SVProgram* program) {
     ss << "    // Implements stateful TCP connection tracking:\n";
     ss << "    // - Outbound (internal→external): Record connection in bloom filter\n";
     ss << "    // - Inbound (external→internal): Check bloom filter, drop if no match\n";
+    ss << "    // Key insight: Use canonical hash so both directions produce same indices\n";
     ss << "    // ==========================================\n\n";
     
-    // Declare registers
+    // Declare registers with initialization
     for (const auto& regName : bloomFilterRegs) {
         ss << "    reg [0:0] " << regName << " [0:4095];\n";
     }
     ss << "\n";
     
-    // Hash indices from flow_hash
-    ss << "    // Hash indices for bloom filter lookup\n";
-    ss << "    wire [11:0] reg_pos_one = flow_hash[11:0];\n";
-    ss << "    wire [11:0] reg_pos_two = flow_hash[11:0] ^ 12'hA5A;\n\n";
+    // Initialize bloom filter arrays
+    ss << "    // Initialize bloom filter arrays\n";
+    ss << "    initial begin\n";
+    ss << "        for (int i = 0; i < 4096; i++) begin\n";
+    for (const auto& regName : bloomFilterRegs) {
+        ss << "            " << regName << "[i] = 1'b0;\n";
+    }
+    ss << "        end\n";
+    ss << "    end\n\n";
     
-    // Read value registers
-    ss << "    // Bloom filter read values (registered for timing)\n";
-    ss << "    reg reg_val_one, reg_val_two;\n\n";
+    // Canonical hash - order IPs and ports so both directions produce same hash
+    ss << "    // Canonical 5-tuple hash - order IPs and ports so both directions match\n";
+    ss << "    // This ensures outbound (A→B) and inbound reply (B→A) hash to same indices\n";
+    ss << "    wire [31:0] ip_min  = (ipv4_src_addr < ipv4_dst_addr) ? ipv4_src_addr : ipv4_dst_addr;\n";
+    ss << "    wire [31:0] ip_max  = (ipv4_src_addr < ipv4_dst_addr) ? ipv4_dst_addr : ipv4_src_addr;\n";
+    ss << "    wire [15:0] port_min = (ipv4_src_port < ipv4_dst_port) ? ipv4_src_port : ipv4_dst_port;\n";
+    ss << "    wire [15:0] port_max = (ipv4_src_port < ipv4_dst_port) ? ipv4_dst_port : ipv4_src_port;\n";
+    ss << "    \n";
+    ss << "    wire [31:0] bloom_hash = ip_min ^ ip_max ^ {port_min, port_max} ^ {24'd0, ipv4_protocol};\n";
+    ss << "    \n";
+    ss << "    wire [11:0] reg_pos_one = bloom_hash[11:0];\n";
+    ss << "    wire [11:0] reg_pos_two = bloom_hash[11:0] ^ 12'hA5A;\n\n";
     
     // Direction signal
     ss << "    // Direction: 0=outbound (set bloom), 1=inbound (check bloom)\n";
-    ss << "    // Determined by ingress port (workaround for single-table architecture)\n";
     ss << "    // Port 0 = external interface → inbound traffic (direction=1)\n";
     ss << "    // Port 1+ = internal interfaces → outbound traffic (direction=0)\n";
     ss << "    wire direction;\n";
     ss << "    assign direction = (ingress_port == 9'd0) ? 1'b1 : 1'b0;\n\n";
     
-    // TCP SYN detection for outbound connection establishment
-    ss << "    // TCP flags from parser (assumes tcp header follows ipv4)\n";
-    ss << "    // For full implementation, parser should extract tcp.syn flag\n";
-    ss << "    // Using simplified approach: record all outbound TCP packets\n\n";
+    // Combinational reads for drop decision
+    ss << "    // Combinational reads - must be evaluated same cycle as packet_valid_in\n";
+    ss << "    wire bloom_val_one = " << bloomFilterRegs[0] << "[reg_pos_one];\n";
+    ss << "    wire bloom_val_two = " << bloomFilterRegs[1] << "[reg_pos_two];\n\n";
     
-    // Sequential logic
-    ss << "    always_ff @(posedge aclk or negedge aresetn) begin\n";
-    ss << "        if (!aresetn) begin\n";
-    ss << "            reg_val_one <= 1'b0;\n";
-    ss << "            reg_val_two <= 1'b0;\n";
-    ss << "        end else if (packet_valid_in && ipv4_valid && ipv4_protocol == 8'd6) begin\n";
-    ss << "            // TCP packet processing\n";
-    ss << "            \n";
-    ss << "            // Always read current bloom filter values\n";
-    ss << "            reg_val_one <= " << bloomFilterRegs[0] << "[reg_pos_one];\n";
-    ss << "            reg_val_two <= " << bloomFilterRegs[1] << "[reg_pos_two];\n";
-    ss << "            \n";
-    ss << "            // Write to bloom filter on outbound traffic (direction=0)\n";
-    ss << "            // This records the connection for later inbound verification\n";
-    ss << "            if (direction == 1'b0) begin\n";
-    ss << "                " << bloomFilterRegs[0] << "[reg_pos_one] <= 1'b1;\n";
-    ss << "                " << bloomFilterRegs[1] << "[reg_pos_two] <= 1'b1;\n";
-    ss << "            end\n";
+    // Bloom filter write logic
+    ss << "    // Bloom filter write (outbound TCP packets only)\n";
+    ss << "    always_ff @(posedge aclk) begin\n";
+    ss << "        if (packet_valid_in && ipv4_valid && ipv4_protocol == 8'd6 && direction == 1'b0) begin\n";
+    ss << "            " << bloomFilterRegs[0] << "[reg_pos_one] <= 1'b1;\n";
+    ss << "            " << bloomFilterRegs[1] << "[reg_pos_two] <= 1'b1;\n";
     ss << "        end\n";
     ss << "    end\n\n";
     
-    // Drop logic for inbound packets without matching outbound connection
-    ss << "    // Bloom filter drop decision\n";
-    ss << "    // Drop inbound TCP packets if bloom filter check fails\n";
-    ss << "    // (no matching outbound connection was recorded)\n";
+    // Combinational drop decision
+    ss << "    // Bloom filter drop decision - fully combinational\n";
+    ss << "    wire bloom_filter_drop_comb;\n";
+    ss << "    assign bloom_filter_drop_comb = (direction == 1'b1) &&           // Inbound\n";
+    ss << "                                    (ipv4_protocol == 8'd6) &&       // TCP\n";
+    ss << "                                    packet_valid_in && ipv4_valid && \n";
+    ss << "                                    (!bloom_val_one || !bloom_val_two);\n\n";
+    
+    // Latched values for pipeline alignment
+    ss << "    // Latch bloom filter values when packet arrives for pipeline alignment\n";
+    ss << "    reg bloom_val_one_lat, bloom_val_two_lat, direction_lat, is_tcp_lat;\n\n";
+    
+    ss << "    always_ff @(posedge aclk or negedge aresetn) begin\n";
+    ss << "        if (!aresetn) begin\n";
+    ss << "            bloom_val_one_lat <= 1'b1;\n";
+    ss << "            bloom_val_two_lat <= 1'b1;\n";
+    ss << "            direction_lat <= 1'b0;\n";
+    ss << "            is_tcp_lat <= 1'b0;\n";
+    ss << "        end else if (packet_valid_in && ipv4_valid) begin\n";
+    ss << "            bloom_val_one_lat <= bloom_val_one;\n";
+    ss << "            bloom_val_two_lat <= bloom_val_two;\n";
+    ss << "            direction_lat <= direction;\n";
+    ss << "            is_tcp_lat <= (ipv4_protocol == 8'd6);\n";
+    ss << "        end else if (packet_valid_out) begin\n";
+    ss << "            // Clear after packet exits pipeline\n";
+    ss << "            bloom_val_one_lat <= 1'b1;\n";
+    ss << "            bloom_val_two_lat <= 1'b1;\n";
+    ss << "            direction_lat <= 1'b0;\n";
+    ss << "            is_tcp_lat <= 1'b0;\n";
+    ss << "        end\n";
+    ss << "    end\n\n";
+    
+    // Compute drop from latched values (aligned with action module output)
+    ss << "    // Compute drop from latched values (aligned with action module output)\n";
+    ss << "    wire bloom_drop_latched;\n";
+    ss << "    assign bloom_drop_latched = direction_lat && is_tcp_lat &&\n";
+    ss << "                               (!bloom_val_one_lat || !bloom_val_two_lat);\n\n";
+    
+    // Final bloom_filter_drop signal
+    ss << "    // Final bloom filter drop signal\n";
     ss << "    wire bloom_filter_drop;\n";
-    ss << "    assign bloom_filter_drop = (direction == 1'b1) &&           // Inbound traffic\n";
-    ss << "                               (ipv4_protocol == 8'd6) &&       // TCP protocol\n";
-    ss << "                               packet_valid_in && ipv4_valid && // Valid packet\n";
-    ss << "                               (reg_val_one == 1'b0 || reg_val_two == 1'b0);  // Bloom filter miss\n\n";
+    ss << "    assign bloom_filter_drop = bloom_drop_latched;\n\n";
     
     return ss.str();
 }
@@ -580,17 +1001,17 @@ std::string generateECMPLogic(SVProgram* program) {
     ss << "            ecmp_nhop_ipv4[i] = 32'h0A_00_00_01 + i;\n";
     ss << "        end\n";
     ss << "    end\n\n";
-    
-    // ECMP select from hash
-    ss << "    // ECMP selection from 5-tuple hash\n";
+
+    // ECMP select from hash - use delayed version for proper pipeline alignment
+    ss << "    // ECMP selection from 5-tuple hash (use delayed hash aligned with action output)\n";
     ss << "    wire [13:0] ecmp_select;\n";
-    ss << "    assign ecmp_select = flow_hash[13:0];\n\n";
-    
+    ss << "    assign ecmp_select = flow_hash_d3[13:0];\n\n";
+
     // Next-hop index using modulo
     ss << "    // Next-hop index = hash mod group_size\n";
     ss << "    wire [ECMP_NHOP_WIDTH-1:0] nhop_index;\n";
     ss << "    assign nhop_index = ecmp_select[ECMP_NHOP_WIDTH-1:0] % ecmp_group_size;\n\n";
-    
+
     // Lookup results
     ss << "    // Next-hop lookup results\n";
     ss << "    wire [8:0]  ecmp_egress_port;\n";
@@ -599,14 +1020,12 @@ std::string generateECMPLogic(SVProgram* program) {
     ss << "    assign ecmp_egress_port = ecmp_nhop_port[nhop_index];\n";
     ss << "    assign ecmp_dmac = ecmp_nhop_dmac[nhop_index];\n";
     ss << "    assign ecmp_ipv4 = ecmp_nhop_ipv4[nhop_index];\n\n";
-    
-    // ECMP active signal
-    ss << "    // ECMP active for valid IPv4 TCP packets with TTL > 0\n";
+
+    // ECMP active signal - use delayed version
+    ss << "    // ECMP active (use delayed signal aligned with action output)\n";
     ss << "    wire ecmp_active;\n";
-    ss << "    assign ecmp_active = packet_valid_in && ipv4_valid && \n";
-    ss << "                         (ipv4_protocol == 8'd6) &&  // TCP\n";
-    ss << "                         (ipv4_ttl > 8'd0);\n\n";
-    
+    ss << "    assign ecmp_active = ecmp_active_d3;\n\n";
+
     // Control plane programming interface
     ss << "    // ==========================================\n";
     ss << "    // ECMP Control Plane Interface\n";
@@ -618,27 +1037,374 @@ std::string generateECMPLogic(SVProgram* program) {
     ss << "    //   0x18 + i*0x10: nhop[i].dmac_hi (RW)\n";
     ss << "    //   0x1C + i*0x10: nhop[i].ipv4 (RW)\n";
     ss << "    // ==========================================\n\n";
-    
+
     // ECMP override signals - these override action module outputs when ECMP is active
     ss << "    // ==========================================\n";
     ss << "    // ECMP Output Override\n";
     ss << "    // ==========================================\n";
     ss << "    // When ECMP is active, override egress port and destination MAC\n";
+    ss << "    // Use delayed match_hit aligned with action output\n";
     ss << "    wire ecmp_override;\n";
-    ss << "    assign ecmp_override = ecmp_active && match_hit;\n\n";
-    
+    ss << "    assign ecmp_override = ecmp_active && match_hit_d1;\n\n";
+
     ss << "    // Final egress port: ECMP overrides table result\n";
     ss << "    wire [8:0] ecmp_final_egress_port;\n";
     ss << "    assign ecmp_final_egress_port = ecmp_override ? ecmp_egress_port : egress_port_from_action;\n\n";
-    
+
     ss << "    // Final destination MAC: ECMP overrides for next-hop\n";
     ss << "    wire [47:0] ecmp_final_dmac;\n";
     ss << "    assign ecmp_final_dmac = ecmp_override ? ecmp_dmac : eth_dst_addr;\n\n";
-    
+
     ss << "    // Final destination IP: ECMP can modify (for NAT-like behavior)\n";
     ss << "    wire [31:0] ecmp_final_dst_ip;\n";
     ss << "    assign ecmp_final_dst_ip = ecmp_override ? ecmp_ipv4 : ipv4_dst_addr;\n\n";
 
+    return ss.str();
+}
+
+std::string generateConstTableLogic(SVProgram* program) {
+    auto ingress = program->getIngress();
+    if (!ingress) return "";
+    
+    const auto& tables = ingress->getTables();
+    
+    // Find tables with const entries
+    SVTable* constTable = nullptr;
+    for (const auto& tablePair : tables) {
+        if (tablePair.second->hasConstEntries()) {
+            constTable = tablePair.second;
+            BACKEND_DEBUG("Found const table: " << tablePair.first);
+            break;
+        }
+    }
+    
+    if (!constTable) return "";
+
+    const auto& constEntries = constTable->getConstEntries();
+    std::cerr << "Const entries count: " << constEntries.size() << std::endl;
+    for (const auto& entry : constEntries) {
+        std::cerr << "  Entry: key=" << entry.keyValues[0] << " action=" << entry.actionName << std::endl;
+    }
+    
+    std::stringstream ss;
+    
+    ss << "\n    // ==========================================\n";
+    ss << "    //          Const Table Logic\n";
+    ss << "    // ==========================================\n";
+    ss << "    // Generated from P4 const entries\n";
+    ss << "    // Implements inline action execution without runtime table lookup\n";
+    ss << "    // ==========================================\n\n";
+    
+    auto keyFieldNames = constTable->getKeyFieldNames();
+    if (keyFieldNames.empty()) {
+        BACKEND_DEBUG("No key fields in const table");
+        return "";
+    }
+    
+    std::string keySignal = mapFieldToSignal(keyFieldNames[0].string(), program);
+    BACKEND_DEBUG("Const table key signal: " << keySignal);
+    
+    const auto& customHeaders = program->getParser()->getCustomHeaders();
+    const auto& actions = ingress->getActions();
+
+    // Helper to get effective action (follows callee chain)
+    auto getEffectiveAction = [&actions](SVAction* action) -> SVAction* {
+        cstring calleeName = action->getCalledAction();
+        if (!calleeName.isNullOrEmpty()) {
+            auto it = actions.find(calleeName);
+            if (it != actions.end()) {
+                return it->second;
+            }
+        }
+        return action;
+    };
+
+    // Debug print with effective action info
+    std::cerr << "Actions count: " << actions.size() << std::endl;
+    for (const auto& a : actions) {
+        SVAction* effective = getEffectiveAction(a.second);
+        std::cerr << "  Action: " << a.first 
+                  << " hasArithOps=" << a.second->hasArithmeticOps() 
+                  << " hasMacSwap=" << a.second->hasMacSwap() 
+                  << " hasEgressSpec=" << a.second->hasEgressSpec();
+        if (effective != a.second) {
+            std::cerr << " -> calls " << a.second->getCalledAction()
+                      << " (hasMacSwap=" << effective->hasMacSwap()
+                      << " hasEgressSpec=" << effective->hasEgressSpec() << ")";
+        }
+        std::cerr << std::endl;
+    }
+    
+    // Helper lambda to resolve callee parameter destination
+    auto resolveCalleeDestination = [&actions](const ArithmeticOperation& op, 
+                                                std::string& destHeader, 
+                                                std::string& destField) -> bool {
+        if (!op.needsCalleeResolution()) {
+            destHeader = op.destHeader.string();
+            destField = op.destField.string();
+            return true;
+        }
+        
+        BACKEND_DEBUG("Resolving callee: " << op.calleeAction << " param index: " << op.calleeParamIndex);
+        
+        auto calleeIt = actions.find(op.calleeAction);
+        if (calleeIt == actions.end()) {
+            return false;
+        }
+        
+        SVAction* callee = calleeIt->second;
+        const auto& params = callee->getParameters();
+        
+        BACKEND_DEBUG("Callee has " << params.size() << " parameters");
+        
+        if (op.calleeParamIndex >= params.size()) {
+            return false;
+        }
+        
+        cstring paramName = params[op.calleeParamIndex]->name;
+        BACKEND_DEBUG("Looking for param: " << paramName);
+        
+        for (const auto& calleeOp : callee->getArithmeticOps()) {
+            BACKEND_DEBUG("  Checking op: dest=" << calleeOp.destHeader << "." << calleeOp.destField 
+                     << " src1=" << calleeOp.srcField1 << " opType=" << (int)calleeOp.op);
+            if (calleeOp.op == ArithmeticOperation::ASSIGN &&
+                !calleeOp.src1IsConstant &&
+                calleeOp.srcField1 == paramName) {
+                destHeader = calleeOp.destHeader.string();
+                destField = calleeOp.destField.string();
+                BACKEND_DEBUG("Resolved to " << destHeader << "." << destField);
+                return true;
+            }
+        }
+        
+        return false;
+    };
+    
+    // Determine which header fields are modified by actions (including callees)
+    std::set<std::string> modifiedFields;
+    bool hasArithmetic = false;
+    bool hasMacSwap = false;
+    bool hasEgressSpec = false;
+    bool hasDrop = false;
+    
+    for (const auto& entry : constTable->getConstEntries()) {
+        auto actionIt = actions.find(entry.actionName);
+        if (actionIt == actions.end()) continue;
+        
+        SVAction* action = actionIt->second;
+        SVAction* effectiveAction = getEffectiveAction(action);
+        
+        if (action->hasArithmeticOps()) {
+            hasArithmetic = true;
+            for (const auto& op : action->getArithmeticOps()) {
+                std::string destHeader, destField;
+                if (resolveCalleeDestination(op, destHeader, destField)) {
+                    modifiedFields.insert(destHeader + "_" + destField);
+                }
+            }
+        }
+        
+        // Check both direct action AND callee for MAC swap and egress spec
+        if (action->hasMacSwap() || effectiveAction->hasMacSwap()) {
+            hasMacSwap = true;
+        }
+        
+        if (action->hasEgressSpec() || effectiveAction->hasEgressSpec()) {
+            hasEgressSpec = true;
+        }
+        
+        if (action->isDropAction()) {
+            hasDrop = true;
+        }
+    }
+    
+    // Generate computed result register(s)
+    if (hasArithmetic) {
+        for (const auto& field : modifiedFields) {
+            int width = 32;
+            for (const auto& headerPair : customHeaders) {
+                for (const auto& fieldPair : headerPair.second.fields) {
+                    std::string fullName = headerPair.first.string() + "_" + fieldPair.first.string();
+                    if (fullName == field) {
+                        width = fieldPair.second.width;
+                        break;
+                    }
+                }
+            }
+            ss << "    reg [" << (width - 1) << ":0] computed_" << field << ";\n";
+        }
+        ss << "    reg computed_valid;\n";
+    }
+    
+    ss << "    reg computed_drop;\n\n";
+    
+    if (hasMacSwap) {
+        ss << "    reg [47:0] swapped_eth_dst_addr;\n";
+        ss << "    reg [47:0] swapped_eth_src_addr;\n";
+        ss << "    reg mac_swap_valid;\n\n";
+    }
+    
+    if (hasEgressSpec) {
+        ss << "    reg [8:0] computed_egress_port;\n";
+        ss << "    reg egress_port_valid;\n\n";
+    }
+    
+    // Generate the main case statement
+    ss << "    // Const table action execution\n";
+    ss << "    always_comb begin\n";
+    
+    for (const auto& field : modifiedFields) {
+        ss << "        computed_" << field << " = '0;\n";
+    }
+    if (hasArithmetic) {
+        ss << "        computed_valid = 1'b0;\n";
+    }
+    ss << "        computed_drop = 1'b0;\n";
+    
+    if (hasMacSwap) {
+        ss << "        swapped_eth_dst_addr = eth_dst_addr;\n";
+        ss << "        swapped_eth_src_addr = eth_src_addr;\n";
+        ss << "        mac_swap_valid = 1'b0;\n";
+    }
+    
+    if (hasEgressSpec) {
+        ss << "        computed_egress_port = 9'd0;\n";
+        ss << "        egress_port_valid = 1'b0;\n";
+    }
+    
+    ss << "\n";
+    ss << "        case (" << keySignal << ")\n";
+    
+    // Generate case for each const entry
+    for (const auto& entry : constTable->getConstEntries()) {
+        std::string keyValue = entry.keyValues[0].string();
+        
+        ss << "            8'h" << std::hex;
+        if (keyValue.find("0x") == 0 || keyValue.find("0X") == 0) {
+            ss << keyValue.substr(2);
+        } else {
+            int val = std::stoi(keyValue);
+            ss << std::setw(2) << std::setfill('0') << val;
+        }
+        ss << std::dec << ": begin  // " << entry.actionName << "\n";
+        
+        auto actionIt = actions.find(entry.actionName);
+        if (actionIt != actions.end()) {
+            SVAction* action = actionIt->second;
+            SVAction* effectiveAction = getEffectiveAction(action);
+            
+            // Generate arithmetic operations
+            if (action->hasArithmeticOps()) {
+                for (const auto& op : action->getArithmeticOps()) {
+                    std::string destHeader, destField;
+                    if (!resolveCalleeDestination(op, destHeader, destField)) {
+                        continue;
+                    }
+                    std::string destSignal = destHeader + "_" + destField;
+                    
+                    std::string leftOp;
+                    if (op.src1IsConstant) {
+                        leftOp = std::to_string(op.srcConstant1);
+                    } else {
+                        leftOp = op.srcHeader1.string() + "_" + op.srcField1.string();
+                    }
+                    
+                    std::string rightOp;
+                    if (op.isBinaryOp()) {
+                        if (op.src2IsConstant) {
+                            rightOp = std::to_string(op.srcConstant2);
+                        } else {
+                            rightOp = op.srcHeader2.string() + "_" + op.srcField2.string();
+                        }
+                    }
+                    
+                    ss << "                computed_" << destSignal << " = ";
+                    if (op.isBinaryOp()) {
+                        ss << leftOp << " " << op.getOperatorString() << " " << rightOp;
+                    } else {
+                        ss << leftOp;
+                    }
+                    ss << ";\n";
+                }
+                ss << "                computed_valid = 1'b1;\n";
+            }
+            
+            // Generate MAC swap (check both action and callee)
+            if (action->hasMacSwap() || effectiveAction->hasMacSwap()) {
+                ss << "                swapped_eth_dst_addr = eth_src_addr;\n";
+                ss << "                swapped_eth_src_addr = eth_dst_addr;\n";
+                ss << "                mac_swap_valid = 1'b1;\n";
+            }
+            
+            // Generate egress spec (check both action and callee)
+            if (action->hasEgressSpec() || effectiveAction->hasEgressSpec()) {
+                const auto& spec = effectiveAction->hasEgressSpec() ? 
+                                   effectiveAction->getEgressSpec() : action->getEgressSpec();
+                if (spec.useIngressPort) {
+                    ss << "                computed_egress_port = ingress_port;\n";
+                } else {
+                    ss << "                computed_egress_port = 9'd" << spec.constantPort << ";\n";
+                }
+                ss << "                egress_port_valid = 1'b1;\n";
+            }
+            
+            // Generate drop
+            if (action->isDropAction()) {
+                ss << "                computed_drop = 1'b1;\n";
+            }
+        }
+        
+        ss << "            end\n";
+    }
+    
+    ss << "            default: begin  // operation_drop (default)\n";
+    ss << "                computed_drop = 1'b1;\n";
+    ss << "            end\n";
+    
+    ss << "        endcase\n";
+    ss << "    end\n\n";
+    
+    // Generate output assignments
+    ss << "    // Override outputs with computed values\n";
+    
+    for (const auto& field : modifiedFields) {
+        ss << "    assign out_" << field << " = computed_valid ? computed_" << field 
+           << " : " << field << ";\n";
+    }
+    
+    // Generate passthrough for UNMODIFIED custom header fields
+    ss << "\n    // Passthrough for unmodified custom header fields\n";
+    for (const auto& headerPair : customHeaders) {
+        const std::string headerName = headerPair.first.string();
+        const auto& headerInfo = headerPair.second;
+        
+        for (const auto& fieldPair : headerInfo.fields) {
+            const std::string fieldName = fieldPair.first.string();
+            std::string fullSignal = headerName + "_" + fieldName;
+            
+            // Skip if this field is already handled by computed output
+            if (modifiedFields.count(fullSignal) > 0) {
+                continue;
+            }
+            
+            ss << "    assign out_" << fullSignal << " = " << fullSignal << ";\n";
+        }
+        
+        // Always passthrough valid signal
+        ss << "    assign out_" << headerName << "_valid = " << headerName << "_valid;\n";
+    }
+    
+    if (hasMacSwap) {
+        ss << "    assign out_eth_dst_addr = mac_swap_valid ? swapped_eth_dst_addr : eth_dst_addr;\n";
+        ss << "    assign out_eth_src_addr = mac_swap_valid ? swapped_eth_src_addr : eth_src_addr;\n";
+    }
+    
+    if (hasEgressSpec) {
+        ss << "    assign egress_port = egress_port_valid ? computed_egress_port : 9'd0;\n";
+    }
+    
+    ss << "    assign drop = computed_drop;\n\n";
+    
     return ss.str();
 }
 
@@ -695,25 +1461,41 @@ std::string generateTableLookup(SVProgram* program) {
     if (keyFieldNames.size() == 1) {
         std::string fieldName = keyFieldNames[0].string();
         std::string hwSignal = mapFieldToSignal(fieldName, program);
-        
+
         keyExpr << hwSignal;
-        
-        if (fieldName.find("ipv4") != std::string::npos || 
-            fieldName.find("dstAddr") != std::string::npos ||
-            fieldName.find("srcAddr") != std::string::npos ||
-            fieldName.find("protocol") != std::string::npos) {
-            validCondition << " && ipv4_valid";
-        } else {
-            size_t dotPos = fieldName.find('.');
-            if (dotPos != std::string::npos) {
-                std::string headerName = fieldName.substr(0, dotPos);
-                validCondition << " && " << headerName << "_valid";
+
+        // Determine valid condition based on header type
+        size_t dotPos = fieldName.find('.');
+        if (dotPos != std::string::npos) {
+            std::string headerName = fieldName.substr(0, dotPos);
+            // Use proper valid signal for each header type
+            if (headerName == "ethernet" || headerName == "eth") {
+                validCondition << " && ethernet_valid";
+            } else if (headerName == "ipv4") {
+                validCondition << " && ipv4_valid";
+            } else if (headerName == "ipv6") {
+                validCondition << " && ipv6_valid";
+            } else if (headerName == "tcp") {
+                validCondition << " && tcp_valid";
+            } else if (headerName == "udp") {
+                validCondition << " && udp_valid";
             } else {
+                // Custom header or unknown - use header_valid
+                validCondition << " && " << headerName << "_valid";
+            }
+        } else {
+            // No header prefix - check for known patterns
+            if (fieldName.find("ipv4") != std::string::npos ||
+                fieldName == "dstAddr" || fieldName == "srcAddr" ||
+                fieldName == "protocol") {
+                validCondition << " && ipv4_valid";
+            } else {
+                // Check custom headers
                 const auto& customHeaders = program->getParser()->getCustomHeaders();
                 for (const auto& headerPair : customHeaders) {
                     const std::string headerName = headerPair.first.string();
                     const auto& headerInfo = headerPair.second;
-                    
+
                     for (const auto& fieldPair : headerInfo.fields) {
                         if (fieldPair.first.string() == fieldName) {
                             validCondition << " && " << headerName << "_valid";
@@ -723,7 +1505,7 @@ std::string generateTableLookup(SVProgram* program) {
                 }
             }
         }
-        
+
         BACKEND_DEBUG("Lookup key: " << hwSignal);
         
     } else {
@@ -754,17 +1536,25 @@ std::string generateTableLookup(SVProgram* program) {
     std::stringstream result;
     result << ".lookup_key(" << keyExpr.str() << "),\n";
     result << "        .lookup_key_mask(";
-    
+
     int keyWidth = firstTable->getKeyWidth();
     if (firstTable->getMatchType() == SVTable::MatchType::EXACT) {
-        result << keyWidth << "'hFFFFFFFF";
+        // Generate proper all-ones mask based on key width
+        // keyWidth/4 = number of hex digits needed
+        int hexDigits = (keyWidth + 3) / 4;  // Round up
+        result << keyWidth << "'h";
+        for (int i = 0; i < hexDigits; i++) {
+            result << "F";
+        }
     } else {
         result << keyWidth << "'h0";
     }
     result << "),\n";
     
-    result << "        .lookup_valid(packet_valid_in" << validCondition.str() << "),\n";
-    
+    // Allow ALL packets through the pipeline (not just matching ones)
+    // This is important for programs like link_monitor that process probe packets in egress
+    result << "        .lookup_valid(packet_valid_in),  // Allow all packets (probe and IPv4)\n";
+
     return result.str();
 }
 
@@ -826,7 +1616,16 @@ std::string generateStackPointerFeedback(SVProgram* program) {
     
     ss << "        end\n";
     ss << "    end\n\n";
-    
+
+    // Generate output port assignments for stack pointers
+    for (const auto& headerPair : customHeaders) {
+        if (headerPair.second.isStack) {
+            ss << "    assign " << headerPair.first.string() << "_ptr_out = "
+               << headerPair.first.string() << "_ptr_next;\n";
+        }
+    }
+    ss << "\n";
+
     return ss.str();
 }
 
@@ -911,16 +1710,29 @@ bool Backend::processMatchActionTemplate(SVProgram* program, const std::string& 
         for (const auto& headerPair : customHeaders) {
             const std::string headerName = headerPair.first.string();
             const SVParser::CustomHeaderInfo& headerInfo = headerPair.second;
-            
-            // Iterate over fields map
-            for (const auto& fieldPair : headerInfo.fields) {
-                const std::string fieldName = fieldPair.first.string();
-                const SVParser::CustomHeaderField& field = fieldPair.second;
-                
-                customInputs << "    input  wire [" << (field.width - 1) << ":0] "
-                           << headerName << "_" << fieldName << ",\n";
+
+            if (headerInfo.isStack) {
+                // For stack headers, generate array inputs
+                int maxSize = headerInfo.maxStackSize;
+                for (const auto& fieldPair : headerInfo.fields) {
+                    const std::string fieldName = fieldPair.first.string();
+                    const SVParser::CustomHeaderField& field = fieldPair.second;
+
+                    customInputs << "    input  wire [" << (field.width - 1) << ":0] "
+                               << headerName << "_" << fieldName << " [0:" << (maxSize-1) << "],\n";
+                }
+                customInputs << "    input  wire " << headerName << "_valid [0:" << (maxSize-1) << "],\n";
+            } else {
+                // For regular headers, generate scalar inputs
+                for (const auto& fieldPair : headerInfo.fields) {
+                    const std::string fieldName = fieldPair.first.string();
+                    const SVParser::CustomHeaderField& field = fieldPair.second;
+
+                    customInputs << "    input  wire [" << (field.width - 1) << ":0] "
+                               << headerName << "_" << fieldName << ",\n";
+                }
+                customInputs << "    input  wire " << headerName << "_valid,\n";
             }
-            customInputs << "    input  wire " << headerName << "_valid,\n";
         }
     }
     
@@ -933,15 +1745,29 @@ bool Backend::processMatchActionTemplate(SVProgram* program, const std::string& 
         for (const auto& headerPair : customHeaders) {
             const std::string headerName = headerPair.first.string();
             const SVParser::CustomHeaderInfo& headerInfo = headerPair.second;
-            
-            for (const auto& fieldPair : headerInfo.fields) {
-                const std::string fieldName = fieldPair.first.string();
-                const SVParser::CustomHeaderField& field = fieldPair.second;
-                
-                customOutputs << "    output wire [" << (field.width - 1) << ":0] "
-                            << "out_" << headerName << "_" << fieldName << ",\n";
+
+            if (headerInfo.isStack) {
+                // For stack headers, generate array outputs
+                int maxSize = headerInfo.maxStackSize;
+                for (const auto& fieldPair : headerInfo.fields) {
+                    const std::string fieldName = fieldPair.first.string();
+                    const SVParser::CustomHeaderField& field = fieldPair.second;
+
+                    customOutputs << "    output wire [" << (field.width - 1) << ":0] "
+                                << "out_" << headerName << "_" << fieldName << " [0:" << (maxSize-1) << "],\n";
+                }
+                customOutputs << "    output wire out_" << headerName << "_valid [0:" << (maxSize-1) << "],\n";
+            } else {
+                // For regular headers, generate scalar outputs
+                for (const auto& fieldPair : headerInfo.fields) {
+                    const std::string fieldName = fieldPair.first.string();
+                    const SVParser::CustomHeaderField& field = fieldPair.second;
+
+                    customOutputs << "    output wire [" << (field.width - 1) << ":0] "
+                                << "out_" << headerName << "_" << fieldName << ",\n";
+                }
+                customOutputs << "    output wire " << "out_" << headerName << "_valid,\n";
             }
-            customOutputs << "    output wire " << "out_" << headerName << "_valid,\n";
         }
     }
     
@@ -969,23 +1795,57 @@ bool Backend::processMatchActionTemplate(SVProgram* program, const std::string& 
     
     // ==========================================
     // Generate Custom Header PASSTHROUGH
+    // Only pass through headers NOT modified by action module
+    // probe and probe_data are modified by action, so only probe_fwd is passed through
     // ==========================================
     std::stringstream customPassthrough;
 
     if (!customHeaders.empty()) {
-        customPassthrough << "    // Custom headers: direct pass-through (no modification)\n";
+        customPassthrough << "    // Custom headers pass-through\n";
+        customPassthrough << "    // Note: probe and probe_data are modified by action module\n";
+        customPassthrough << "    // Only probe_fwd is passed through directly\n";
+
         for (const auto& headerPair : customHeaders) {
             const std::string headerName = headerPair.first.string();
             const SVParser::CustomHeaderInfo& headerInfo = headerPair.second;
-            
-            for (const auto& fieldPair : headerInfo.fields) {
-                const std::string fieldName = fieldPair.first.string();
-                
-                customPassthrough << "    assign out_" << headerName << "_" << fieldName
-                                << " = " << headerName << "_" << fieldName << ";\n";
+
+            // Skip probe and probe_data - these are modified by action module
+            // Only pass through probe_fwd (forwarding info not modified in egress)
+            if (headerName.find("probe_fwd") == std::string::npos) {
+                // These headers come from action module, not direct passthrough
+                continue;
             }
-            customPassthrough << "    assign out_" << headerName << "_valid"
-                            << " = " << headerName << "_valid;\n";
+
+            if (headerInfo.isStack) {
+                // For stacks, use generate block to assign each array element
+                int maxSize = headerInfo.maxStackSize;
+                customPassthrough << "    // " << headerName << " pass-through (not modified by action)\n";
+                customPassthrough << "    genvar i_" << headerName << ";\n";
+                customPassthrough << "    generate\n";
+                customPassthrough << "        for (i_" << headerName << " = 0; i_" << headerName
+                                << " < " << maxSize << "; i_" << headerName << "++) begin : gen_" << headerName << "_passthrough\n";
+
+                for (const auto& fieldPair : headerInfo.fields) {
+                    const std::string fieldName = fieldPair.first.string();
+                    customPassthrough << "            assign out_" << headerName << "_" << fieldName
+                                    << "[i_" << headerName << "] = " << headerName << "_" << fieldName
+                                    << "[i_" << headerName << "];\n";
+                }
+                customPassthrough << "            assign out_" << headerName << "_valid[i_" << headerName
+                                << "] = " << headerName << "_valid[i_" << headerName << "];\n";
+                customPassthrough << "        end\n";
+                customPassthrough << "    endgenerate\n";
+            } else {
+                // For regular headers, simple assign
+                for (const auto& fieldPair : headerInfo.fields) {
+                    const std::string fieldName = fieldPair.first.string();
+
+                    customPassthrough << "    assign out_" << headerName << "_" << fieldName
+                                    << " = " << headerName << "_" << fieldName << ";\n";
+                }
+                customPassthrough << "    assign out_" << headerName << "_valid"
+                                << " = " << headerName << "_valid;\n";
+            }
         }
     }
 
@@ -1025,22 +1885,35 @@ bool Backend::processMatchActionTemplate(SVProgram* program, const std::string& 
     // ==========================================
     // Replace Template Placeholders
     // ==========================================
-    matchActionTemplate = replaceAll(matchActionTemplate, 
-                                     "{{CUSTOM_HEADER_INPUTS}}", 
+    // Generate Stack Pointer Port Declarations
+    // ==========================================
+    std::stringstream stackPointerPorts;
+    for (const auto& headerPair : customHeaders) {
+        if (headerPair.second.isStack) {
+            stackPointerPorts << "    input  wire [3:0]                     "
+                            << headerPair.first.string() << "_ptr_in,\n";
+            stackPointerPorts << "    output wire [3:0]                     "
+                            << headerPair.first.string() << "_ptr_out,\n";
+        }
+    }
+
+    // ==========================================
+    matchActionTemplate = replaceAll(matchActionTemplate,
+                                     "{{CUSTOM_HEADER_INPUTS}}",
                                      customInputs.str());
-    
-    matchActionTemplate = replaceAll(matchActionTemplate, 
-                                     "{{CUSTOM_HEADER_OUTPUTS}}", 
+
+    matchActionTemplate = replaceAll(matchActionTemplate,
+                                     "{{CUSTOM_HEADER_OUTPUTS}}",
                                      customOutputs.str());
-    
-    matchActionTemplate = replaceAll(matchActionTemplate, 
-                                     "{{CUSTOM_HEADER_WIRES}}", 
+
+    matchActionTemplate = replaceAll(matchActionTemplate,
+                                     "{{STACK_POINTER_PORTS}}",
+                                     stackPointerPorts.str());
+
+    matchActionTemplate = replaceAll(matchActionTemplate,
+                                     "{{CUSTOM_HEADER_WIRES}}",
                                      customWires.str());
-    
-    matchActionTemplate = replaceAll(matchActionTemplate, 
-                                     "{{CUSTOM_HEADER_PASSTHROUGH}}", 
-                                     customPassthrough.str());
-    
+
     matchActionTemplate = replaceAll(matchActionTemplate,
                                  "{{STACK_POINTER_SIGNALS}}",
                                  stackPointerSignals);
@@ -1067,8 +1940,53 @@ bool Backend::processMatchActionTemplate(SVProgram* program, const std::string& 
                                         "{{TABLE_LOOKUP_LOGIC}}",
                                         ".lookup_key(ipv4_dst_addr),\n"
                                         "        .lookup_key_mask(32'hFFFFFFFF),\n"
-                                        "        .lookup_valid(packet_valid_in && ipv4_valid),\n");
+                                        "        .lookup_valid(packet_valid_in),  // Allow all packets\n");
     }
+
+    // ==========================================
+    // Generate Match Module Custom Header Connections
+    // ==========================================
+    std::stringstream matchCustomInputs;
+    std::stringstream matchCustomOutWires;
+    std::stringstream matchCustomOutConnections;
+
+    for (const auto& headerPair : customHeaders) {
+        const std::string headerName = headerPair.first.string();
+        const SVParser::CustomHeaderInfo& headerInfo = headerPair.second;
+
+        // Only process non-stack headers (like probe)
+        // Stack headers (probe_data, probe_fwd) are not pipelined through match
+        if (!headerInfo.isStack) {
+            // Generate input connections to match module
+            for (const auto& fieldPair : headerInfo.fields) {
+                const std::string fieldName = fieldPair.first.string();
+                const SVParser::CustomHeaderField& field = fieldPair.second;
+
+                matchCustomInputs << "        ." << headerName << "_" << fieldName << "_in("
+                                  << headerName << "_" << fieldName << "),\n";
+
+                matchCustomOutWires << "    wire [" << (field.width - 1) << ":0]           match_"
+                                    << headerName << "_" << fieldName << ";\n";
+
+                matchCustomOutConnections << "        ." << headerName << "_" << fieldName << "_out(match_"
+                                          << headerName << "_" << fieldName << "),\n";
+            }
+            // Valid signal
+            matchCustomInputs << "        ." << headerName << "_valid_in(" << headerName << "_valid),\n";
+            matchCustomOutWires << "    wire                           match_" << headerName << "_valid;\n";
+            matchCustomOutConnections << "        ." << headerName << "_valid_out(match_" << headerName << "_valid),\n";
+        }
+    }
+
+    matchActionTemplate = replaceAll(matchActionTemplate,
+                                    "{{MATCH_CUSTOM_HEADER_CONNECTIONS}}",
+                                    matchCustomInputs.str());
+    matchActionTemplate = replaceAll(matchActionTemplate,
+                                    "{{MATCH_CUSTOM_HEADER_OUT_WIRES}}",
+                                    matchCustomOutWires.str());
+    matchActionTemplate = replaceAll(matchActionTemplate,
+                                    "{{MATCH_CUSTOM_HEADER_OUT_CONNECTIONS}}",
+                                    matchCustomOutConnections.str());
 
     // Generate stack pointer connections
     std::stringstream connSS;
@@ -1091,34 +2009,209 @@ bool Backend::processMatchActionTemplate(SVProgram* program, const std::string& 
                                     "{{STACK_POINTER_CONNECTIONS}}",
                                     ptrConnections);
 
+    // ==========================================
+    // Generate Const Table Logic (for calc.p4)
+    // ==========================================
+    std::string constTableLogic = generateConstTableLogic(program);
+    
+    matchActionTemplate = replaceAll(matchActionTemplate,
+                                    "{{CONST_TABLE_LOGIC}}",
+                                    constTableLogic);
+    
+
+    // ==========================================
+    // Generate Probe Signal Connections
+    // ==========================================
+    std::string probeValidExpr = "1'b0";
+    std::string probeHopCntExpr = "8'd0";
+    
+    for (const auto& headerPair : customHeaders) {
+        std::string headerName = headerPair.first.string();
+        const auto& headerInfo = headerPair.second;
+        
+        // Check for probe header (non-stack)
+        bool isProbeHeader = (headerName == "probe" || 
+                              headerName.find("probe") != std::string::npos);
+        
+        if (isProbeHeader && !headerInfo.isStack) {
+            probeValidExpr = headerName + "_valid";
+            
+            // Look for hop_cnt field
+            for (const auto& fieldPair : headerInfo.fields) {
+                std::string fieldName = fieldPair.first.string();
+                if (fieldName == "hop_cnt" || fieldName == "hopCnt" || 
+                    fieldName == "hop_count" || fieldName == "hops") {
+                    probeHopCntExpr = headerName + "_" + fieldName;
+                    BACKEND_DEBUG("Found probe header: " << headerName 
+                                << " with " << fieldName << " field");
+                    break;
+                }
+            }
+            break;
+        }
+    }
+    
+    // Use match module outputs for probe signals (pipelined through match)
+    std::stringstream probeSS;
+    if (probeValidExpr != "1'b0") {
+        // Probe header exists - use pipelined outputs from match module
+        probeSS << "        .probe_valid(match_probe_valid),\n";
+        probeSS << "        .probe_hop_cnt(match_probe_hop_cnt),";
+    } else {
+        // No probe header - use defaults
+        probeSS << "        .probe_valid(1'b0),\n";
+        probeSS << "        .probe_hop_cnt(8'd0),";
+    }
+
+    matchActionTemplate = replaceAll(matchActionTemplate,
+                                    "{{PROBE_SIGNAL_CONNECTIONS}}",
+                                    probeSS.str());
+
+    BACKEND_DEBUG("Probe connections: valid=" << probeValidExpr
+                << ", hop_cnt=" << probeHopCntExpr);
+
+    // ==========================================
+    // Detect const table FIRST (needed for custom header connections)
+    // ==========================================
+    bool useConstTableForHeaders = false;
+    if (ingress) {
+        for (const auto& tablePair : ingress->getTables()) {
+            if (tablePair.second->hasConstEntries()) {
+                useConstTableForHeaders = true;
+                BACKEND_DEBUG("Const table detected - will leave action custom header outputs unconnected");
+                break;
+            }
+        }
+    }
+
+    // ==========================================
+    // Generate Custom Header Connections for Action Module
+    // ==========================================
+    std::stringstream actionCustomSS;
+    if (!customHeaders.empty()) {
+        for (const auto& headerPair : customHeaders) {
+            const std::string headerName = headerPair.first.string();
+            const SVParser::CustomHeaderInfo& headerInfo = headerPair.second;
+
+            // Generate INPUT connections for custom header data arrays
+            // Action module needs access to stack data (e.g., srcRoutes_port for egress_spec)
+            if (headerInfo.isStack) {
+                for (const auto& fieldPair : headerInfo.fields) {
+                    const std::string fieldName = fieldPair.first.string();
+                    actionCustomSS << "        ." << headerName << "_" << fieldName
+                                 << "(" << headerName << "_" << fieldName << "),\n";
+                }
+                actionCustomSS << "        ." << headerName << "_valid"
+                             << "(" << headerName << "_valid),\n";
+            }
+
+            // Generate OUTPUT connections for action module
+            // When const table is used, leave unconnected to avoid multiple drivers
+            for (const auto& fieldPair : headerInfo.fields) {
+                const std::string fieldName = fieldPair.first.string();
+                if (useConstTableForHeaders) {
+                    actionCustomSS << "        .out_" << headerName << "_" << fieldName << "(),\n";
+                } else {
+                    actionCustomSS << "        .out_" << headerName << "_" << fieldName
+                                 << "(out_" << headerName << "_" << fieldName << "),\n";
+                }
+            }
+            if (useConstTableForHeaders) {
+                actionCustomSS << "        .out_" << headerName << "_valid(),\n";
+            } else {
+                actionCustomSS << "        .out_" << headerName << "_valid"
+                             << "(out_" << headerName << "_valid),\n";
+            }
+        }
+    }
+
+    // Add comment if const table handles custom headers
+    if (useConstTableForHeaders && !customHeaders.empty()) {
+        actionCustomSS.str("        // Custom header outputs handled by const table logic - leave unconnected\n" + actionCustomSS.str());
+    }
+
+    matchActionTemplate = replaceAll(matchActionTemplate,
+                                    "{{ACTION_CUSTOM_HEADER_CONNECTIONS}}",
+                                    actionCustomSS.str());
+
+    // Check for QoS DSCP-only conditionals
+    bool hasQosDscp = hasDscpOnlyConditionals(program);
+
     if (!conditionalLogic.empty()) {
         BACKEND_DEBUG("Inserted conditional logic into template");
-        
-        // Replace placeholder with final_action_id
-        matchActionTemplate = replaceAll(matchActionTemplate,
-                                        "{{ACTION_ID_SIGNAL}}",
-                                        "final_action_id");
-        
-        BACKEND_DEBUG("Using final_action_id for conditional override");
+
+        // Check if we have action-override conditionals (not just DSCP-only)
+        bool hasActionOverrideConditionals = false;
+        for (const auto& ifElse : g_detectedIfElse) {
+            if (ifElse.controlName != "MyIngress") continue;
+            std::string trueActionName = ifElse.trueAction.string();
+            if (!isDscpOnlyAction(program, trueActionName)) {
+                hasActionOverrideConditionals = true;
+                break;
+            }
+        }
+
+        if (hasActionOverrideConditionals) {
+            // Replace placeholder with final_action_id for action overrides
+            matchActionTemplate = replaceAll(matchActionTemplate,
+                                            "{{ACTION_ID_SIGNAL}}",
+                                            "final_action_id");
+            BACKEND_DEBUG("Using final_action_id for conditional action override");
+        } else {
+            // DSCP-only conditionals - use normal match_action_id
+            matchActionTemplate = replaceAll(matchActionTemplate,
+                                            "{{ACTION_ID_SIGNAL}}",
+                                            "match_action_id");
+            BACKEND_DEBUG("Using match_action_id (DSCP-only conditionals, no action override)");
+        }
     } else {
         // Replace placeholder with match_action_id (no conditionals)
         matchActionTemplate = replaceAll(matchActionTemplate,
                                         "{{ACTION_ID_SIGNAL}}",
                                         "match_action_id");
-        
+
         BACKEND_DEBUG("Using match_action_id (no conditionals)");
+    }
+
+    // Handle DSCP output signal based on QoS presence
+    if (hasQosDscp) {
+        // QoS mode: action outputs to intermediate wire, then override mux assigns final output
+        matchActionTemplate = replaceAll(matchActionTemplate,
+                                        "{{DIFFSERV_OUT_SIGNAL}}",
+                                        "action_ipv4_diffserv");
+        matchActionTemplate = replaceAll(matchActionTemplate,
+                                        "{{FINAL_DSCP_ASSIGNMENT}}",
+                                        "// Final DSCP assignment with QoS override\n"
+                                        "    assign out_ipv4_diffserv = qos_ipv4_diffserv;");
+        BACKEND_DEBUG("QoS mode: using DSCP override logic");
+    } else {
+        // Normal mode: action outputs directly to module output
+        matchActionTemplate = replaceAll(matchActionTemplate,
+                                        "{{DIFFSERV_OUT_SIGNAL}}",
+                                        "out_ipv4_diffserv");
+        matchActionTemplate = replaceAll(matchActionTemplate,
+                                        "{{FINAL_DSCP_ASSIGNMENT}}",
+                                        "");
+        BACKEND_DEBUG("Normal mode: direct DSCP pass-through");
     }
     
     // ==========================================
-    // Generate Inline Register Logic (for firewall bloom filter)
+    // Detect feature flags FIRST (before placeholder replacement)
     // ==========================================
-    std::string inlineRegisterLogic = generateInlineRegisterLogic(program);
     
-    matchActionTemplate = replaceAll(matchActionTemplate,
-                                    "{{INLINE_REGISTER_LOGIC}}",
-                                    inlineRegisterLogic);
+    // Check for const table
+    bool useConstTable = false;
+    if (ingress) {
+        for (const auto& tablePair : ingress->getTables()) {
+            if (tablePair.second->hasConstEntries()) {
+                useConstTable = true;
+                BACKEND_DEBUG("Using const table logic for " << tablePair.first);
+                break;
+            }
+        }
+    }
     
-    // Check for bloom filter registers to determine drop signal wiring
+    // Check for bloom filter registers
     bool hasBloomFilter = false;
     if (ingress) {
         for (const auto& reg : ingress->getRegisters()) {
@@ -1129,33 +2222,6 @@ bool Backend::processMatchActionTemplate(SVProgram* program, const std::string& 
         }
     }
     
-    if (hasBloomFilter) {
-        BACKEND_DEBUG("Enabling bloom filter drop logic");
-        
-        matchActionTemplate = replaceAll(matchActionTemplate,
-                                        "{{DROP_SIGNAL_NAME}}",
-                                        "action_drop");
-        // Declare wire BEFORE action module
-        matchActionTemplate = replaceAll(matchActionTemplate,
-                                        "{{ACTION_DROP_WIRE}}",
-                                        "wire action_drop;  // Declared for bloom filter combine");
-        matchActionTemplate = replaceAll(matchActionTemplate,
-                                        "{{FINAL_DROP_ASSIGNMENT}}",
-                                        "// Combine action drop with bloom filter drop\n"
-                                        "    assign drop = action_drop || bloom_filter_drop;");
-    } else {
-        matchActionTemplate = replaceAll(matchActionTemplate,
-                                        "{{DROP_SIGNAL_NAME}}",
-                                        "drop");
-        matchActionTemplate = replaceAll(matchActionTemplate,
-                                        "{{ACTION_DROP_WIRE}}",
-                                        "");
-        matchActionTemplate = replaceAll(matchActionTemplate,
-                                        "{{FINAL_DROP_ASSIGNMENT}}",
-                                        "// No bloom filter - drop comes directly from action");
-    }
-
-
     // Check for ECMP pattern
     bool hasECMP = false;
     if (ingress) {
@@ -1168,8 +2234,98 @@ bool Backend::processMatchActionTemplate(SVProgram* program, const std::string& 
         }
     }
     
-    if (hasECMP) {
+    // ==========================================
+    // Replace placeholders based on mutually exclusive modes
+    // Priority: const table > bloom filter > ECMP > default
+    // ==========================================
+    
+    if (useConstTable) {
+        // Const table handles everything - passthrough is in generateConstTableLogic()
+        matchActionTemplate = replaceAll(matchActionTemplate, 
+                                        "{{CUSTOM_HEADER_PASSTHROUGH}}", 
+                                        "// Custom header outputs handled by const table logic");
+        
+        // Const table handles drop and egress_port directly
+        matchActionTemplate = replaceAll(matchActionTemplate,
+                                        "{{DROP_SIGNAL_NAME}}",
+                                        "action_drop_unused");
+        matchActionTemplate = replaceAll(matchActionTemplate,
+                                        "{{ACTION_DROP_WIRE}}",
+                                        "wire action_drop_unused;  // Unused - const table drives drop");
+        matchActionTemplate = replaceAll(matchActionTemplate,
+                                        "{{FINAL_DROP_ASSIGNMENT}}",
+                                        "// drop driven by const table logic");
+        matchActionTemplate = replaceAll(matchActionTemplate,
+                                        "{{EGRESS_PORT_WIRE}}",
+                                        "wire [8:0] egress_port_unused;");
+        matchActionTemplate = replaceAll(matchActionTemplate,
+                                        "{{EGRESS_PORT_ACTION_NAME}}",
+                                        "egress_port_unused");
+        matchActionTemplate = replaceAll(matchActionTemplate,
+                                        "{{FINAL_EGRESS_PORT}}",
+                                        "// egress_port driven by const table logic");
+                                        
+        BACKEND_DEBUG("Const table mode: action module outputs unused");
+        
+    } else if (hasBloomFilter) {
+        // Bloom filter mode
+        matchActionTemplate = replaceAll(matchActionTemplate, 
+                                        "{{CUSTOM_HEADER_PASSTHROUGH}}", 
+                                        customPassthrough.str());
+        
+        BACKEND_DEBUG("Enabling bloom filter drop logic");
+        
+        matchActionTemplate = replaceAll(matchActionTemplate,
+                                        "{{DROP_SIGNAL_NAME}}",
+                                        "action_drop");
+        matchActionTemplate = replaceAll(matchActionTemplate,
+                                        "{{ACTION_DROP_WIRE}}",
+                                        "wire action_drop;  // Declared for bloom filter combine");
+        matchActionTemplate = replaceAll(matchActionTemplate,
+                                        "{{FINAL_DROP_ASSIGNMENT}}",
+                                        "// Combine action drop with bloom filter drop\n"
+                                        "    assign drop = action_drop || bloom_filter_drop;");
+        
+        // Egress port - check if also has ECMP
+        if (hasECMP) {
+            matchActionTemplate = replaceAll(matchActionTemplate,
+                                            "{{EGRESS_PORT_WIRE}}",
+                                            "wire [8:0] egress_port_from_action;");
+            matchActionTemplate = replaceAll(matchActionTemplate,
+                                            "{{EGRESS_PORT_ACTION_NAME}}",
+                                            "egress_port_from_action");
+            matchActionTemplate = replaceAll(matchActionTemplate,
+                                            "{{FINAL_EGRESS_PORT}}",
+                                            "assign egress_port = ecmp_final_egress_port;");
+        } else {
+            matchActionTemplate = replaceAll(matchActionTemplate,
+                                            "{{EGRESS_PORT_WIRE}}",
+                                            "");
+            matchActionTemplate = replaceAll(matchActionTemplate,
+                                            "{{EGRESS_PORT_ACTION_NAME}}",
+                                            "egress_port");
+            matchActionTemplate = replaceAll(matchActionTemplate,
+                                            "{{FINAL_EGRESS_PORT}}",
+                                            "");
+        }
+        
+    } else if (hasECMP) {
+        // ECMP mode (no bloom filter)
+        matchActionTemplate = replaceAll(matchActionTemplate, 
+                                        "{{CUSTOM_HEADER_PASSTHROUGH}}", 
+                                        customPassthrough.str());
+        
         BACKEND_DEBUG("Enabling ECMP egress port override");
+        
+        matchActionTemplate = replaceAll(matchActionTemplate,
+                                        "{{DROP_SIGNAL_NAME}}",
+                                        "drop");
+        matchActionTemplate = replaceAll(matchActionTemplate,
+                                        "{{ACTION_DROP_WIRE}}",
+                                        "");
+        matchActionTemplate = replaceAll(matchActionTemplate,
+                                        "{{FINAL_DROP_ASSIGNMENT}}",
+                                        "// No bloom filter - drop comes directly from action");
         
         matchActionTemplate = replaceAll(matchActionTemplate,
                                         "{{EGRESS_PORT_WIRE}}",
@@ -1180,7 +2336,22 @@ bool Backend::processMatchActionTemplate(SVProgram* program, const std::string& 
         matchActionTemplate = replaceAll(matchActionTemplate,
                                         "{{FINAL_EGRESS_PORT}}",
                                         "assign egress_port = ecmp_final_egress_port;");
+        
     } else {
+        // Default mode - no special features
+        matchActionTemplate = replaceAll(matchActionTemplate, 
+                                        "{{CUSTOM_HEADER_PASSTHROUGH}}", 
+                                        customPassthrough.str());
+        
+        matchActionTemplate = replaceAll(matchActionTemplate,
+                                        "{{DROP_SIGNAL_NAME}}",
+                                        "drop");
+        matchActionTemplate = replaceAll(matchActionTemplate,
+                                        "{{ACTION_DROP_WIRE}}",
+                                        "");
+        matchActionTemplate = replaceAll(matchActionTemplate,
+                                        "{{FINAL_DROP_ASSIGNMENT}}",
+                                        "// No bloom filter - drop comes directly from action");
         matchActionTemplate = replaceAll(matchActionTemplate,
                                         "{{EGRESS_PORT_WIRE}}",
                                         "");
@@ -1191,6 +2362,28 @@ bool Backend::processMatchActionTemplate(SVProgram* program, const std::string& 
                                         "{{FINAL_EGRESS_PORT}}",
                                         "");
     }
+
+    if (!useConstTable) {
+        // Default passthrough for MAC addresses
+        matchActionTemplate = replaceAll(matchActionTemplate,
+                                        "{{MAC_PASSTHROUGH}}",
+                                        "assign out_eth_dst_addr = eth_dst_addr;\n"
+                                        "    assign out_eth_src_addr = eth_src_addr;");
+    } else {
+        // Const table handles this
+        matchActionTemplate = replaceAll(matchActionTemplate,
+                                        "{{MAC_PASSTHROUGH}}",
+                                        "// MAC handled by const table logic");
+    }
+    
+    // ==========================================
+    // Generate Inline Register Logic (for firewall bloom filter)
+    // ==========================================
+    std::string inlineRegisterLogic = generateInlineRegisterLogic(program);
+    
+    matchActionTemplate = replaceAll(matchActionTemplate,
+                                    "{{INLINE_REGISTER_LOGIC}}",
+                                    inlineRegisterLogic);
     
     // ==========================================
     // Generate ECMP Logic (for load_balance.p4)
@@ -1257,11 +2450,38 @@ bool Backend::processActionTemplate(SVProgram* program, const std::string& outpu
             int maxSize = headerPair.second.maxStackSize;
             while (maxSize > (1 << ptrBits)) ptrBits++;
             
-            outputsSS << "    output reg  [" << (ptrBits-1) << ":0] " 
+            outputsSS << "    output reg  [" << (ptrBits-1) << ":0] "
                      << headerPair.first.string() << "_ptr_out,\n";
         }
     }
-    
+
+    // ==========================================
+    // 2.5 Generate Custom Header Data INPUTS
+    // For source routing, action needs srcRoutes_port[0] to set egress_spec
+    // ==========================================
+    std::stringstream customHeaderInputsSS;
+    for (const auto& headerPair : customHeaders) {
+        const std::string headerName = headerPair.first.string();
+        const SVParser::CustomHeaderInfo& headerInfo = headerPair.second;
+
+        if (headerInfo.isStack) {
+            int maxSize = headerInfo.maxStackSize;
+            // Generate input arrays for each field in the stack
+            for (const auto& fieldPair : headerInfo.fields) {
+                const std::string fieldName = fieldPair.first.string();
+                int fieldWidth = fieldPair.second.width;
+
+                customHeaderInputsSS << "    input  wire ";
+                customHeaderInputsSS << "[" << (fieldWidth-1) << ":0] ";
+                customHeaderInputsSS << headerName << "_" << fieldName
+                                   << " [0:" << (maxSize-1) << "],\n";
+            }
+            // Generate valid array input
+            customHeaderInputsSS << "    input  wire " << headerName << "_valid"
+                               << " [0:" << (maxSize-1) << "],\n";
+        }
+    }
+
     // ==========================================
     // 3. Generate Stack Pointer RESET (for _out)
     // ==========================================
@@ -1312,19 +2532,55 @@ bool Backend::processActionTemplate(SVProgram* program, const std::string& outpu
                         std::string stackName = stackOp.stackName.string();
                         
                         if (stackOp.type == StackOperation::POP_FRONT) {
-                            logicSS << "                    " << currentActionId 
+                            logicSS << "                    " << currentActionId
                                    << ": begin  // " << actionName << " (pop_front)\n";
+
+                            // Check if action assigns to egress_spec from stack header
+                            // Pattern: standard_metadata.egress_spec = hdr.srcRoutes[0].port
+                            bool setsEgressPort = false;
+                            std::string egressSourceField;
+                            for (const auto& assign : action->getAssignments()) {
+                                if (assign.dest.find("egress_spec") != std::string::npos ||
+                                    assign.dest.find("egress_port") != std::string::npos) {
+                                    // Check if source is from the stack (e.g., srcRoutes.port)
+                                    if (assign.source.find(stackName) != std::string::npos ||
+                                        assign.source.find("port") != std::string::npos) {
+                                        setsEgressPort = true;
+                                        // Extract field name (port from srcRoutes.port)
+                                        size_t dotPos = assign.source.rfind('.');
+                                        if (dotPos != std::string::npos) {
+                                            egressSourceField = assign.source.substr(dotPos + 1);
+                                        } else {
+                                            egressSourceField = "port";  // Default
+                                        }
+                                        BACKEND_DEBUG("Action " << actionName
+                                                   << " sets egress from " << stackName
+                                                   << "." << egressSourceField);
+                                    }
+                                }
+                            }
+
+                            // If action sets egress_port from stack, generate assignment
+                            // P4 accesses srcRoutes[0].port - always index 0 (the current first element)
+                            // The pop_front logically removes the first element for the next iteration
+                            if (setsEgressPort) {
+                                logicSS << "                        egress_port <= {1'b0, "
+                                       << stackName << "_" << egressSourceField
+                                       << "[0][7:0]};\n";
+                            }
+
+                            // Generate pointer increment
                             if (stackOp.count == 1) {
-                                logicSS << "                        " << stackName 
+                                logicSS << "                        " << stackName
                                        << "_ptr_out <= " << stackName << "_ptr_in + 1;\n";
                             } else {
-                                logicSS << "                        " << stackName 
-                                       << "_ptr_out <= " << stackName << "_ptr_in + " 
+                                logicSS << "                        " << stackName
+                                       << "_ptr_out <= " << stackName << "_ptr_in + "
                                        << stackOp.count << ";\n";
                             }
                             logicSS << "                    end\n";
-                            
-                            BACKEND_DEBUG("Action " << actionName << " uses pop_front(" 
+
+                            BACKEND_DEBUG("Action " << actionName << " uses pop_front("
                                         << stackOp.count << ") on " << stackName);
                         }
                         else if (stackOp.type == StackOperation::PUSH_FRONT) {
@@ -1437,14 +2693,180 @@ bool Backend::processActionTemplate(SVProgram* program, const std::string& outpu
     }
     actionTemplate = replaceAll(actionTemplate, "{{EGRESS_CONFIG}}", configSS.str());
 
+    actionTemplate = replaceAll(actionTemplate, "{{ECN_THRESHOLD}}", 
+                            "19'd" + std::to_string(program->getECNThreshold()));
+
+    // ==========================================
+    // 6.5. Generate Custom Header Outputs
+    // ==========================================
+    std::stringstream customHeaderOutputsSS;
+    for (const auto& headerPair : customHeaders) {
+        const std::string headerName = headerPair.first.string();
+        const SVParser::CustomHeaderInfo& headerInfo = headerPair.second;
+
+        if (headerInfo.isStack) {
+            // For stacks, generate arrays of outputs
+            int maxSize = headerInfo.maxStackSize;
+            for (const auto& fieldPair : headerInfo.fields) {
+                const std::string fieldName = fieldPair.first.string();
+                int fieldWidth = fieldPair.second.width;
+
+                customHeaderOutputsSS << "    output reg  ";
+                // Always specify bit width for arrays (even for 1-bit signals)
+                customHeaderOutputsSS << "[" << (fieldWidth-1) << ":0] ";
+                customHeaderOutputsSS << "out_" << headerName << "_" << fieldName
+                                    << " [0:" << (maxSize-1) << "],\n";
+            }
+
+            // Generate valid array for stack
+            customHeaderOutputsSS << "    output reg  [0:0]                     out_"
+                                << headerName << "_valid [0:" << (maxSize-1) << "],\n";
+        } else {
+            // For regular headers, generate single outputs
+            for (const auto& fieldPair : headerInfo.fields) {
+                const std::string fieldName = fieldPair.first.string();
+                int fieldWidth = fieldPair.second.width;
+
+                customHeaderOutputsSS << "    output reg  ";
+                if (fieldWidth > 1) {
+                    customHeaderOutputsSS << "[" << (fieldWidth-1) << ":0] ";
+                }
+                customHeaderOutputsSS << "out_" << headerName << "_" << fieldName << ",\n";
+            }
+
+            // Generate valid output for regular header
+            customHeaderOutputsSS << "    output reg                            out_"
+                                << headerName << "_valid,\n";
+        }
+    }
+
     // ==========================================
     // 7. Replace All Placeholders
     // ==========================================
     actionTemplate = replaceAll(actionTemplate, "{{STACK_POINTER_INPUTS}}", inputsSS.str());
     actionTemplate = replaceAll(actionTemplate, "{{STACK_POINTER_OUTPUTS}}", outputsSS.str());
+    actionTemplate = replaceAll(actionTemplate, "{{ACTION_CUSTOM_HEADER_INPUTS}}", customHeaderInputsSS.str());
     actionTemplate = replaceAll(actionTemplate, "{{STACK_POINTER_RESET_OUT}}", resetSS.str());
     actionTemplate = replaceAll(actionTemplate, "{{STACK_POINTER_LOGIC_INOUT}}", logicSS.str());
-    
+    actionTemplate = replaceAll(actionTemplate, "{{ACTION_CUSTOM_HEADER_OUTPUTS}}", customHeaderOutputsSS.str());
+
+    // ==========================================
+    // 7.1. Generate Reset Custom Header Outputs
+    // ==========================================
+    std::stringstream resetCustomHeadersSS;
+    for (const auto& headerPair : customHeaders) {
+        const std::string headerName = headerPair.first.string();
+        const SVParser::CustomHeaderInfo& headerInfo = headerPair.second;
+
+        if (headerInfo.isStack) {
+            int maxSize = headerInfo.maxStackSize;
+            // Reset loop for stack arrays
+            resetCustomHeadersSS << "            // Reset " << headerName << " stack outputs\n";
+            resetCustomHeadersSS << "            for (int i = 0; i < " << maxSize << "; i++) begin\n";
+            for (const auto& fieldPair : headerInfo.fields) {
+                const std::string fieldName = fieldPair.first.string();
+                int fieldWidth = fieldPair.second.width;
+                resetCustomHeadersSS << "                out_" << headerName << "_" << fieldName
+                                   << "[i] <= " << fieldWidth << "'d0;\n";
+            }
+            resetCustomHeadersSS << "                out_" << headerName << "_valid[i] <= 1'b0;\n";
+            resetCustomHeadersSS << "            end\n";
+        } else {
+            // Reset scalar outputs
+            resetCustomHeadersSS << "            // Reset " << headerName << " outputs\n";
+            for (const auto& fieldPair : headerInfo.fields) {
+                const std::string fieldName = fieldPair.first.string();
+                int fieldWidth = fieldPair.second.width;
+                resetCustomHeadersSS << "            out_" << headerName << "_" << fieldName
+                                   << " <= " << fieldWidth << "'d0;\n";
+            }
+            resetCustomHeadersSS << "            out_" << headerName << "_valid <= 1'b0;\n";
+        }
+    }
+
+    // ==========================================
+    // 7.2. Generate Default Custom Header Outputs (clear valid on each cycle)
+    // ==========================================
+    std::stringstream defaultCustomHeadersSS;
+    // Note: We don't clear all fields every cycle, just the valid signals
+    // The actual data will be set when probe_valid is true
+
+    // ==========================================
+    // 7.3. Generate Egress Custom Header Logic (byte counting + probe push)
+    // ==========================================
+    std::stringstream egressCustomLogicSS;
+
+    // Check if we have probe-related headers (link_monitor pattern)
+    bool hasProbeData = false;
+    std::string probeDataHeader;
+    int probeDataMaxSize = 10;
+
+    for (const auto& headerPair : customHeaders) {
+        const std::string headerName = headerPair.first.string();
+        if (headerName.find("probe_data") != std::string::npos && headerPair.second.isStack) {
+            hasProbeData = true;
+            probeDataHeader = headerName;
+            probeDataMaxSize = headerPair.second.maxStackSize;
+            break;
+        }
+    }
+
+    if (hasProbeData) {
+        // Generate link_monitor style byte counting and probe push logic
+        // This code goes inside the ENABLE_STATEFUL block's inner begin/end
+        egressCustomLogicSS << R"(
+                            // Byte counting logic for link_monitor
+                            if (ipv4_valid && !probe_valid) begin
+                                // Regular IPv4 packet: accumulate bytes
+                                byte_cnt_write_data_in <= byte_cnt_read_out + {16'd0, packet_length_in};
+                                byte_cnt_write_en_in   <= 1'b1;
+                            end else if (probe_valid) begin
+                                // Probe packet: capture current byte_cnt and reset
+                                byte_cnt_write_data_in <= 32'd0;  // Reset counter
+                                byte_cnt_write_en_in   <= 1'b1;
+                                last_time_write_data_in <= global_timestamp;
+                                last_time_write_en_in   <= 1'b1;
+
+                                // PROBE DATA PUSH (link_monitor)
+                                // Push captured data when probe packet arrives
+                                if (ENABLE_PUSH_FRONT) begin
+                                    automatic logic [7:0] new_hop_cnt;
+                                    new_hop_cnt = probe_hop_cnt + 8'd1;
+
+                                    // Push new probe_data entry at current pointer
+                                    out_probe_data_bos[probe_data_ptr_in] <= (new_hop_cnt == 8'd1) ? 1'b1 : 1'b0;
+                                    out_probe_data_swid[probe_data_ptr_in] <= 7'd1;  // Switch ID (configurable)
+                                    out_probe_data_port[probe_data_ptr_in] <= egress_port_id[7:0];
+                                    out_probe_data_byte_cnt[probe_data_ptr_in] <= byte_cnt_read_out;
+                                    out_probe_data_last_time[probe_data_ptr_in] <= last_time_read_out;
+                                    out_probe_data_cur_time[probe_data_ptr_in] <= global_timestamp;
+                                    out_probe_data_valid[probe_data_ptr_in] <= 1'b1;
+
+                                    // Increment stack pointer
+                                    probe_data_ptr_out <= probe_data_ptr_in + 1;
+
+                                    // Output incremented hop_cnt
+                                    out_probe_hop_cnt <= new_hop_cnt;
+                                    out_probe_valid <= 1'b1;
+                                end
+
+                                // Don't drop probe packets
+                                drop <= 1'b0;
+                            end else begin
+                                // Non-probe, non-IPv4 packets: clear probe outputs
+                                out_probe_valid <= 1'b0;
+)";
+        // Generate clear loop for probe data valid
+        egressCustomLogicSS << "                                for (int i = 0; i < " << probeDataMaxSize << "; i++) begin\n";
+        egressCustomLogicSS << "                                    out_probe_data_valid[i] <= 1'b0;\n";
+        egressCustomLogicSS << "                                end\n";
+        egressCustomLogicSS << "                            end\n";
+    }
+
+    actionTemplate = replaceAll(actionTemplate, "{{RESET_CUSTOM_HEADER_OUTPUTS}}", resetCustomHeadersSS.str());
+    actionTemplate = replaceAll(actionTemplate, "{{DEFAULT_CUSTOM_HEADER_OUTPUTS}}", defaultCustomHeadersSS.str());
+    actionTemplate = replaceAll(actionTemplate, "{{EGRESS_CUSTOM_HEADER_LOGIC}}", egressCustomLogicSS.str());
+
     // ==========================================
     // 8. Write Output File
     // ==========================================
@@ -1648,6 +3070,12 @@ bool Backend::run(const SVOptions& options,
     }
     BACKEND_SUCCESS("Copied static modules");
 
+    // Process match.sv template with custom header passthrough
+    if (!processMatchTemplate(&svprog, options.outputDir.string())) {
+        return false;
+    }
+    BACKEND_SUCCESS("Generated match.sv");
+
     // Process match_action.sv template with custom headers AND conditional logic
     if (!processMatchActionTemplate(&svprog, options.outputDir.string())) {
         return false;
@@ -1764,6 +3192,34 @@ bool Backend::run(const SVOptions& options,
         }
     }
 
+    // Generate probe_data signal declarations (only if program has probe_data)
+    std::stringstream probeDataSignalsSS;
+    if (hasProbeDataStack) {
+        probeDataSignalsSS << "// Egress probe_data outputs (from match_action)\n";
+        probeDataSignalsSS << "logic                        pipeline_out_probe_data_valid;\n";
+        probeDataSignalsSS << "logic                        pipeline_out_probe_data_bos;\n";
+        probeDataSignalsSS << "logic [6:0]                  pipeline_out_probe_data_swid;\n";
+        probeDataSignalsSS << "logic [7:0]                  pipeline_out_probe_data_port;\n";
+        probeDataSignalsSS << "logic [31:0]                 pipeline_out_probe_data_byte_cnt;\n";
+        probeDataSignalsSS << "logic [47:0]                 pipeline_out_probe_data_last_time;\n";
+        probeDataSignalsSS << "logic [47:0]                 pipeline_out_probe_data_cur_time;\n";
+    }
+    vfpgaTemplate = replaceAll(vfpgaTemplate, "{{PROBE_DATA_SIGNALS}}", probeDataSignalsSS.str());
+
+    // Generate match_action probe_data port connections (only if program has probe_data)
+    std::stringstream matchActionProbeSS;
+    if (hasProbeDataStack) {
+        matchActionProbeSS << ",\n\n    // Egress probe data outputs\n";
+        matchActionProbeSS << "    .out_probe_data_valid(pipeline_out_probe_data_valid),\n";
+        matchActionProbeSS << "    .out_probe_data_bos(pipeline_out_probe_data_bos),\n";
+        matchActionProbeSS << "    .out_probe_data_swid(pipeline_out_probe_data_swid),\n";
+        matchActionProbeSS << "    .out_probe_data_port(pipeline_out_probe_data_port),\n";
+        matchActionProbeSS << "    .out_probe_data_byte_cnt(pipeline_out_probe_data_byte_cnt),\n";
+        matchActionProbeSS << "    .out_probe_data_last_time(pipeline_out_probe_data_last_time),\n";
+        matchActionProbeSS << "    .out_probe_data_cur_time(pipeline_out_probe_data_cur_time)";
+    }
+    vfpgaTemplate = replaceAll(vfpgaTemplate, "{{MATCH_ACTION_PROBE_DATA_PORTS}}", matchActionProbeSS.str());
+
     if (hasProbeDataStack) {
         deparserEgressSS << "    // Egress probe_data element (from push_front)\n";
         deparserEgressSS << "    .egress_probe_data_valid(pipeline_out_probe_data_valid),\n";
@@ -1775,7 +3231,7 @@ bool Backend::run(const SVOptions& options,
         deparserEgressSS << "    .egress_probe_data_cur_time(pipeline_out_probe_data_cur_time),\n";
     }
 
-    vfpgaTemplate = replaceAll(vfpgaTemplate, "{{DEPARSER_EGRESS_PROBE_DATA_PORTS}}", 
+    vfpgaTemplate = replaceAll(vfpgaTemplate, "{{DEPARSER_EGRESS_PROBE_DATA_PORTS}}",
                             deparserEgressSS.str());
     
     // ==========================================

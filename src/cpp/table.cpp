@@ -70,35 +70,107 @@ bool SVTable::build() {
     return true;
 }
 
-
 void SVTable::extractConstEntries(const IR::Property* prop) {
-    auto exprList = prop->value->to<IR::ExpressionValue>();
-    if (!exprList) return;
+    TABLE_DEBUG("entries property value type: " << prop->value->node_type_name());
     
-    auto entries = exprList->expression->to<IR::ListExpression>();
-    if (!entries) return;
+    auto entriesList = prop->value->to<IR::EntriesList>();
+    if (!entriesList) {
+        TABLE_DEBUG("Failed to cast to EntriesList");
+        return;
+    }
     
-    for (auto entry : entries->components) {
-        auto entryExpr = entry->to<IR::Entry>();
-        if (!entryExpr) continue;
+    TABLE_DEBUG("EntriesList has " << entriesList->entries.size() << " entries");
+    
+    for (auto entry : entriesList->entries) {
+        TABLE_DEBUG("  Processing entry, keys type: " << entry->keys->node_type_name());
         
         ConstTableEntry constEntry;
         
         // Extract key values
-        if (auto keyTuple = entryExpr->keys->to<IR::ListExpression>()) {
+        if (auto keyTuple = entry->keys->to<IR::ListExpression>()) {
+            TABLE_DEBUG("    Keys is ListExpression with " << keyTuple->components.size() << " components");
             for (auto key : keyTuple->components) {
+                TABLE_DEBUG("      Key component type: " << key->node_type_name());
                 if (auto constant = key->to<IR::Constant>()) {
-                    constEntry.keyValues.push_back(
-                        cstring::to_cstring(constant->value));
+                    constEntry.keyValues.push_back(cstring::to_cstring(constant->value));
+                } else if (auto pathExpr = key->to<IR::PathExpression>()) {
+                    cstring constName = pathExpr->path->name.name;
+                    TABLE_DEBUG("      PathExpression name: " << constName);
+                    
+                    // First try refMap
+                    auto decl = control->getProgram()->refMap->getDeclaration(pathExpr->path);
+                    if (decl) {
+                        TABLE_DEBUG("      refMap found declaration: " << decl->node_type_name());
+                        if (auto constDecl = decl->to<IR::Declaration_Constant>()) {
+                            const IR::Expression* init = constDecl->initializer;
+                            // Unwrap Cast if present
+                            if (auto cast = init->to<IR::Cast>()) {
+                                init = cast->expr;
+                            }
+                            if (auto val = init->to<IR::Constant>()) {
+                                constEntry.keyValues.push_back(cstring::to_cstring(val->value));
+                                TABLE_DEBUG("      Resolved via refMap to: " << val->value);
+                            }
+                        }
+                    } else {
+                        TABLE_DEBUG("      refMap returned null, trying constants map");
+                        // Fallback: use program's extracted constants
+                        const auto& constants = control->getProgram()->getConstants();
+                        TABLE_DEBUG("      Constants map size: " << constants.size());
+                        auto it = constants.find(constName);
+                        if (it != constants.end()) {
+                            constEntry.keyValues.push_back(cstring::to_cstring(it->second));
+                            TABLE_DEBUG("      Resolved via constants map: " << it->second);
+                        } else {
+                            TABLE_DEBUG("      Constant NOT found: " << constName);
+                        }
+                    }
                 }
             }
-        } else if (auto constant = entryExpr->keys->to<IR::Constant>()) {
-            constEntry.keyValues.push_back(
-                cstring::to_cstring(constant->value));
+        } else if (auto constant = entry->keys->to<IR::Constant>()) {
+            TABLE_DEBUG("    Keys is Constant");
+            constEntry.keyValues.push_back(cstring::to_cstring(constant->value));
+        } else if (auto pathExpr = entry->keys->to<IR::PathExpression>()) {
+            // Single key as named constant
+            cstring constName = pathExpr->path->name.name;
+            TABLE_DEBUG("    Keys is PathExpression: " << constName);
+            
+            // First try refMap
+            auto decl = control->getProgram()->refMap->getDeclaration(pathExpr->path);
+            if (decl) {
+                TABLE_DEBUG("    refMap found declaration: " << decl->node_type_name());
+                if (auto constDecl = decl->to<IR::Declaration_Constant>()) {
+                    const IR::Expression* init = constDecl->initializer;
+                    // Unwrap Cast if present
+                    if (auto cast = init->to<IR::Cast>()) {
+                        init = cast->expr;
+                    }
+                    if (auto val = init->to<IR::Constant>()) {
+                        constEntry.keyValues.push_back(cstring::to_cstring(val->value));
+                        TABLE_DEBUG("    Resolved via refMap to: " << val->value);
+                    }
+                }
+            } else {
+                TABLE_DEBUG("    refMap returned null, trying constants map");
+                // Fallback: use program's extracted constants
+                const auto& constants = control->getProgram()->getConstants();
+                TABLE_DEBUG("    Constants map size: " << constants.size());
+                auto it = constants.find(constName);
+                if (it != constants.end()) {
+                    constEntry.keyValues.push_back(cstring::to_cstring(it->second));
+                    TABLE_DEBUG("    Resolved via constants map: " << it->second);
+                } else {
+                    TABLE_DEBUG("    Constant NOT found: " << constName);
+                }
+            }
+        } else {
+            TABLE_DEBUG("    Keys is neither ListExpression nor Constant nor PathExpression");
         }
         
+        TABLE_DEBUG("    keyValues size: " << constEntry.keyValues.size());
+        
         // Extract action
-        if (auto actionCall = entryExpr->action->to<IR::MethodCallExpression>()) {
+        if (auto actionCall = entry->action->to<IR::MethodCallExpression>()) {
             auto pathExpr = actionCall->method->to<IR::PathExpression>();
             if (pathExpr) {
                 constEntry.actionName = pathExpr->path->name.name;
@@ -113,10 +185,14 @@ void SVTable::extractConstEntries(const IR::Property* prop) {
             }
         }
         
-        constEntries_.push_back(constEntry);
-        TABLE_DEBUG("  Const entry: " << constEntry.keyValues[0] 
-                      << " -> " << constEntry.actionName);
+        if (!constEntry.keyValues.empty()) {
+            constEntries_.push_back(constEntry);
+            TABLE_DEBUG("  Const entry: " << constEntry.keyValues[0] 
+                          << " -> " << constEntry.actionName);
+        }
     }
+    
+    TABLE_DEBUG("Extracted " << constEntries_.size() << " const entries");
 }
 
 // ==========================================
@@ -125,7 +201,7 @@ void SVTable::extractConstEntries(const IR::Property* prop) {
 
 void SVTable::extractKeys() {
     TABLE_TRACE("Extracting keys from table: " << tableName);
-    
+
     auto keys = p4table->getKey();
     if (keys != nullptr) {
         for (auto key : keys->keyElements) {
@@ -133,22 +209,31 @@ void SVTable::extractKeys() {
             if (element && element->expression->is<IR::Member>()) {
                 auto member = element->expression->to<IR::Member>();
                 auto type = control->getProgram()->typeMap->getType(member, true);
-                
+
                 int fieldSize = 32;  // Default
                 if (type && type->template is<IR::Type_Bits>()) {
                     fieldSize = type->template to<IR::Type_Bits>()->size;
                 }
-                
-                // Store field info
-                keyFields.push_back(std::make_pair(member->member, fieldSize)); 
+
+                // Build the full field path (e.g., "ethernet.dstAddr" from "hdr.ethernet.dstAddr")
+                // The member->expr points to the header (e.g., hdr.ethernet)
+                std::string fullFieldName = member->member.string();
+                if (auto headerMember = member->expr->to<IR::Member>()) {
+                    // This is a nested member like hdr.ethernet.dstAddr
+                    // headerMember->member gives us "ethernet"
+                    fullFieldName = headerMember->member.string() + "." + member->member.string();
+                }
+
+                // Store field info with full path
+                keyFields.push_back(std::make_pair(cstring(fullFieldName), fieldSize));
                 keyWidth += fieldSize;
-                
-                
-                TABLE_TRACE("Key field: " << member->member << " (" << fieldSize << " bits)");
+
+
+                TABLE_TRACE("Key field: " << fullFieldName << " (" << fieldSize << " bits)");
             }
         }
     }
-    
+
     TABLE_TRACE("Total key width: " << keyWidth << " bits");
 }
 
