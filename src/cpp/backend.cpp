@@ -152,10 +152,292 @@ static bool isSourceRoutingPattern(SVProgram* program) {
 }
 
 // ======================================
+// Helper: Detect Tunnel Pattern
+// ======================================
+// Tunnel pattern uses a custom header (myTunnel) with conditional table selection:
+// - if ipv4.isValid() && !myTunnel.isValid(): ipv4_lpm.apply()
+// - if myTunnel.isValid(): myTunnel_exact.apply()
+// This requires dynamic lookup key selection based on header validity.
+static bool isTunnelPattern(SVProgram* program) {
+    if (!program->getIngress() || !program->getParser()) return false;
+
+    const auto& tables = program->getIngress()->getTables();
+    const auto& customHeaders = program->getParser()->getCustomHeaders();
+
+    // Need at least 2 tables for tunnel pattern
+    if (tables.size() < 2) return false;
+
+    // Check for tunnel-like custom header (myTunnel, tunnel, etc.)
+    bool hasTunnelHeader = false;
+    std::string tunnelHeaderName;
+    for (const auto& header : customHeaders) {
+        std::string headerName = header.first.string();
+        // Case-insensitive check for "tunnel" in header name
+        std::string lowerName = headerName;
+        std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(), ::tolower);
+        if (lowerName.find("tunnel") != std::string::npos) {
+            hasTunnelHeader = true;
+            tunnelHeaderName = headerName;
+            BACKEND_DEBUG("Found tunnel header: " << headerName);
+            break;
+        }
+    }
+
+    if (!hasTunnelHeader) return false;
+
+    // Check if we have tables that use both ipv4 and tunnel header fields as keys
+    bool hasIpv4Table = false;
+    bool hasTunnelTable = false;
+
+    for (const auto& tablePair : tables) {
+        SVTable* table = tablePair.second;
+        auto keyFieldNames = table->getKeyFieldNames();
+
+        for (const auto& field : keyFieldNames) {
+            std::string fieldName = field.string();
+            std::string lowerField = fieldName;
+            std::transform(lowerField.begin(), lowerField.end(), lowerField.begin(), ::tolower);
+
+            if (lowerField.find("ipv4") != std::string::npos &&
+                (lowerField.find("dst") != std::string::npos || lowerField.find("addr") != std::string::npos)) {
+                hasIpv4Table = true;
+                BACKEND_DEBUG("Found IPv4 table: " << tablePair.first.string());
+            }
+            if (lowerField.find("tunnel") != std::string::npos) {
+                hasTunnelTable = true;
+                BACKEND_DEBUG("Found tunnel table: " << tablePair.first.string());
+            }
+        }
+    }
+
+    bool isTunnel = hasTunnelHeader && hasIpv4Table && hasTunnelTable;
+    if (isTunnel) {
+        BACKEND_DEBUG("Detected tunnel pattern with header: " << tunnelHeaderName);
+    }
+
+    return isTunnel;
+}
+
+// ======================================
+// Feature Detection: Hash Engine Needed
+// ======================================
+// Returns true if program uses hash (ECMP, bloom filter, etc.)
+static bool needsHashEngine(SVProgram* program) {
+    if (!program->getIngress()) return false;
+
+    const auto& actions = program->getIngress()->getActions();
+    for (const auto& actionPair : actions) {
+        SVAction* action = actionPair.second;
+        // Check if action uses hash operations
+        if (action->usesHash()) {
+            BACKEND_DEBUG("Hash engine needed for action: " << actionPair.first.string());
+            return true;
+        }
+    }
+    return false;
+}
+
+// ======================================
+// Feature Detection: Registers Needed
+// ======================================
+// Returns true if program uses stateful registers (firewall, link_monitor)
+static bool needsRegisters(SVProgram* program) {
+    if (!program->getIngress()) return false;
+
+    // Check ingress registers
+    if (!program->getIngress()->getRegisters().empty()) {
+        BACKEND_DEBUG("Registers needed: found ingress registers");
+        return true;
+    }
+
+    // Check egress registers
+    if (program->getEgress() && !program->getEgress()->getRegisters().empty()) {
+        BACKEND_DEBUG("Registers needed: found egress registers");
+        return true;
+    }
+
+    return false;
+}
+
+// ======================================
+// Feature Detection: Encap/Decap Needed
+// ======================================
+// Returns true if program uses stack operations (push_front, pop_front)
+static bool needsEncapDecap(SVProgram* program) {
+    if (!program->getIngress()) return false;
+
+    const auto& actions = program->getIngress()->getActions();
+    for (const auto& actionPair : actions) {
+        SVAction* action = actionPair.second;
+        if (!action->getStackOperations().empty()) {
+            BACKEND_DEBUG("Encap/Decap needed for action: " << actionPair.first.string());
+            return true;
+        }
+    }
+
+    // Also check egress actions
+    if (program->getEgress()) {
+        const auto& egressActions = program->getEgress()->getActions();
+        for (const auto& actionPair : egressActions) {
+            SVAction* action = actionPair.second;
+            if (!action->getStackOperations().empty()) {
+                BACKEND_DEBUG("Encap/Decap needed for egress action: " << actionPair.first.string());
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+// ======================================
+// Feature Detection: Get Match Type
+// ======================================
+// Returns the match type: 0=Exact, 1=LPM, 2=Ternary, 3=Range
+static int getMatchType(SVProgram* program) {
+    if (!program->getIngress()) return 1;  // Default LPM
+
+    const auto& tables = program->getIngress()->getTables();
+    if (tables.empty()) return 1;
+
+    // Get the primary table's match type
+    for (const auto& tablePair : tables) {
+        SVTable* table = tablePair.second;
+        return static_cast<int>(table->getMatchType());
+    }
+
+    return 1;  // Default LPM
+}
+
+// ======================================
+// Conditional Section Processing
+// ======================================
+// Replace {{#IF_TAG}}...{{/IF_TAG}} with content when condition is true
+static std::string replaceConditionalSection(const std::string& tmpl,
+                                              const std::string& tag,
+                                              const std::string& content) {
+    std::string result = tmpl;
+    std::string startTag = "{{#" + tag + "}}";
+    std::string endTag = "{{/" + tag + "}}";
+
+    size_t startPos = result.find(startTag);
+    size_t endPos = result.find(endTag);
+
+    if (startPos != std::string::npos && endPos != std::string::npos) {
+        // Replace the section including tags with content
+        result.replace(startPos, endPos + endTag.length() - startPos, content);
+    }
+
+    return result;
+}
+
+// Remove {{#IF_TAG}}...{{/IF_TAG}} section entirely when condition is false
+static std::string removeConditionalSection(const std::string& tmpl,
+                                             const std::string& tag) {
+    std::string result = tmpl;
+    std::string startTag = "{{#" + tag + "}}";
+    std::string endTag = "{{/" + tag + "}}";
+
+    size_t startPos = result.find(startTag);
+    size_t endPos = result.find(endTag);
+
+    if (startPos != std::string::npos && endPos != std::string::npos) {
+        // Remove the section including tags
+        result.erase(startPos, endPos + endTag.length() - startPos);
+    }
+
+    return result;
+}
+
+// ======================================
+// Helper: Get Tunnel Header Info
+// ======================================
+// Returns the tunnel header name and key field name
+static std::pair<std::string, std::string> getTunnelHeaderInfo(SVProgram* program) {
+    const auto& customHeaders = program->getParser()->getCustomHeaders();
+
+    for (const auto& header : customHeaders) {
+        std::string headerName = header.first.string();
+        std::string lowerName = headerName;
+        std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(), ::tolower);
+
+        if (lowerName.find("tunnel") != std::string::npos) {
+            // Find the dst_id field (key field for tunnel lookup)
+            for (const auto& field : header.second.fields) {
+                std::string fieldName = field.first.string();
+                std::string lowerField = fieldName;
+                std::transform(lowerField.begin(), lowerField.end(), lowerField.begin(), ::tolower);
+
+                if (lowerField.find("dst") != std::string::npos) {
+                    return {headerName, fieldName};
+                }
+            }
+            // Fallback: return first field
+            if (!header.second.fields.empty()) {
+                return {headerName, header.second.fields.begin()->first.string()};
+            }
+        }
+    }
+
+    return {"", ""};
+}
+
+// ======================================
+// Generate Lookup Key Selection for Tunnel
+// ======================================
+static std::string generateTunnelLookupKeySelection(SVProgram* program) {
+    auto tunnelInfo = getTunnelHeaderInfo(program);
+    std::string tunnelHeaderName = tunnelInfo.first;
+    std::string tunnelKeyField = tunnelInfo.second;
+
+    if (tunnelHeaderName.empty()) return "";
+
+    // Get the field width
+    const auto& customHeaders = program->getParser()->getCustomHeaders();
+    int tunnelKeyWidth = 16;  // Default
+
+    for (const auto& header : customHeaders) {
+        if (header.first.string() == tunnelHeaderName) {
+            for (const auto& field : header.second.fields) {
+                if (field.first.string() == tunnelKeyField) {
+                    tunnelKeyWidth = field.second.width;
+                    break;
+                }
+            }
+            break;
+        }
+    }
+
+    int paddingBits = 32 - tunnelKeyWidth;
+
+    std::stringstream ss;
+    ss << "    // ==========================================\n";
+    ss << "    // Lookup Key Selection for Tunnel Support\n";
+    ss << "    // ==========================================\n";
+    ss << "    // " << tunnelHeaderName << " packets: use " << tunnelKeyField << " in MSBs (for LPM prefix=" << tunnelKeyWidth << " match)\n";
+    ss << "    // Regular IPv4:     use ipv4_dst_addr\n";
+    ss << "    wire [31:0] selected_lookup_key;\n";
+    ss << "    assign selected_lookup_key = " << tunnelHeaderName << "_valid ? {"
+       << tunnelHeaderName << "_" << tunnelKeyField << ", " << paddingBits << "'b0} : ipv4_dst_addr;\n\n";
+
+    BACKEND_DEBUG("Generated tunnel lookup key selection for " << tunnelHeaderName << "_" << tunnelKeyField);
+
+    return ss.str();
+}
+
+// ======================================
 // Generate Conditional Logic
 // ======================================
 
 std::string generateConditionalLogic(SVProgram* program) {
+    // Special case: Tunnel pattern (check BEFORE g_detectedIfElse empty check)
+    // For tunneling, we need dynamic lookup key selection based on header validity
+    // Tunnel programs may not have explicit if-else in P4 but still need key selection
+    if (isTunnelPattern(program)) {
+        BACKEND_DEBUG("Detected tunnel pattern - generating lookup key selection");
+        return generateTunnelLookupKeySelection(program);
+    }
+
     if (g_detectedIfElse.empty()) {
         return "";
     }
@@ -560,11 +842,173 @@ bool Backend::copyStaticTemplates(const std::string& outputDir) {
 }
 
 // ======================================
-// Process Match Module Template
+// Process Modular Match Template
+// ======================================
+// Generates exact_match.sv or lpm_match.sv based on match type
+
+bool Backend::processModularMatchTemplate(SVProgram* program, const std::string& outputDir) {
+    BACKEND_DEBUG("Processing modular match template");
+
+    // Determine match type
+    int matchType = getMatchType(program);
+    std::string templateName;
+    std::string outputName;
+
+    switch (matchType) {
+        case 0:  // Exact
+            templateName = "exact_match.sv.in";
+            outputName = "exact_match.sv";
+            break;
+        case 1:  // LPM
+        default:
+            templateName = "lpm_match.sv.in";
+            outputName = "lpm_match.sv";
+            break;
+    }
+
+    // Load template
+    std::string matchTemplate = loadTemplate("../src/sv/hdl/" + templateName);
+    if (matchTemplate.empty()) {
+        BACKEND_ERROR("Failed to load " << templateName);
+        return false;
+    }
+
+    // Get custom headers for pass-through
+    const auto& customHeaders = program->getParser()->getCustomHeaders();
+
+    // Generate custom header inputs/outputs for pass-through
+    std::stringstream customInputs;
+    std::stringstream customOutputs;
+    std::stringstream customRegs;
+    std::stringstream customRegResets;
+    std::stringstream customRegAssigns;
+    std::stringstream customOutResets;
+    std::stringstream customOutAssigns;
+
+    for (const auto& headerPair : customHeaders) {
+        const std::string headerName = headerPair.first.string();
+        const SVParser::CustomHeaderInfo& headerInfo = headerPair.second;
+
+        // Only process non-stack headers (like probe)
+        if (!headerInfo.isStack) {
+            for (const auto& fieldPair : headerInfo.fields) {
+                const std::string fieldName = fieldPair.first.string();
+                const SVParser::CustomHeaderField& field = fieldPair.second;
+
+                customInputs << "    input  wire [" << (field.width - 1) << ":0]           "
+                             << headerName << "_" << fieldName << "_in,\n";
+
+                customOutputs << "    output reg  [" << (field.width - 1) << ":0]           "
+                              << headerName << "_" << fieldName << "_out,\n";
+
+                customRegs << "    reg  [" << (field.width - 1) << ":0]                   "
+                           << headerName << "_" << fieldName << "_d1;\n";
+
+                customRegResets << "            " << headerName << "_" << fieldName << "_d1  <= "
+                                << field.width << "'b0;\n";
+
+                customRegAssigns << "            " << headerName << "_" << fieldName << "_d1  <= "
+                                 << headerName << "_" << fieldName << "_in;\n";
+
+                customOutResets << "            " << headerName << "_" << fieldName << "_out <= "
+                                << field.width << "'b0;\n";
+
+                customOutAssigns << "            " << headerName << "_" << fieldName << "_out <= "
+                                 << headerName << "_" << fieldName << "_d1;\n";
+            }
+            // Valid signal
+            customInputs << "    input  wire                           " << headerName << "_valid_in,\n";
+            customOutputs << "    output reg                            " << headerName << "_valid_out,\n";
+            customRegs << "    reg                           " << headerName << "_valid_d1;\n";
+            customRegResets << "            " << headerName << "_valid_d1   <= 1'b0;\n";
+            customRegAssigns << "            " << headerName << "_valid_d1   <= " << headerName << "_valid_in;\n";
+            customOutResets << "            " << headerName << "_valid_out  <= 1'b0;\n";
+            customOutAssigns << "            " << headerName << "_valid_out  <= " << headerName << "_valid_d1;\n";
+        }
+    }
+
+    // Replace placeholders
+    matchTemplate = replaceAll(matchTemplate, "{{MATCH_CUSTOM_HEADER_INPUTS}}", customInputs.str());
+    matchTemplate = replaceAll(matchTemplate, "{{MATCH_CUSTOM_HEADER_OUTPUTS}}", customOutputs.str());
+    matchTemplate = replaceAll(matchTemplate, "{{MATCH_CUSTOM_HEADER_REGS}}", customRegs.str());
+    matchTemplate = replaceAll(matchTemplate, "{{MATCH_CUSTOM_HEADER_REG_RESETS}}", customRegResets.str());
+    matchTemplate = replaceAll(matchTemplate, "{{MATCH_CUSTOM_HEADER_REG_ASSIGNS}}", customRegAssigns.str());
+    matchTemplate = replaceAll(matchTemplate, "{{MATCH_CUSTOM_HEADER_OUT_RESETS}}", customOutResets.str());
+    matchTemplate = replaceAll(matchTemplate, "{{MATCH_CUSTOM_HEADER_OUT_ASSIGNS}}", customOutAssigns.str());
+
+    // Write output
+    boost::filesystem::path hdlDir = boost::filesystem::path(outputDir) / "hdl";
+    if (!boost::filesystem::exists(hdlDir)) {
+        boost::filesystem::create_directories(hdlDir);
+    }
+
+    std::string outputPath = (hdlDir / outputName).string();
+    std::ofstream ofs(outputPath);
+    if (!ofs.is_open()) {
+        BACKEND_ERROR("Failed to create " << outputName);
+        return false;
+    }
+    ofs << matchTemplate;
+    ofs.close();
+
+    BACKEND_DEBUG("Generated " << outputName << " (match type: " << matchType << ")");
+    return true;
+}
+
+// ======================================
+// Process Action Engine Template
+// ======================================
+
+bool Backend::processActionEngineTemplate(SVProgram* program, const std::string& outputDir) {
+    BACKEND_DEBUG("Processing action_engine.sv template");
+
+    // Load template
+    std::string actionTemplate = loadTemplate("../src/sv/hdl/action_engine.sv.in");
+    if (actionTemplate.empty()) {
+        BACKEND_ERROR("Failed to load action_engine.sv.in template");
+        return false;
+    }
+
+    // Detect features needed
+    bool enableHash = needsHashEngine(program);
+    bool enableRegisters = needsRegisters(program);
+    bool enableEncap = needsEncapDecap(program);
+    bool enableDecap = needsEncapDecap(program);
+
+    // Replace feature flags (empty strings for now - these will be filled by vfpga_top)
+    actionTemplate = replaceAll(actionTemplate, "{{ACTION_CUSTOM_INPUTS}}", "");
+    actionTemplate = replaceAll(actionTemplate, "{{ACTION_CUSTOM_OUTPUTS}}", "");
+    actionTemplate = replaceAll(actionTemplate, "{{STACK_POINTER_INPUTS}}", "");
+    actionTemplate = replaceAll(actionTemplate, "{{STACK_POINTER_OUTPUTS}}", "");
+    actionTemplate = replaceAll(actionTemplate, "{{ACTION_CUSTOM_LOGIC}}", "");
+
+    // Write output
+    boost::filesystem::path hdlDir = boost::filesystem::path(outputDir) / "hdl";
+    if (!boost::filesystem::exists(hdlDir)) {
+        boost::filesystem::create_directories(hdlDir);
+    }
+
+    std::string outputPath = (hdlDir / "action_engine.sv").string();
+    std::ofstream ofs(outputPath);
+    if (!ofs.is_open()) {
+        BACKEND_ERROR("Failed to create action_engine.sv");
+        return false;
+    }
+    ofs << actionTemplate;
+    ofs.close();
+
+    BACKEND_DEBUG("Generated action_engine.sv (hash=" << enableHash
+                  << ", registers=" << enableRegisters
+                  << ", encap=" << enableEncap << ")");
+    return true;
+}
+
+// ======================================
+// Process Match Module Template (Legacy)
 // ======================================
 
 bool Backend::processMatchTemplate(SVProgram* program, const std::string& outputDir) {
-    BACKEND_DEBUG("Processing match.sv template");
+    BACKEND_DEBUG("Processing match.sv template (legacy)");
 
     // Load template
     std::string matchTemplate = loadTemplate("../src/sv/hdl/match.sv.in");
@@ -1534,7 +1978,15 @@ std::string generateTableLookup(SVProgram* program) {
     
     // Build the complete lookup key line
     std::stringstream result;
-    result << ".lookup_key(" << keyExpr.str() << "),\n";
+
+    // For tunnel pattern, use the dynamically selected lookup key
+    if (isTunnelPattern(program)) {
+        result << ".lookup_key(selected_lookup_key),\n";
+        BACKEND_DEBUG("Using selected_lookup_key for tunnel pattern");
+    } else {
+        result << ".lookup_key(" << keyExpr.str() << "),\n";
+    }
+
     result << "        .lookup_key_mask(";
 
     int keyWidth = firstTable->getKeyWidth();
@@ -1735,7 +2187,24 @@ bool Backend::processMatchActionTemplate(SVProgram* program, const std::string& 
             }
         }
     }
-    
+
+    // ==========================================
+    // Add MRI-specific inputs (ipv4_ihl, ipv4_total_len from standard ipv4 header)
+    // ==========================================
+    bool hasMriForInputs = false;
+    for (const auto& headerPair : customHeaders) {
+        std::string hdrName = headerPair.first.string();
+        if (hdrName == "mri" || hdrName.find("mri") != std::string::npos) {
+            hasMriForInputs = true;
+            break;
+        }
+    }
+    if (hasMriForInputs) {
+        customInputs << "    // MRI-specific inputs (from standard IPv4 header)\n";
+        customInputs << "    input  wire [3:0]                     ipv4_ihl,\n";
+        customInputs << "    input  wire [15:0]                    ipv4_total_len,\n";
+    }
+
     // ==========================================
     // Generate Custom Header OUTPUTS
     // ==========================================
@@ -1745,6 +2214,12 @@ bool Backend::processMatchActionTemplate(SVProgram* program, const std::string& 
         for (const auto& headerPair : customHeaders) {
             const std::string headerName = headerPair.first.string();
             const SVParser::CustomHeaderInfo& headerInfo = headerPair.second;
+
+            // Skip MRI header outputs - they're generated separately as MRI-specific outputs
+            bool isMriHeader = (headerName == "mri" || headerName.find("mri") != std::string::npos);
+            if (isMriHeader && !headerInfo.isStack) {
+                continue;  // Skip non-stack MRI header (mri_count, mri_valid handled by MRI-specific)
+            }
 
             if (headerInfo.isStack) {
                 // For stack headers, generate array outputs
@@ -1770,7 +2245,21 @@ bool Backend::processMatchActionTemplate(SVProgram* program, const std::string& 
             }
         }
     }
-    
+
+    // ==========================================
+    // Add MRI-specific outputs (includes out_mri_count which replaces custom header output)
+    // ==========================================
+    if (hasMriForInputs) {
+        customOutputs << "    // MRI-specific outputs (modified by egress action)\n";
+        customOutputs << "    output wire [15:0]                    out_mri_count,\n";  // Replaces custom header out_mri_count
+        customOutputs << "    output wire [3:0]                     out_ipv4_ihl,\n";
+        customOutputs << "    output wire [7:0]                     out_ipv4_option_length,\n";
+        customOutputs << "    output wire [15:0]                    out_ipv4_total_len,\n";
+        customOutputs << "    output wire [31:0]                    out_swtraces_0_swid,\n";
+        customOutputs << "    output wire [31:0]                    out_swtraces_0_qdepth,\n";
+        customOutputs << "    output wire                           out_swtraces_0_valid,\n";
+    }
+
     // ==========================================
     // Generate Custom Header WIRES
     // ==========================================
@@ -2071,6 +2560,61 @@ bool Backend::processMatchActionTemplate(SVProgram* program, const std::string& 
                 << ", hop_cnt=" << probeHopCntExpr);
 
     // ==========================================
+    // Generate MRI/INT Signal Connections
+    // Note: mri_valid and mri_count come from custom header generation
+    // Here we only add MRI-specific signals not covered by custom headers
+    // ==========================================
+    bool hasMriHeader = false;
+    for (const auto& headerPair : customHeaders) {
+        std::string headerName = headerPair.first.string();
+        if (headerName == "mri" || headerName.find("mri") != std::string::npos) {
+            hasMriHeader = true;
+            break;
+        }
+    }
+
+    std::stringstream mriSS;
+    if (hasMriHeader) {
+        // MRI header exists - connect MRI-specific signals
+        // mri_valid and mri_count are already connected via custom headers
+        mriSS << "\n        // MRI/INT signal connections (MRI-specific fields)\n";
+        mriSS << "        .mri_valid(mri_valid),\n";
+        mriSS << "        .mri_count_in(mri_count),\n";
+        mriSS << "        .deq_qdepth(deq_qdepth),\n";
+        mriSS << "        .ipv4_ihl_in(ipv4_ihl),\n";
+        mriSS << "        .ipv4_option_length_in(ipv4_option_optionLength),\n";  // From ipv4_option header
+        mriSS << "        .ipv4_total_len_in(ipv4_total_len),\n";
+        mriSS << "        .mri_count_out(out_mri_count),\n";
+        mriSS << "        .ipv4_ihl_out(out_ipv4_ihl),\n";
+        mriSS << "        .ipv4_option_length_out(out_ipv4_option_length),\n";
+        mriSS << "        .ipv4_total_len_out(out_ipv4_total_len),\n";
+        mriSS << "        .swtraces_0_swid_out(out_swtraces_0_swid),\n";
+        mriSS << "        .swtraces_0_qdepth_out(out_swtraces_0_qdepth),\n";
+        mriSS << "        .swtraces_0_valid_out(out_swtraces_0_valid),";
+        BACKEND_DEBUG("MRI header found - generating MRI signal connections");
+    } else {
+        // No MRI header - connect to defaults
+        mriSS << "\n        // MRI signals (no MRI header - defaults)\n";
+        mriSS << "        .mri_valid(1'b0),\n";
+        mriSS << "        .mri_count_in(16'd0),\n";
+        mriSS << "        .deq_qdepth(19'd0),\n";
+        mriSS << "        .ipv4_ihl_in(4'd0),\n";
+        mriSS << "        .ipv4_option_length_in(8'd0),\n";
+        mriSS << "        .ipv4_total_len_in(16'd0),\n";
+        mriSS << "        .mri_count_out(),\n";
+        mriSS << "        .ipv4_ihl_out(),\n";
+        mriSS << "        .ipv4_option_length_out(),\n";
+        mriSS << "        .ipv4_total_len_out(),\n";
+        mriSS << "        .swtraces_0_swid_out(),\n";
+        mriSS << "        .swtraces_0_qdepth_out(),\n";
+        mriSS << "        .swtraces_0_valid_out(),";
+    }
+
+    matchActionTemplate = replaceAll(matchActionTemplate,
+                                    "{{MRI_SIGNAL_CONNECTIONS}}",
+                                    mriSS.str());
+
+    // ==========================================
     // Detect const table FIRST (needed for custom header connections)
     // ==========================================
     bool useConstTableForHeaders = false;
@@ -2093,6 +2637,10 @@ bool Backend::processMatchActionTemplate(SVProgram* program, const std::string& 
             const std::string headerName = headerPair.first.string();
             const SVParser::CustomHeaderInfo& headerInfo = headerPair.second;
 
+            // Skip MRI header outputs - they're handled by MRI-specific connections
+            // (mri_count_out, etc. in action module connect to out_mri_count via MRI_SIGNAL_CONNECTIONS)
+            bool isMriHeader = (headerName == "mri" || headerName.find("mri") != std::string::npos);
+
             // Generate INPUT connections for custom header data arrays
             // Action module needs access to stack data (e.g., srcRoutes_port for egress_spec)
             if (headerInfo.isStack) {
@@ -2106,6 +2654,11 @@ bool Backend::processMatchActionTemplate(SVProgram* program, const std::string& 
             }
 
             // Generate OUTPUT connections for action module
+            // Skip MRI header - handled separately via MRI_SIGNAL_CONNECTIONS
+            if (isMriHeader) {
+                continue;  // MRI outputs handled by MRI signal connections
+            }
+
             // When const table is used, leave unconnected to avoid multiple drivers
             for (const auto& fieldPair : headerInfo.fields) {
                 const std::string fieldName = fieldPair.first.string();
@@ -2686,6 +3239,24 @@ bool Backend::processActionTemplate(SVProgram* program, const std::string& outpu
         BACKEND_DEBUG("Enabled multicast pruning");
     }
 
+    // Check for MRI/INT pattern (swtraces header with egress processing)
+    bool hasMriEgress = false;
+    for (const auto& headerPair : customHeaders) {
+        const std::string headerName = headerPair.first.string();
+        if ((headerName.find("swtraces") != std::string::npos ||
+             headerName.find("swtrace") != std::string::npos) && headerPair.second.isStack) {
+            hasMriEgress = true;
+            BACKEND_DEBUG("Detected MRI/INT swtraces header for egress processing");
+            break;
+        }
+    }
+
+    if (hasMriEgress) {
+        // MRI needs: ENABLE_EGRESS (0), ENABLE_EGRESS_TABLE (4), ENABLE_PUSH_FRONT (5)
+        egressConfig |= 0x31;  // Bits 0,4,5: ENABLE_EGRESS + ENABLE_EGRESS_TABLE + ENABLE_PUSH_FRONT
+        BACKEND_DEBUG("Enabled MRI egress processing (egress table + push_front)");
+    }
+
     std::stringstream configSS;
     configSS << "8'b";
     for (int i = 7; i >= 0; i--) {
@@ -2801,13 +3372,24 @@ bool Backend::processActionTemplate(SVProgram* program, const std::string& outpu
     std::string probeDataHeader;
     int probeDataMaxSize = 10;
 
+    // Check if we have swtraces header (MRI/INT pattern)
+    bool hasSwtraces = false;
+    std::string swtracesHeader;
+    int swtracesMaxSize = 9;
+
     for (const auto& headerPair : customHeaders) {
         const std::string headerName = headerPair.first.string();
         if (headerName.find("probe_data") != std::string::npos && headerPair.second.isStack) {
             hasProbeData = true;
             probeDataHeader = headerName;
             probeDataMaxSize = headerPair.second.maxStackSize;
-            break;
+        }
+        if ((headerName.find("swtraces") != std::string::npos ||
+             headerName.find("swtrace") != std::string::npos) && headerPair.second.isStack) {
+            hasSwtraces = true;
+            swtracesHeader = headerName;
+            swtracesMaxSize = headerPair.second.maxStackSize;
+            BACKEND_DEBUG("Found swtraces header: " << swtracesHeader << " with max size " << swtracesMaxSize);
         }
     }
 
@@ -2861,6 +3443,13 @@ bool Backend::processActionTemplate(SVProgram* program, const std::string& outpu
         egressCustomLogicSS << "                                    out_probe_data_valid[i] <= 1'b0;\n";
         egressCustomLogicSS << "                                end\n";
         egressCustomLogicSS << "                            end\n";
+    }
+
+    // Generate MRI/INT swtrace push logic (different pattern from link_monitor)
+    if (hasSwtraces) {
+        // MRI logic: when mri header is valid, push swtrace entry
+        // This is triggered by egress table action, not inline
+        BACKEND_DEBUG("Generating MRI swtraces egress logic for " << swtracesHeader);
     }
 
     actionTemplate = replaceAll(actionTemplate, "{{RESET_CUSTOM_HEADER_OUTPUTS}}", resetCustomHeadersSS.str());
@@ -3057,30 +3646,25 @@ bool Backend::run(const SVOptions& options,
     }
     BACKEND_SUCCESS("Generated deparser.sv");
 
-    // Generate action.sv
-    BACKEND_DEBUG("Generating action.sv");
-    if (!processActionTemplate(&svprog, options.outputDir.string())) {
-        return false;
-    }
-    BACKEND_SUCCESS("Generated action.sv");
-    
-    // Copy static modules
+    // Copy static modules (stats, etc.)
     if (!copyStaticTemplates(options.outputDir.string())) {
         return false;
     }
     BACKEND_SUCCESS("Copied static modules");
 
-    // Process match.sv template with custom header passthrough
-    if (!processMatchTemplate(&svprog, options.outputDir.string())) {
+    // Generate modular match template (exact_match or lpm_match)
+    BACKEND_DEBUG("Generating modular match module");
+    if (!processModularMatchTemplate(&svprog, options.outputDir.string())) {
         return false;
     }
-    BACKEND_SUCCESS("Generated match.sv");
+    BACKEND_SUCCESS("Generated modular match module");
 
-    // Process match_action.sv template with custom headers AND conditional logic
-    if (!processMatchActionTemplate(&svprog, options.outputDir.string())) {
+    // Generate action_engine.sv
+    BACKEND_DEBUG("Generating action_engine.sv");
+    if (!processActionEngineTemplate(&svprog, options.outputDir.string())) {
         return false;
     }
-    BACKEND_SUCCESS("Generated match_action.sv");
+    BACKEND_SUCCESS("Generated action_engine.sv");
 
     if (svprog.getEgress() && svprog.getEgress()->hasRegisters()) {
         if (!processEgressTemplate(&svprog, options.outputDir.string())) {
@@ -3118,13 +3702,105 @@ bool Backend::run(const SVOptions& options,
     
     // Basic replacements
     vfpgaTemplate = replaceAll(vfpgaTemplate, "{{MODULE_NAME}}", baseName);
-    vfpgaTemplate = replaceAll(vfpgaTemplate, "{{PARSER_CONFIG}}", 
+    vfpgaTemplate = replaceAll(vfpgaTemplate, "{{PARSER_CONFIG}}",
                                 svprog.getParser()->getParserConfigString());
-    vfpgaTemplate = replaceAll(vfpgaTemplate, "{{DEPARSER_CONFIG}}", 
+    vfpgaTemplate = replaceAll(vfpgaTemplate, "{{DEPARSER_CONFIG}}",
                                 svprog.getDeparser()->getDeparserConfigString());
-    
+
+    // ==========================================
+    // Modular Architecture Placeholders
+    // ==========================================
+    int matchType = getMatchType(&svprog);
+    std::string matchModuleName = (matchType == 0) ? "exact_match" : "lpm_match";
+    std::string matchTypeName = (matchType == 0) ? "Exact" : "LPM";
+
+    vfpgaTemplate = replaceAll(vfpgaTemplate, "{{MATCH_MODULE_NAME}}", matchModuleName);
+    vfpgaTemplate = replaceAll(vfpgaTemplate, "{{MATCH_TYPE_NAME}}", matchTypeName);
+
+    // Determine lookup key and key width
+    std::string lookupKey = "ipv4_dst_addr";  // Default
+    std::string keyWidth = "32";
+
+    if (svprog.getIngress()) {
+        const auto& tables = svprog.getIngress()->getTables();
+        if (!tables.empty()) {
+            SVTable* firstTable = tables.begin()->second;
+            auto keyFields = firstTable->getKeyFieldNames();
+            if (!keyFields.empty()) {
+                std::string fieldName = keyFields[0].string();
+                // Convert P4 field notation (hdr.ipv4.dstAddr) to signal name (ipv4_dst_addr)
+                if (fieldName.find("ipv4") != std::string::npos &&
+                    fieldName.find("dst") != std::string::npos) {
+                    lookupKey = "ipv4_dst_addr";
+                    keyWidth = "32";
+                } else if (fieldName.find("ipv4") != std::string::npos &&
+                           fieldName.find("src") != std::string::npos) {
+                    lookupKey = "ipv4_src_addr";
+                    keyWidth = "32";
+                }
+                // Check for tunnel header
+                auto tunnelInfo = getTunnelHeaderInfo(&svprog);
+                if (!tunnelInfo.first.empty()) {
+                    // Tunnel application - might use tunnel header field
+                    BACKEND_DEBUG("Tunnel lookup key detected");
+                }
+            }
+        }
+    }
+
+    vfpgaTemplate = replaceAll(vfpgaTemplate, "{{LOOKUP_KEY}}", lookupKey);
+    vfpgaTemplate = replaceAll(vfpgaTemplate, "{{KEY_WIDTH}}", keyWidth);
+
+    // Match table extra ports (for LPM: prefix_len)
+    std::string matchTableExtraPorts = "";
+    if (matchType == 1) {  // LPM
+        matchTableExtraPorts = "    .table_entry_prefix_len(axi_ctrl_entry_prefix_len),\n";
+    }
+    vfpgaTemplate = replaceAll(vfpgaTemplate, "{{MATCH_TABLE_EXTRA_PORTS}}", matchTableExtraPorts);
+
+    // Feature detection for action_engine
+    bool enableHash = needsHashEngine(&svprog);
+    bool enableRegisters = needsRegisters(&svprog);
+    bool enableEncap = needsEncapDecap(&svprog);
+    bool enableDecap = needsEncapDecap(&svprog);
+    bool enableEcnMarking = (svprog.getControlConfig().egressConfig & 0x02) != 0;
+    bool enableMulticast = false;
+
+    // Detect multicast
+    if (svprog.getIngress()) {
+        for (const auto& actionPair : svprog.getIngress()->getActions()) {
+            SVAction* action = actionPair.second;
+            for (const auto& assignment : action->getAssignments()) {
+                if (assignment.dest.find("mcast_grp") != std::string::npos) {
+                    enableMulticast = true;
+                    break;
+                }
+            }
+            if (enableMulticast) break;
+        }
+    }
+
+    vfpgaTemplate = replaceAll(vfpgaTemplate, "{{ENABLE_HASH}}", enableHash ? "1" : "0");
+    vfpgaTemplate = replaceAll(vfpgaTemplate, "{{ENABLE_REGISTERS}}", enableRegisters ? "1" : "0");
+    vfpgaTemplate = replaceAll(vfpgaTemplate, "{{ENABLE_ENCAP}}", enableEncap ? "1" : "0");
+    vfpgaTemplate = replaceAll(vfpgaTemplate, "{{ENABLE_DECAP}}", enableDecap ? "1" : "0");
+    vfpgaTemplate = replaceAll(vfpgaTemplate, "{{ENABLE_ECN_MARKING}}", enableEcnMarking ? "1" : "0");
+    vfpgaTemplate = replaceAll(vfpgaTemplate, "{{ENABLE_MULTICAST}}", enableMulticast ? "1" : "0");
+    vfpgaTemplate = replaceAll(vfpgaTemplate, "{{HASH_TYPE}}", "0");  // CRC16 default
+    vfpgaTemplate = replaceAll(vfpgaTemplate, "{{NUM_REGISTERS}}", "1024");
+
+    // Match custom header wires/inputs/outputs (empty for now)
+    vfpgaTemplate = replaceAll(vfpgaTemplate, "{{MATCH_CUSTOM_HEADER_WIRES}}", "");
+    vfpgaTemplate = replaceAll(vfpgaTemplate, "{{MATCH_CUSTOM_HEADER_INPUTS}}", "");
+    vfpgaTemplate = replaceAll(vfpgaTemplate, "{{MATCH_CUSTOM_HEADER_OUTPUTS}}", "");
+
+    // Action custom inputs/outputs/stack ports (empty for now)
+    vfpgaTemplate = replaceAll(vfpgaTemplate, "{{ACTION_CUSTOM_INPUTS}}", "");
+    vfpgaTemplate = replaceAll(vfpgaTemplate, "{{ACTION_CUSTOM_OUTPUTS}}", "");
+    vfpgaTemplate = replaceAll(vfpgaTemplate, "{{ACTION_STACK_POINTER_PORTS}}", "");
+
     // Custom header replacements
-    vfpgaTemplate = replaceAll(vfpgaTemplate, "{{CUSTOM_HEADER_SIGNALS}}", 
+    vfpgaTemplate = replaceAll(vfpgaTemplate, "{{CUSTOM_HEADER_SIGNALS}}",
                                 codegen.generateCustomHeaderSignals(svprog.getParser()));
 
     // ==========================================

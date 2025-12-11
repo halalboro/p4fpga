@@ -135,7 +135,7 @@ module tb_user;
     // ==========================================
     parser #(
         .DATA_WIDTH(DATA_WIDTH),
-        .PARSER_CONFIG(8'b00100101)  // Ethernet + IPv4 + UDP
+        .PARSER_CONFIG(8'b10100101)  // Ethernet + IPv4 + UDP + myTunnel
     ) parser_inst (
         .aclk(aclk),
         .aresetn(aresetn),
@@ -288,7 +288,7 @@ module tb_user;
     // ==========================================
     deparser #(
         .DATA_WIDTH(DATA_WIDTH),
-        .DEPARSER_CONFIG(16'h0025)  // Ethernet + IPv4 + UDP
+        .DEPARSER_CONFIG(16'h0425)  // Ethernet + IPv4 + UDP + myTunnel
     ) deparser_inst (
         .aclk(aclk),
         .aresetn(aresetn),
@@ -401,8 +401,8 @@ module tb_user;
         table_wr_en            <= 1'b1;
         table_wr_addr          <= addr;
         table_entry_valid      <= 1'b1;
-        table_entry_key        <= {16'd0, dst_id};  // 16-bit dst_id in lower bits
-        table_entry_prefix_len <= 6'd16;            // Exact match
+        table_entry_key        <= {dst_id, 16'd0};  // dst_id in MSBs for LPM prefix match
+        table_entry_prefix_len <= 6'd16;            // Match top 16 bits (dst_id)
         table_entry_action     <= action_id;
         // For tunnel forward, only egress port matters
         table_entry_action_data <= {24'd0, egress_p[7:0], 96'd0};

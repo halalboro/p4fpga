@@ -21,6 +21,11 @@ private:
     
     bool copyStaticTemplates(const std::string& outputDir);
 
+    // Modular architecture (new)
+    bool processModularMatchTemplate(SVProgram* program, const std::string& outputDir);
+    bool processActionEngineTemplate(SVProgram* program, const std::string& outputDir);
+
+    // Legacy functions (kept for reference)
     bool processMatchTemplate(SVProgram* program, const std::string& outputDir);
     bool processMatchActionTemplate(SVProgram* program, const std::string& outputDir);
     bool processActionTemplate(SVProgram* program, const std::string& outputDir);

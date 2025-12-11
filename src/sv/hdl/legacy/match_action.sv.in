@@ -63,8 +63,9 @@ module match_action #(
     // Egress Control
     // ==========================================
     input  wire [18:0]                    enq_qdepth,
+    input  wire [18:0]                    deq_qdepth,
     input  wire [8:0]                     egress_port_id,
-        
+
     // ==========================================
     // Packet Output (to Deparser)
     // ==========================================
@@ -293,6 +294,7 @@ module match_action #(
         .egress_port_id(egress_port_id),
         .packet_length_in(packet_length),
 {{PROBE_SIGNAL_CONNECTIONS}}
+{{MRI_SIGNAL_CONNECTIONS}}
 
         .packet_out(packet_out),
         .packet_keep_out(packet_keep_out),

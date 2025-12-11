@@ -1,0 +1,270 @@
+// =============================================================================
+// LPM (Longest Prefix Match) Module
+// Implements IP routing style prefix matching
+// Extracted as reusable IP block for P4-FPGA compiler
+// =============================================================================
+
+module lpm_match #(
+    parameter KEY_WIDTH = 32,
+    parameter TABLE_SIZE = 1024,
+    parameter ACTION_DATA_WIDTH = 128,
+    parameter DATA_WIDTH = 512
+) (
+    input  wire                           aclk,
+    input  wire                           aresetn,
+
+    // ==========================================
+    // Lookup Interface
+    // ==========================================
+    input  wire [KEY_WIDTH-1:0]           lookup_key,
+    input  wire                           lookup_valid,
+    output reg                            lookup_ready,
+
+    // ==========================================
+    // Header validity preservation
+    // ==========================================
+    input  wire                           ipv4_valid_in,
+
+    // ==========================================
+    // Custom header inputs (for pass-through)
+    // ==========================================
+{{MATCH_CUSTOM_HEADER_INPUTS}}
+
+    // ==========================================
+    // Header fields pass-through
+    // ==========================================
+    input  wire [47:0]                    eth_dst_addr_in,
+    input  wire [47:0]                    eth_src_addr_in,
+    input  wire [7:0]                     ipv4_ttl_in,
+    input  wire [5:0]                     ipv4_diffserv_in,
+    input  wire [1:0]                     ipv4_ecn_in,
+
+    // ==========================================
+    // Packet data pass-through
+    // ==========================================
+    input  wire [DATA_WIDTH-1:0]          packet_data_in,
+    input  wire [DATA_WIDTH/8-1:0]        packet_keep_in,
+    input  wire                           packet_last_in,
+
+    // ==========================================
+    // Match Results
+    // ==========================================
+    output reg                            match_hit,
+    output reg  [3:0]                     match_action_id,
+    output reg  [ACTION_DATA_WIDTH-1:0]   match_action_data,
+    output reg                            match_valid,
+
+    // ==========================================
+    // Preserved outputs
+    // ==========================================
+    output reg                            ipv4_valid_out,
+    output reg  [47:0]                    eth_dst_addr_out,
+    output reg  [47:0]                    eth_src_addr_out,
+    output reg  [7:0]                     ipv4_ttl_out,
+    output reg  [5:0]                     ipv4_diffserv_out,
+    output reg  [1:0]                     ipv4_ecn_out,
+    output reg  [DATA_WIDTH-1:0]          packet_data_out,
+    output reg  [DATA_WIDTH/8-1:0]        packet_keep_out,
+    output reg                            packet_last_out,
+
+    // ==========================================
+    // Custom header outputs (pass-through)
+    // ==========================================
+{{MATCH_CUSTOM_HEADER_OUTPUTS}}
+
+    // ==========================================
+    // Table Programming Interface
+    // ==========================================
+    input  wire                           table_write_enable,
+    input  wire [$clog2(TABLE_SIZE)-1:0]  table_write_addr,
+    input  wire                           table_entry_valid,
+    input  wire [KEY_WIDTH-1:0]           table_entry_key,
+    input  wire [5:0]                     table_entry_prefix_len,
+    input  wire [2:0]                     table_entry_action_id,
+    input  wire [ACTION_DATA_WIDTH-1:0]   table_entry_action_data
+);
+
+    // ==========================================
+    // Table Entry Structure (LPM)
+    // ==========================================
+    typedef struct packed {
+        logic                           valid;
+        logic [KEY_WIDTH-1:0]           key;
+        logic [5:0]                     prefix_len;
+        logic [2:0]                     action_id;
+        logic [ACTION_DATA_WIDTH-1:0]   action_data;
+    } table_entry_t;
+
+    // ==========================================
+    // Table Storage
+    // ==========================================
+    table_entry_t table_mem [0:TABLE_SIZE-1];
+
+    // ==========================================
+    // Pipeline registers for pass-through
+    // ==========================================
+    reg                           ipv4_valid_d1;
+    reg  [47:0]                   eth_dst_d1;
+    reg  [47:0]                   eth_src_d1;
+    reg  [7:0]                    ipv4_ttl_d1;
+    reg  [5:0]                    ipv4_diffserv_d1;
+    reg  [1:0]                    ipv4_ecn_d1;
+    reg  [DATA_WIDTH-1:0]         packet_data_d1;
+    reg  [DATA_WIDTH/8-1:0]       packet_keep_d1;
+    reg                           packet_last_d1;
+    reg                           lookup_valid_d1;
+    reg  [KEY_WIDTH-1:0]          lookup_key_d1;
+
+    // Custom header pipeline registers
+{{MATCH_CUSTOM_HEADER_REGS}}
+
+    // ==========================================
+    // Internal Signals
+    // ==========================================
+    reg  [KEY_WIDTH-1:0] match_mask;
+
+    // ==========================================
+    // Table Initialization
+    // ==========================================
+    initial begin
+        for (int i = 0; i < TABLE_SIZE; i++) begin
+            table_mem[i].valid = 1'b0;
+            table_mem[i].action_id = 3'd1;  // Default: drop
+        end
+    end
+
+    // ==========================================
+    // Table Write Logic
+    // ==========================================
+    always_ff @(posedge aclk) begin
+        if (table_write_enable) begin
+            table_mem[table_write_addr].valid       <= table_entry_valid;
+            table_mem[table_write_addr].key         <= table_entry_key;
+            table_mem[table_write_addr].prefix_len  <= table_entry_prefix_len;
+            table_mem[table_write_addr].action_id   <= table_entry_action_id;
+            table_mem[table_write_addr].action_data <= table_entry_action_data;
+        end
+    end
+
+    // ==========================================
+    // Stage 1 - Register inputs
+    // ==========================================
+    always_ff @(posedge aclk or negedge aresetn) begin
+        if (!aresetn) begin
+            ipv4_valid_d1     <= 1'b0;
+            eth_dst_d1        <= 48'b0;
+            eth_src_d1        <= 48'b0;
+            ipv4_ttl_d1       <= 8'b0;
+            ipv4_diffserv_d1  <= 6'b0;
+            ipv4_ecn_d1       <= 2'b0;
+            packet_data_d1    <= '0;
+            packet_keep_d1    <= '0;
+            packet_last_d1    <= 1'b0;
+            lookup_valid_d1   <= 1'b0;
+            lookup_key_d1     <= '0;
+            // Custom header register resets
+{{MATCH_CUSTOM_HEADER_REG_RESETS}}
+        end else if (lookup_ready) begin
+            ipv4_valid_d1     <= ipv4_valid_in;
+            eth_dst_d1        <= eth_dst_addr_in;
+            eth_src_d1        <= eth_src_addr_in;
+            ipv4_ttl_d1       <= ipv4_ttl_in;
+            ipv4_diffserv_d1  <= ipv4_diffserv_in;
+            ipv4_ecn_d1       <= ipv4_ecn_in;
+            packet_data_d1    <= packet_data_in;
+            packet_keep_d1    <= packet_keep_in;
+            packet_last_d1    <= packet_last_in;
+            lookup_valid_d1   <= lookup_valid;
+            lookup_key_d1     <= lookup_key;
+            // Custom header register assignments
+{{MATCH_CUSTOM_HEADER_REG_ASSIGNS}}
+        end
+    end
+
+    // ==========================================
+    // Lookup Logic (Combinational)
+    // ==========================================
+    always_comb begin
+        lookup_ready = 1'b1;  // Always ready
+    end
+
+    // ==========================================
+    // LPM Match Logic
+    // ==========================================
+    always_ff @(posedge aclk or negedge aresetn) begin
+        if (!aresetn) begin
+            match_hit         <= 1'b0;
+            match_action_id   <= 3'd1;  // Default drop
+            match_action_data <= '0;
+            match_valid       <= 1'b0;
+            ipv4_valid_out    <= 1'b0;
+            eth_dst_addr_out  <= 48'b0;
+            eth_src_addr_out  <= 48'b0;
+            ipv4_ttl_out      <= 8'b0;
+            ipv4_diffserv_out <= 6'b0;
+            ipv4_ecn_out      <= 2'b0;
+            packet_data_out   <= '0;
+            packet_keep_out   <= '0;
+            packet_last_out   <= 1'b0;
+            // Custom header output resets
+{{MATCH_CUSTOM_HEADER_OUT_RESETS}}
+        end else begin
+            match_valid       <= lookup_valid_d1;
+            ipv4_valid_out    <= ipv4_valid_d1;
+            eth_dst_addr_out  <= eth_dst_d1;
+            eth_src_addr_out  <= eth_src_d1;
+            ipv4_ttl_out      <= ipv4_ttl_d1;
+            ipv4_diffserv_out <= ipv4_diffserv_d1;
+            ipv4_ecn_out      <= ipv4_ecn_d1;
+            packet_data_out   <= packet_data_d1;
+            packet_keep_out   <= packet_keep_d1;
+            packet_last_out   <= packet_last_d1;
+            // Custom header output assignments
+{{MATCH_CUSTOM_HEADER_OUT_ASSIGNS}}
+
+            if (lookup_valid_d1) begin
+                // Default: no match
+                match_hit        <= 1'b0;
+                match_action_id  <= 3'd1;  // Drop
+                match_action_data <= '0;
+
+                // LPM: Find longest matching prefix
+                begin
+                    automatic logic [5:0] best_match_len = 6'd0;
+                    automatic logic found = 1'b0;
+                    automatic logic [2:0] best_action_id = 3'd1;
+                    automatic logic [ACTION_DATA_WIDTH-1:0] best_action_data = '0;
+
+                    for (int i = 0; i < TABLE_SIZE; i++) begin
+                        if (table_mem[i].valid) begin
+                            // Calculate MSB-based mask from prefix length
+                            // For network order IPs: /8 = top 8 bits, /24 = top 24 bits
+                            if (table_mem[i].prefix_len == 6'd0)
+                                match_mask = '0;
+                            else if (table_mem[i].prefix_len >= KEY_WIDTH)
+                                match_mask = '1;
+                            else
+                                match_mask = ({KEY_WIDTH{1'b1}} << (KEY_WIDTH - table_mem[i].prefix_len));
+
+                            // Check if prefix matches
+                            if ((lookup_key_d1 & match_mask) == (table_mem[i].key & match_mask)) begin
+                                // Select longest match
+                                if (table_mem[i].prefix_len >= best_match_len) begin
+                                    found             = 1'b1;
+                                    best_match_len    = table_mem[i].prefix_len;
+                                    best_action_id    = table_mem[i].action_id;
+                                    best_action_data  = table_mem[i].action_data;
+                                end
+                            end
+                        end
+                    end
+
+                    match_hit         <= found;
+                    match_action_id   <= best_action_id;
+                    match_action_data <= best_action_data;
+                end
+            end
+        end
+    end
+
+endmodule

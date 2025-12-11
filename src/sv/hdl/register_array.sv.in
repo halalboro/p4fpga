@@ -1,0 +1,191 @@
+// =============================================================================
+// Register Array Module
+// Implements P4 stateful registers with read-modify-write support
+// Extracted as reusable IP block for P4-FPGA compiler
+// =============================================================================
+
+module register_array #(
+    parameter NUM_REGISTERS = 1024,
+    parameter REGISTER_WIDTH = 32,
+    parameter INIT_VALUE = 0,
+    parameter ENABLE_RMW = 0        // Enable atomic read-modify-write operations
+) (
+    input  wire                                    aclk,
+    input  wire                                    aresetn,
+
+    // Simple Read/Write Interface
+    input  wire [$clog2(NUM_REGISTERS)-1:0]       addr,
+    input  wire [REGISTER_WIDTH-1:0]              write_data,
+    input  wire                                    write_enable,
+    output wire [REGISTER_WIDTH-1:0]              read_data,
+
+    // Atomic Read-Modify-Write Interface (optional)
+    input  wire [$clog2(NUM_REGISTERS)-1:0]       rmw_addr,
+    input  wire [REGISTER_WIDTH-1:0]              rmw_operand,
+    input  wire [2:0]                             rmw_op,      // Operation type
+    input  wire                                    rmw_enable,
+    output wire [REGISTER_WIDTH-1:0]              rmw_old_value,
+    output wire [REGISTER_WIDTH-1:0]              rmw_new_value
+);
+
+    // ==========================================
+    // RMW Operation Types
+    // ==========================================
+    localparam RMW_ADD = 3'd0;    // result = old + operand
+    localparam RMW_SUB = 3'd1;    // result = old - operand
+    localparam RMW_AND = 3'd2;    // result = old & operand
+    localparam RMW_OR  = 3'd3;    // result = old | operand
+    localparam RMW_XOR = 3'd4;    // result = old ^ operand
+    localparam RMW_MAX = 3'd5;    // result = max(old, operand)
+    localparam RMW_MIN = 3'd6;    // result = min(old, operand)
+    localparam RMW_SET = 3'd7;    // result = operand
+
+    // ==========================================
+    // Register Storage
+    // ==========================================
+    reg [REGISTER_WIDTH-1:0] registers [0:NUM_REGISTERS-1];
+
+    // ==========================================
+    // Initialization
+    // ==========================================
+    initial begin
+        for (int i = 0; i < NUM_REGISTERS; i++) begin
+            registers[i] = INIT_VALUE[REGISTER_WIDTH-1:0];
+        end
+    end
+
+    // ==========================================
+    // Combinational Read
+    // ==========================================
+    assign read_data = registers[addr];
+
+    // ==========================================
+    // RMW Support (Generate Block)
+    // ==========================================
+    generate
+        if (ENABLE_RMW) begin : gen_rmw
+            // RMW old value read
+            assign rmw_old_value = registers[rmw_addr];
+
+            // Compute RMW result
+            reg [REGISTER_WIDTH-1:0] rmw_result;
+            always_comb begin
+                case (rmw_op)
+                    RMW_ADD: rmw_result = rmw_old_value + rmw_operand;
+                    RMW_SUB: rmw_result = rmw_old_value - rmw_operand;
+                    RMW_AND: rmw_result = rmw_old_value & rmw_operand;
+                    RMW_OR:  rmw_result = rmw_old_value | rmw_operand;
+                    RMW_XOR: rmw_result = rmw_old_value ^ rmw_operand;
+                    RMW_MAX: rmw_result = (rmw_old_value > rmw_operand) ? rmw_old_value : rmw_operand;
+                    RMW_MIN: rmw_result = (rmw_old_value < rmw_operand) ? rmw_old_value : rmw_operand;
+                    RMW_SET: rmw_result = rmw_operand;
+                    default: rmw_result = rmw_operand;
+                endcase
+            end
+            assign rmw_new_value = rmw_result;
+
+            // Sequential Write with RMW support
+            always_ff @(posedge aclk) begin
+                if (!aresetn) begin
+                    for (int i = 0; i < NUM_REGISTERS; i++) begin
+                        registers[i] <= INIT_VALUE[REGISTER_WIDTH-1:0];
+                    end
+                end else begin
+                    // Normal write has priority
+                    if (write_enable) begin
+                        registers[addr] <= write_data;
+                    end
+                    // RMW write (only if not conflicting with normal write)
+                    if (rmw_enable && !(write_enable && addr == rmw_addr)) begin
+                        registers[rmw_addr] <= rmw_result;
+                    end
+                end
+            end
+
+        end else begin : gen_no_rmw
+            // No RMW support - simpler logic
+            assign rmw_old_value = '0;
+            assign rmw_new_value = '0;
+
+            // Sequential Write
+            always_ff @(posedge aclk) begin
+                if (!aresetn) begin
+                    for (int i = 0; i < NUM_REGISTERS; i++) begin
+                        registers[i] <= INIT_VALUE[REGISTER_WIDTH-1:0];
+                    end
+                end else if (write_enable) begin
+                    registers[addr] <= write_data;
+                end
+            end
+        end
+    endgenerate
+
+endmodule
+
+// =============================================================================
+// Dual Register Array Module
+// For link_monitor style: byte_cnt + last_time pair
+// =============================================================================
+
+module dual_register_array #(
+    parameter NUM_REGISTERS = 256,
+    parameter REG_A_WIDTH = 32,     // byte_cnt width
+    parameter REG_B_WIDTH = 48      // last_time width
+) (
+    input  wire                                    aclk,
+    input  wire                                    aresetn,
+
+    // Index (shared between both registers)
+    input  wire [$clog2(NUM_REGISTERS)-1:0]       index,
+
+    // Register A Interface (e.g., byte_cnt)
+    input  wire [REG_A_WIDTH-1:0]                 reg_a_write_data,
+    input  wire                                    reg_a_write_enable,
+    output wire [REG_A_WIDTH-1:0]                 reg_a_read_data,
+
+    // Register B Interface (e.g., last_time)
+    input  wire [REG_B_WIDTH-1:0]                 reg_b_write_data,
+    input  wire                                    reg_b_write_enable,
+    output wire [REG_B_WIDTH-1:0]                 reg_b_read_data
+);
+
+    // ==========================================
+    // Register Storage
+    // ==========================================
+    reg [REG_A_WIDTH-1:0] reg_a [0:NUM_REGISTERS-1];
+    reg [REG_B_WIDTH-1:0] reg_b [0:NUM_REGISTERS-1];
+
+    // ==========================================
+    // Initialization
+    // ==========================================
+    initial begin
+        for (int i = 0; i < NUM_REGISTERS; i++) begin
+            reg_a[i] = {REG_A_WIDTH{1'b0}};
+            reg_b[i] = {REG_B_WIDTH{1'b0}};
+        end
+    end
+
+    // ==========================================
+    // Combinational Read
+    // ==========================================
+    assign reg_a_read_data = reg_a[index];
+    assign reg_b_read_data = reg_b[index];
+
+    // ==========================================
+    // Sequential Write
+    // ==========================================
+    always_ff @(posedge aclk) begin
+        if (!aresetn) begin
+            for (int i = 0; i < NUM_REGISTERS; i++) begin
+                reg_a[i] <= {REG_A_WIDTH{1'b0}};
+                reg_b[i] <= {REG_B_WIDTH{1'b0}};
+            end
+        end else begin
+            if (reg_a_write_enable)
+                reg_a[index] <= reg_a_write_data;
+            if (reg_b_write_enable)
+                reg_b[index] <= reg_b_write_data;
+        end
+    end
+
+endmodule

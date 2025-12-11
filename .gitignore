@@ -15,6 +15,7 @@ generatedcpp/
 *.la
 .deps
 .libs
+*.code-workspace
 
 c++/ext/lib/
 c++/test/bin/

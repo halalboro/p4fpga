@@ -119,6 +119,14 @@ module action #(
     // Probe header valid (for link_monitor)
     input  wire                           probe_valid,
     input  wire [7:0]                     probe_hop_cnt,
+
+    // MRI header valid (for INT/MRI)
+    input  wire                           mri_valid,
+    input  wire [15:0]                    mri_count_in,
+    input  wire [18:0]                    deq_qdepth,
+    input  wire [3:0]                     ipv4_ihl_in,
+    input  wire [7:0]                     ipv4_option_length_in,
+    input  wire [15:0]                    ipv4_total_len_in,
     
     // ==========================================
     // Packet Output
@@ -146,6 +154,16 @@ module action #(
     // ==========================================
 {{ACTION_CUSTOM_HEADER_OUTPUTS}}
 
+    // MRI outputs (for INT/MRI)
+    output reg  [15:0]                    mri_count_out,
+    output reg  [3:0]                     ipv4_ihl_out,
+    output reg  [7:0]                     ipv4_option_length_out,
+    output reg  [15:0]                    ipv4_total_len_out,
+    // swtraces[0] outputs (filled during add_swtrace action)
+    output reg  [31:0]                    swtraces_0_swid_out,
+    output reg  [31:0]                    swtraces_0_qdepth_out,
+    output reg                            swtraces_0_valid_out,
+
     // Egress table programming
     input  wire                           egress_table_write_enable,
     input  wire [$clog2(EGRESS_TABLE_SIZE)-1:0] egress_table_write_addr,
@@ -169,8 +187,9 @@ module action #(
     localparam ACTION_MULTICAST     = 4'd10;
     
     // Egress Action IDs
-    localparam EGRESS_ACTION_NOACTION  = 3'd0;
-    localparam EGRESS_ACTION_SET_SWID  = 3'd1;
+    localparam EGRESS_ACTION_NOACTION    = 3'd0;
+    localparam EGRESS_ACTION_SET_SWID    = 3'd1;
+    localparam EGRESS_ACTION_ADD_SWTRACE = 3'd2;  // MRI/INT add_swtrace
     
     // ==========================================
     // Configuration Bits
@@ -391,6 +410,15 @@ module action #(
             ipv4_ecn_out      <= 2'b0;
             ipv4_ttl_out      <= 8'b0;
             metadata_out      <= '0;
+
+            // MRI outputs reset
+            mri_count_out          <= 16'd0;
+            ipv4_ihl_out           <= 4'd0;
+            ipv4_option_length_out <= 8'd0;
+            ipv4_total_len_out     <= 16'd0;
+            swtraces_0_swid_out    <= 32'd0;
+            swtraces_0_qdepth_out  <= 32'd0;
+            swtraces_0_valid_out   <= 1'b0;
 
 {{RESET_CUSTOM_HEADER_OUTPUTS}}
 
@@ -653,7 +681,52 @@ module action #(
 {{EGRESS_CUSTOM_HEADER_LOGIC}}
                         end
                     end
-                    
+
+                    // ------------------------------------------
+                    // MRI/INT EGRESS PROCESSING
+                    // (add_swtrace action for In-band Network Telemetry)
+                    // ------------------------------------------
+                    if (ENABLE_EGRESS_TABLE && ENABLE_PUSH_FRONT && mri_valid) begin
+                        if (egress_action_id_out == EGRESS_ACTION_ADD_SWTRACE) begin
+                            // MRI add_swtrace action:
+                            // 1. Increment mri.count
+                            // 2. push_front on swtraces (handled by stack pointer)
+                            // 3. Set swtraces[0].swid = egress_action_data (table parameter)
+                            // 4. Set swtraces[0].qdepth = deq_qdepth
+                            // 5. Increment ipv4.ihl by 2 (64 bits = 8 bytes = 2 x 32-bit words)
+                            // 6. Increment ipv4_option.optionLength by 8
+                            // 7. Increment ipv4.totalLen by 8
+
+                            mri_count_out          <= mri_count_in + 16'd1;
+                            ipv4_ihl_out           <= ipv4_ihl_in + 4'd2;
+                            ipv4_option_length_out <= ipv4_option_length_in + 8'd8;
+                            ipv4_total_len_out     <= ipv4_total_len_in + 16'd8;
+
+                            // Set swtraces[0] - the newly pushed element
+                            // swid comes from egress table action_data (table parameter)
+                            // qdepth comes from standard_metadata.deq_qdepth
+                            swtraces_0_swid_out   <= egress_action_data_out[31:0];
+                            swtraces_0_qdepth_out <= {13'd0, deq_qdepth};
+                            swtraces_0_valid_out  <= 1'b1;  // setValid()
+
+                            header_modified <= 1'b1;
+                        end else begin
+                            // Pass through MRI values unchanged
+                            mri_count_out          <= mri_count_in;
+                            ipv4_ihl_out           <= ipv4_ihl_in;
+                            ipv4_option_length_out <= ipv4_option_length_in;
+                            ipv4_total_len_out     <= ipv4_total_len_in;
+                            swtraces_0_valid_out   <= 1'b0;
+                        end
+                    end else if (mri_valid) begin
+                        // MRI valid but no egress table action - pass through
+                        mri_count_out          <= mri_count_in;
+                        ipv4_ihl_out           <= ipv4_ihl_in;
+                        ipv4_option_length_out <= ipv4_option_length_in;
+                        ipv4_total_len_out     <= ipv4_total_len_in;
+                        swtraces_0_valid_out   <= 1'b0;
+                    end
+
                     // ------------------------------------------
                     // MIRRORING LOGIC (placeholder)
                     // ------------------------------------------

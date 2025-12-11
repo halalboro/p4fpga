@@ -1,0 +1,211 @@
+// =============================================================================
+// Hash Engine Module
+// Supports CRC16, CRC32, XOR, and CSUM16 hashing algorithms
+// Extracted as reusable IP block for P4-FPGA compiler
+// =============================================================================
+
+module hash_engine #(
+    parameter HASH_TYPE = 0,      // 0=CRC16, 1=CRC32, 2=XOR, 3=CSUM16
+    parameter INPUT_WIDTH = 104,  // 5-tuple default (32+32+16+16+8 = 104 bits)
+    parameter OUTPUT_WIDTH = 16,  // Output hash width
+    parameter PIPELINE_STAGES = 1 // Number of pipeline stages (0=combinational)
+) (
+    input  wire                        aclk,
+    input  wire                        aresetn,
+
+    // Input data interface
+    input  wire [INPUT_WIDTH-1:0]      data_in,
+    input  wire                        valid_in,
+    output wire                        ready_out,
+
+    // Output hash interface
+    output reg  [OUTPUT_WIDTH-1:0]     hash_out,
+    output reg                         valid_out
+);
+
+    // ==========================================
+    // CRC Polynomials
+    // ==========================================
+    localparam [15:0] CRC16_POLY = 16'h1021;    // CRC-CCITT
+    localparam [31:0] CRC32_POLY = 32'h04C11DB7; // IEEE 802.3
+
+    // ==========================================
+    // Always ready (single-cycle operation)
+    // ==========================================
+    assign ready_out = 1'b1;
+
+    // ==========================================
+    // Hash Type Generation
+    // ==========================================
+    generate
+        // ==========================================
+        // CRC16 Hash (Type 0)
+        // ==========================================
+        if (HASH_TYPE == 0) begin : gen_crc16
+
+            // Process 8 bits through CRC16
+            function automatic [15:0] crc16_byte;
+                input [15:0] crc_in;
+                input [7:0] data_byte;
+                reg [15:0] crc;
+                integer i;
+                begin
+                    crc = crc_in ^ {data_byte, 8'h00};
+                    for (i = 0; i < 8; i = i + 1) begin
+                        if (crc[15])
+                            crc = {crc[14:0], 1'b0} ^ CRC16_POLY;
+                        else
+                            crc = {crc[14:0], 1'b0};
+                    end
+                    crc16_byte = crc;
+                end
+            endfunction
+
+            // Combinational CRC calculation with explicit byte extraction
+            wire [15:0] crc_result;
+            wire [127:0] padded_data = {{(128-INPUT_WIDTH){1'b0}}, data_in};
+
+            wire [15:0] crc_b0  = crc16_byte(16'hFFFF,      padded_data[7:0]);
+            wire [15:0] crc_b1  = crc16_byte(crc_b0,        padded_data[15:8]);
+            wire [15:0] crc_b2  = crc16_byte(crc_b1,        padded_data[23:16]);
+            wire [15:0] crc_b3  = crc16_byte(crc_b2,        padded_data[31:24]);
+            wire [15:0] crc_b4  = crc16_byte(crc_b3,        padded_data[39:32]);
+            wire [15:0] crc_b5  = crc16_byte(crc_b4,        padded_data[47:40]);
+            wire [15:0] crc_b6  = crc16_byte(crc_b5,        padded_data[55:48]);
+            wire [15:0] crc_b7  = crc16_byte(crc_b6,        padded_data[63:56]);
+            wire [15:0] crc_b8  = crc16_byte(crc_b7,        padded_data[71:64]);
+            wire [15:0] crc_b9  = crc16_byte(crc_b8,        padded_data[79:72]);
+            wire [15:0] crc_b10 = crc16_byte(crc_b9,        padded_data[87:80]);
+            wire [15:0] crc_b11 = crc16_byte(crc_b10,       padded_data[95:88]);
+            wire [15:0] crc_b12 = crc16_byte(crc_b11,       padded_data[103:96]);
+
+            assign crc_result = ~crc_b12;
+
+            always_ff @(posedge aclk or negedge aresetn) begin
+                if (!aresetn) begin
+                    hash_out  <= {OUTPUT_WIDTH{1'b0}};
+                    valid_out <= 1'b0;
+                end else if (valid_in) begin
+                    hash_out  <= crc_result[OUTPUT_WIDTH-1:0];
+                    valid_out <= 1'b1;
+                end else begin
+                    valid_out <= 1'b0;
+                end
+            end
+
+        // ==========================================
+        // CRC32 Hash (Type 1)
+        // ==========================================
+        end else if (HASH_TYPE == 1) begin : gen_crc32
+
+            // Process 8 bits through CRC32 (reflected)
+            function automatic [31:0] crc32_byte;
+                input [31:0] crc_in;
+                input [7:0] data_byte;
+                reg [31:0] crc;
+                integer i;
+                begin
+                    crc = crc_in ^ {24'h000000, data_byte};
+                    for (i = 0; i < 8; i = i + 1) begin
+                        if (crc[0])
+                            crc = {1'b0, crc[31:1]} ^ CRC32_POLY;
+                        else
+                            crc = {1'b0, crc[31:1]};
+                    end
+                    crc32_byte = crc;
+                end
+            endfunction
+
+            // Combinational CRC calculation with explicit byte extraction
+            wire [31:0] crc_result;
+            wire [127:0] padded_data = {{(128-INPUT_WIDTH){1'b0}}, data_in};
+
+            wire [31:0] crc_b0  = crc32_byte(32'hFFFFFFFF, padded_data[7:0]);
+            wire [31:0] crc_b1  = crc32_byte(crc_b0,       padded_data[15:8]);
+            wire [31:0] crc_b2  = crc32_byte(crc_b1,       padded_data[23:16]);
+            wire [31:0] crc_b3  = crc32_byte(crc_b2,       padded_data[31:24]);
+            wire [31:0] crc_b4  = crc32_byte(crc_b3,       padded_data[39:32]);
+            wire [31:0] crc_b5  = crc32_byte(crc_b4,       padded_data[47:40]);
+            wire [31:0] crc_b6  = crc32_byte(crc_b5,       padded_data[55:48]);
+            wire [31:0] crc_b7  = crc32_byte(crc_b6,       padded_data[63:56]);
+            wire [31:0] crc_b8  = crc32_byte(crc_b7,       padded_data[71:64]);
+            wire [31:0] crc_b9  = crc32_byte(crc_b8,       padded_data[79:72]);
+            wire [31:0] crc_b10 = crc32_byte(crc_b9,       padded_data[87:80]);
+            wire [31:0] crc_b11 = crc32_byte(crc_b10,      padded_data[95:88]);
+            wire [31:0] crc_b12 = crc32_byte(crc_b11,      padded_data[103:96]);
+
+            assign crc_result = ~crc_b12;
+
+            always_ff @(posedge aclk or negedge aresetn) begin
+                if (!aresetn) begin
+                    hash_out  <= {OUTPUT_WIDTH{1'b0}};
+                    valid_out <= 1'b0;
+                end else if (valid_in) begin
+                    hash_out  <= crc_result[OUTPUT_WIDTH-1:0];
+                    valid_out <= 1'b1;
+                end else begin
+                    valid_out <= 1'b0;
+                end
+            end
+
+        // ==========================================
+        // XOR Hash (Type 2) - Simplest, Fastest
+        // ==========================================
+        end else if (HASH_TYPE == 2) begin : gen_xor
+
+            // XOR fold all 32-bit words
+            wire [127:0] padded_data = {{(128-INPUT_WIDTH){1'b0}}, data_in};
+            wire [31:0] xor_result = padded_data[31:0] ^ padded_data[63:32] ^
+                                     padded_data[95:64] ^ padded_data[127:96];
+
+            always_ff @(posedge aclk or negedge aresetn) begin
+                if (!aresetn) begin
+                    hash_out  <= {OUTPUT_WIDTH{1'b0}};
+                    valid_out <= 1'b0;
+                end else if (valid_in) begin
+                    hash_out  <= xor_result[OUTPUT_WIDTH-1:0];
+                    valid_out <= 1'b1;
+                end else begin
+                    valid_out <= 1'b0;
+                end
+            end
+
+        // ==========================================
+        // CSUM16 Hash (Type 3) - Internet Checksum Style
+        // One's complement sum of 16-bit words
+        // ==========================================
+        end else begin : gen_csum16
+
+            // Pad and extract 16-bit words
+            wire [127:0] padded_data = {{(128-INPUT_WIDTH){1'b0}}, data_in};
+
+            // Sum all 16-bit words with carry
+            wire [19:0] sum = {4'b0, padded_data[15:0]} +
+                              {4'b0, padded_data[31:16]} +
+                              {4'b0, padded_data[47:32]} +
+                              {4'b0, padded_data[63:48]} +
+                              {4'b0, padded_data[79:64]} +
+                              {4'b0, padded_data[95:80]} +
+                              {4'b0, padded_data[111:96]} +
+                              {4'b0, padded_data[127:112]};
+
+            // Fold carry bits back into result
+            wire [15:0] folded = sum[15:0] + {12'b0, sum[19:16]};
+            wire [15:0] csum_result = ~folded;  // One's complement
+
+            always_ff @(posedge aclk or negedge aresetn) begin
+                if (!aresetn) begin
+                    hash_out  <= {OUTPUT_WIDTH{1'b0}};
+                    valid_out <= 1'b0;
+                end else if (valid_in) begin
+                    hash_out  <= csum_result[OUTPUT_WIDTH-1:0];
+                    valid_out <= 1'b1;
+                end else begin
+                    valid_out <= 1'b0;
+                end
+            end
+
+        end
+    endgenerate
+
+endmodule

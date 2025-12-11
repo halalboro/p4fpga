@@ -1,0 +1,274 @@
+// =============================================================================
+// Encap/Decap Module
+// Handles header stack operations: push_front, pop_front
+// Supports: Source Routing (pop), Link Monitor (push), MRI/INT (push)
+// Extracted as reusable IP block for P4-FPGA compiler
+// =============================================================================
+
+module encap_decap #(
+    parameter STACK_DEPTH = 16,
+    parameter ELEMENT_WIDTH = 64,
+    parameter OPERATION = 0,          // 0=PUSH_FRONT, 1=POP_FRONT, 2=BOTH
+    parameter PTR_WIDTH = $clog2(STACK_DEPTH)
+) (
+    input  wire                           aclk,
+    input  wire                           aresetn,
+
+    // Stack Pointer Interface
+    input  wire [PTR_WIDTH-1:0]           ptr_in,
+    output reg  [PTR_WIDTH-1:0]           ptr_out,
+
+    // Operation Control
+    input  wire                           push_enable,
+    input  wire                           pop_enable,
+    input  wire [3:0]                     push_count,  // Number of elements to push (1-15)
+    input  wire [3:0]                     pop_count,   // Number of elements to pop (1-15)
+
+    // New Element Data (for push operations)
+    input  wire [ELEMENT_WIDTH-1:0]       new_element_data,
+    input  wire                           new_element_valid,
+
+    // Current Top Element (for pop operations)
+    output wire [ELEMENT_WIDTH-1:0]       top_element,
+    output wire                           top_valid,
+
+    // Status
+    output wire                           stack_empty,
+    output wire                           stack_full,
+    output wire [PTR_WIDTH-1:0]           stack_count
+);
+
+    // ==========================================
+    // Stack Status
+    // ==========================================
+    assign stack_empty = (ptr_in == 0);
+    assign stack_full  = (ptr_in >= STACK_DEPTH - 1);
+    assign stack_count = ptr_in;
+
+    // ==========================================
+    // Top Element Output
+    // For pop operations, the caller provides the stack data
+    // This module just manages pointers
+    // ==========================================
+    assign top_element = new_element_data;  // Pass-through for external stack access
+    assign top_valid   = new_element_valid;
+
+    // ==========================================
+    // Pointer Update Logic
+    // ==========================================
+    generate
+        // ==========================================
+        // PUSH_FRONT Only (OPERATION == 0)
+        // Used by: link_monitor, MRI/INT
+        // push_front DECREMENTS pointer (adds to front)
+        // ==========================================
+        if (OPERATION == 0) begin : gen_push_only
+
+            always_ff @(posedge aclk or negedge aresetn) begin
+                if (!aresetn) begin
+                    ptr_out <= '0;
+                end else if (push_enable && !stack_full) begin
+                    // Decrement pointer by push_count (with bounds check)
+                    if (ptr_in >= push_count)
+                        ptr_out <= ptr_in - push_count;
+                    else
+                        ptr_out <= '0;  // Saturate at 0
+                end else begin
+                    ptr_out <= ptr_in;  // Pass through
+                end
+            end
+
+        // ==========================================
+        // POP_FRONT Only (OPERATION == 1)
+        // Used by: source_routing
+        // pop_front INCREMENTS pointer (removes from front)
+        // ==========================================
+        end else if (OPERATION == 1) begin : gen_pop_only
+
+            always_ff @(posedge aclk or negedge aresetn) begin
+                if (!aresetn) begin
+                    ptr_out <= '0;
+                end else if (pop_enable && !stack_empty) begin
+                    // Increment pointer by pop_count (with bounds check)
+                    if ((ptr_in + pop_count) < STACK_DEPTH)
+                        ptr_out <= ptr_in + pop_count;
+                    else
+                        ptr_out <= STACK_DEPTH - 1;  // Saturate at max
+                end else begin
+                    ptr_out <= ptr_in;  // Pass through
+                end
+            end
+
+        // ==========================================
+        // BOTH Operations (OPERATION == 2)
+        // For flexibility - push and pop in same module
+        // ==========================================
+        end else begin : gen_both
+
+            always_ff @(posedge aclk or negedge aresetn) begin
+                if (!aresetn) begin
+                    ptr_out <= '0;
+                end else begin
+                    // Default: pass through
+                    ptr_out <= ptr_in;
+
+                    // Push operation (priority over pop)
+                    if (push_enable && !stack_full) begin
+                        if (ptr_in >= push_count)
+                            ptr_out <= ptr_in - push_count;
+                        else
+                            ptr_out <= '0;
+                    end
+                    // Pop operation
+                    else if (pop_enable && !stack_empty) begin
+                        if ((ptr_in + pop_count) < STACK_DEPTH)
+                            ptr_out <= ptr_in + pop_count;
+                        else
+                            ptr_out <= STACK_DEPTH - 1;
+                    end
+                end
+            end
+
+        end
+    endgenerate
+
+endmodule
+
+// =============================================================================
+// Source Route Stack Module
+// Specialized for source routing with segment extraction
+// =============================================================================
+
+module source_route_stack #(
+    parameter STACK_DEPTH = 16,
+    parameter SEGMENT_WIDTH = 16,     // port width for source routing
+    parameter PTR_WIDTH = $clog2(STACK_DEPTH)
+) (
+    input  wire                           aclk,
+    input  wire                           aresetn,
+
+    // Stack Pointer
+    input  wire [PTR_WIDTH-1:0]           ptr_in,
+    output reg  [PTR_WIDTH-1:0]           ptr_out,
+
+    // Stack Data (all segments)
+    input  wire [SEGMENT_WIDTH-1:0]       segments [0:STACK_DEPTH-1],
+    input  wire                           segments_valid [0:STACK_DEPTH-1],
+
+    // Pop Operation
+    input  wire                           pop_enable,
+
+    // Current Segment Output (top of stack)
+    output wire [SEGMENT_WIDTH-1:0]       current_segment,
+    output wire                           current_valid,
+
+    // Stack Status
+    output wire                           stack_empty,
+    output wire [PTR_WIDTH-1:0]           remaining_count
+);
+
+    // Status
+    assign stack_empty = (ptr_in >= STACK_DEPTH) || !segments_valid[ptr_in];
+    assign remaining_count = (ptr_in < STACK_DEPTH) ? (STACK_DEPTH - ptr_in) : '0;
+
+    // Current segment is at ptr_in position
+    assign current_segment = (ptr_in < STACK_DEPTH) ? segments[ptr_in] : '0;
+    assign current_valid   = (ptr_in < STACK_DEPTH) ? segments_valid[ptr_in] : 1'b0;
+
+    // Pointer update (pop = increment)
+    always_ff @(posedge aclk or negedge aresetn) begin
+        if (!aresetn) begin
+            ptr_out <= '0;
+        end else if (pop_enable && !stack_empty) begin
+            ptr_out <= ptr_in + 1;
+        end else begin
+            ptr_out <= ptr_in;
+        end
+    end
+
+endmodule
+
+// =============================================================================
+// MRI/INT Swtrace Stack Module
+// Specialized for In-band Network Telemetry trace insertion
+// =============================================================================
+
+module mri_swtrace_stack #(
+    parameter STACK_DEPTH = 16,
+    parameter SWID_WIDTH = 32,
+    parameter QDEPTH_WIDTH = 32,
+    parameter PTR_WIDTH = $clog2(STACK_DEPTH)
+) (
+    input  wire                           aclk,
+    input  wire                           aresetn,
+
+    // Stack Pointer
+    input  wire [PTR_WIDTH-1:0]           ptr_in,
+    output reg  [PTR_WIDTH-1:0]           ptr_out,
+
+    // New Trace Data (for push_front)
+    input  wire [SWID_WIDTH-1:0]          new_swid,
+    input  wire [QDEPTH_WIDTH-1:0]        new_qdepth,
+    input  wire                           push_enable,
+
+    // Output Trace Data
+    output wire [SWID_WIDTH-1:0]          swtrace_swid,
+    output wire [QDEPTH_WIDTH-1:0]        swtrace_qdepth,
+    output wire                           swtrace_valid,
+
+    // Stack Status
+    output wire                           stack_full,
+    output wire [PTR_WIDTH-1:0]           trace_count
+);
+
+    // Swtrace storage
+    reg [SWID_WIDTH-1:0]   swid_stack   [0:STACK_DEPTH-1];
+    reg [QDEPTH_WIDTH-1:0] qdepth_stack [0:STACK_DEPTH-1];
+    reg                    valid_stack  [0:STACK_DEPTH-1];
+
+    // Status
+    assign stack_full  = (ptr_in == 0);  // Can't push more when ptr=0
+    assign trace_count = STACK_DEPTH - ptr_in;
+
+    // Output the first trace element
+    assign swtrace_swid   = swid_stack[0];
+    assign swtrace_qdepth = qdepth_stack[0];
+    assign swtrace_valid  = valid_stack[0];
+
+    // Initialize
+    initial begin
+        for (int i = 0; i < STACK_DEPTH; i++) begin
+            swid_stack[i]   = '0;
+            qdepth_stack[i] = '0;
+            valid_stack[i]  = 1'b0;
+        end
+    end
+
+    // Push operation shifts stack and decrements pointer
+    always_ff @(posedge aclk or negedge aresetn) begin
+        if (!aresetn) begin
+            ptr_out <= STACK_DEPTH - 1;  // Start at end (empty)
+            for (int i = 0; i < STACK_DEPTH; i++) begin
+                swid_stack[i]   <= '0;
+                qdepth_stack[i] <= '0;
+                valid_stack[i]  <= 1'b0;
+            end
+        end else if (push_enable && !stack_full) begin
+            // Shift all elements up by 1
+            for (int i = STACK_DEPTH - 1; i > 0; i--) begin
+                swid_stack[i]   <= swid_stack[i-1];
+                qdepth_stack[i] <= qdepth_stack[i-1];
+                valid_stack[i]  <= valid_stack[i-1];
+            end
+            // Insert new element at position 0
+            swid_stack[0]   <= new_swid;
+            qdepth_stack[0] <= new_qdepth;
+            valid_stack[0]  <= 1'b1;
+            // Decrement pointer
+            ptr_out <= ptr_in - 1;
+        end else begin
+            ptr_out <= ptr_in;
+        end
+    end
+
+endmodule
