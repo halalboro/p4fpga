@@ -15,7 +15,6 @@ generatedcpp/
 *.la
 .deps
 .libs
-*.code-workspace
 
 c++/ext/lib/
 c++/test/bin/
@@ -48,3 +47,6 @@ bluesim/
 nfsume*/
 sample_input/
 sample_outputs/
+
+# IDE/Editor workspace files
+*.code-workspace
