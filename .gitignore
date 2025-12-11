@@ -48,5 +48,5 @@ nfsume*/
 sample_input/
 sample_outputs/
 
-# IDE/Editor workspace files
 *.code-workspace
+.claude/
